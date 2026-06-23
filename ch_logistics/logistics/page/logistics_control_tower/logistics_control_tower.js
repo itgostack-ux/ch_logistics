@@ -1,0 +1,1184 @@
+/**
+ * Logistics Command Center
+ * Merged from: Logistics Hub (analytics) + Logistics Control Tower (dispatch ops)
+ *
+ * Mode tabs:
+ *   Overview   — KPI dashboard, AI insights, route analysis, driver scorecard
+ *   Operations — Trip kanban board, exception inbox, drivers, GPS map
+ *
+ * Shared page-header filters (hub_filters): Company → City → Zone → Store + date range
+ * Operations-specific filters: Trip Date + Days window (inline in content area)
+ */
+
+const _LCC = "ch_logistics.api.logistics_api.";
+
+frappe.pages["logistics-control-tower"].on_page_load = function (wrapper) {
+	const page = frappe.ui.make_app_page({
+		parent: wrapper,
+		title: __("Logistics Command Center"),
+		single_column: true,
+	});
+	wrapper.lcc = new LogisticsCommandCenter(page, wrapper);
+};
+
+frappe.pages["logistics-control-tower"].refresh = function (wrapper) {
+	if (wrapper.lcc) wrapper.lcc.refresh();
+};
+
+class LogisticsCommandCenter {
+	constructor(page, wrapper) {
+		this.page = page;
+		this.wrapper = wrapper;
+
+		// shared state
+		this.mode = "overview";
+		this.filters = null;		// hub_filters handle
+		this._auto_timer = null;
+
+		// ops state
+		this.trip_date = frappe.datetime.get_today();
+		this.include_days = 1;
+		this.bottom_tab = "manifests";
+		this.board = { buckets: {}, totals: {} };
+		this.unassigned = [];
+		this.exceptions = [];
+		this.drivers = [];
+		this.selected_manifests = new Set();
+		this.active_trip = null;
+		this._leaflet_loading = null;
+		this._map = null;
+		this.map_open = false;
+
+		this._boot();
+	}
+
+	// ─────────────────────────────────────────────────────────────
+	// BOOT
+	// ─────────────────────────────────────────────────────────────
+
+	_boot() {
+		// Page-level actions
+		this.page.set_primary_action(__("New Trip"), () => this._dlg_new_trip(), "add");
+		this.page.add_menu_item(__("Auto-plan Trips"), () => this._dlg_auto_plan());
+		this.page.add_button(__("Refresh"), () => this.refresh(), { icon: "refresh" });
+
+		// Shared hub_filters (header bar): company, city, zone, store, dates
+		this.filters = ch_erp15.hub_filters.attach(this.page, {
+			include_dates: true,
+			on_change: () => { if (this.mode === "overview") this._ov_load(); },
+		});
+
+		// Root shell
+		this.$root = $('<div class="lcc-root"></div>').appendTo(this.page.body);
+		this._render_shell();
+		this._switch_mode("overview");
+	}
+
+	// ─────────────────────────────────────────────────────────────
+	// SHELL
+	// ─────────────────────────────────────────────────────────────
+
+	_render_shell() {
+		this.$root.html(`
+			<div class="lcc-modebar">
+				<div class="lcc-modebar-tabs">
+					<button class="lcc-mode-btn" data-mode="overview">
+						<i class="fa fa-tachometer"></i> ${__("Overview")}
+					</button>
+					<button class="lcc-mode-btn" data-mode="ops">
+						<i class="fa fa-sitemap"></i> ${__("Operations")}
+					</button>
+				</div>
+				<span class="lcc-live-badge" id="lcc-live-badge" style="display:none">
+					<span class="lcc-pulse-dot"></span> ${__("Live · 60s")}
+				</span>
+			</div>
+			<div class="lcc-content" id="lcc-content"></div>
+			<div class="lcc-side" id="lcc-side"></div>
+		`);
+
+		this.$root.on("click", ".lcc-mode-btn", (e) => {
+			this._switch_mode($(e.currentTarget).data("mode"));
+		});
+	}
+
+	_switch_mode(mode) {
+		this.mode = mode;
+		this.$root.find(".lcc-mode-btn").removeClass("active");
+		this.$root.find(`.lcc-mode-btn[data-mode="${mode}"]`).addClass("active");
+
+		if (mode === "overview") {
+			$("#lcc-live-badge").show();
+			this._ov_init();
+		} else {
+			$("#lcc-live-badge").hide();
+			this._stop_auto_refresh();
+			this._ops_init();
+		}
+	}
+
+	refresh() {
+		if (this.mode === "overview") this._ov_load();
+		else this._ops_load();
+	}
+
+	// ─────────────────────────────────────────────────────────────
+	// AUTO-REFRESH (Overview only)
+	// ─────────────────────────────────────────────────────────────
+
+	_start_auto_refresh() {
+		this._stop_auto_refresh();
+		this._auto_timer = setInterval(() => {
+			if (this.mode === "overview") this._ov_load();
+		}, 60000);
+	}
+
+	_stop_auto_refresh() {
+		if (this._auto_timer) { clearInterval(this._auto_timer); this._auto_timer = null; }
+	}
+
+	// ══════════════════════════════════════════════════════════════
+	// OVERVIEW MODE
+	// ══════════════════════════════════════════════════════════════
+
+	_ov_init() {
+		$("#lcc-content").html(`
+			<div class="lcc-ov" id="lcc-ov">
+				<div class="lcc-loading"><i class="fa fa-spinner fa-spin"></i> ${__("Loading Overview…")}</div>
+			</div>
+		`);
+		this._start_auto_refresh();
+		this._ov_load();
+	}
+
+	_ov_load() {
+		const $ov = $("#lcc-ov");
+		$ov.html(`<div class="lcc-loading"><i class="fa fa-spinner fa-spin"></i> ${__("Loading Overview…")}</div>`);
+		frappe.xcall("ch_erp15.ch_erp15.hub_api.get_logistics_hub_data", this.filters.values())
+			.then((data) => this._ov_render(data))
+			.catch(() => {
+				$ov.html(`<div class="lcc-error-banner"><i class="fa fa-exclamation-circle"></i> ${__("Failed to load overview data.")}</div>`);
+			});
+	}
+
+	_ov_render(data) {
+		const $ov = $("#lcc-ov").empty();
+		this._ov_alerts($ov, data);
+		this._ov_pipeline($ov, data.pipeline || []);
+		this._ov_kpis($ov, data.kpis || []);
+		this._ov_intelligence($ov, data);
+		this._ov_planning($ov, data.planning_suggestions || []);
+		this._ov_route_lanes($ov, data.route_lanes || []);
+		this._ov_driver_scorecard($ov, data.driver_scorecard || []);
+		this._ov_quick_actions($ov);
+		this._ov_manifest_tables($ov, data);
+	}
+
+	/* ── Alert banners ────────────────────────────────────────── */
+
+	_ov_alerts($ov, data) {
+		const kmap = {};
+		(data.kpis || []).forEach((k) => (kmap[k.key] = k.value));
+		const overdue = parseInt(kmap.overdue || 0);
+		const pending = parseInt(kmap.pending_pickup || 0);
+		const rows = [];
+
+		if (overdue > 0) {
+			rows.push(`
+				<div class="lcc-alert is-critical">
+					<div class="lcc-alert-icon"><i class="fa fa-clock-o"></i></div>
+					<div class="lcc-alert-body">
+						<div class="lcc-alert-title">${overdue} ${__("manifest(s) overdue")}</div>
+						<div class="lcc-alert-sub">${__("Past estimated delivery date — contact driver / logistics manager.")}</div>
+					</div>
+					<button class="lcc-alert-cta" data-go="overdue">
+						${__("View Overdue")} <i class="fa fa-arrow-right"></i>
+					</button>
+				</div>`);
+		}
+		if (pending > 0) {
+			rows.push(`
+				<div class="lcc-alert is-warning">
+					<div class="lcc-alert-icon"><i class="fa fa-truck"></i></div>
+					<div class="lcc-alert-body">
+						<div class="lcc-alert-title">${pending} ${__("manifest(s) awaiting pickup")}</div>
+						<div class="lcc-alert-sub">${__("Driver assigned but not yet packed — assign in Operations board.")}</div>
+					</div>
+					<button class="lcc-alert-cta" data-mode="ops">
+						${__("Open Operations")} <i class="fa fa-arrow-right"></i>
+					</button>
+				</div>`);
+		}
+		if (!rows.length) return;
+
+		$ov.append(rows.join(""));
+		$ov.find(".lcc-alert-cta").on("click", (e) => {
+			const go = $(e.currentTarget).data("go");
+			const sw = $(e.currentTarget).data("mode");
+			if (sw === "ops") {
+				this._switch_mode("ops");
+			} else if (go) {
+				this._ov_activate_tab(go);
+				$ov.find(".lcc-tabs").first()[0]?.scrollIntoView({ behavior: "smooth" });
+			}
+		});
+	}
+
+	/* ── Pipeline ─────────────────────────────────────────────── */
+
+	_ov_pipeline($ov, steps) {
+		const arrow = `<div class="lcc-flow-sep">
+			<svg width="22" height="18" viewBox="0 0 32 24" fill="none" stroke="currentColor"
+				stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+				<path d="M4 12H24M18 6l6 6-6 6"/>
+			</svg></div>`;
+
+		const nodes = steps.map((s, i) => {
+			const node = `<div class="lcc-flow-node" data-step="${s.key}">
+				<div class="lcc-flow-badge" style="background:${s.color}">${s.count}</div>
+				<div class="lcc-flow-label">
+					<i class="fa fa-${s.icon}"></i>
+					<span>${__(s.label)}</span>
+				</div>
+				<div class="lcc-flow-sub">${s.sub || ""}</div>
+			</div>`;
+			return i < steps.length - 1 ? node + arrow : node;
+		}).join("");
+
+		$ov.append(`
+			<div class="lcc-section">
+				<h5 class="lcc-section-title"><i class="fa fa-random"></i> ${__("Delivery Pipeline")}</h5>
+				<div class="lcc-flow-wrap"><div class="lcc-flow">${nodes}</div></div>
+			</div>`);
+
+		$ov.find(".lcc-flow-node").on("click", (e) => {
+			const step = $(e.currentTarget).data("step");
+			const sm = { draft:"Draft", assigned:"Assigned", packed:"Packed", transit:"In Transit", delivered:"Delivered", closed:"Closed" };
+			if (sm[step]) this._go_list("CH Transfer Manifest", { status: sm[step] });
+		});
+	}
+
+	/* ── KPI cards ────────────────────────────────────────────── */
+
+	_ov_kpis($ov, kpis) {
+		const cards = kpis.map((k) => {
+			const val = typeof k.value === "string" ? k.value
+				: k.key === "avg_hours" ? `${k.value}h` : k.value;
+			return `<div class="lcc-kpi-card" style="--kc:${k.color}" data-kpi="${k.key}">
+				<div class="lcc-kpi-val">${val}</div>
+				<div class="lcc-kpi-lbl">${__(k.label)}</div>
+			</div>`;
+		}).join("");
+
+		$ov.append(`
+			<div class="lcc-section">
+				<h5 class="lcc-section-title"><i class="fa fa-tachometer"></i> ${__("Key Metrics")}</h5>
+				<div class="lcc-kpi-grid">${cards}</div>
+			</div>`);
+
+		$ov.find(".lcc-kpi-card").on("click", (e) => {
+			const k = $(e.currentTarget).data("kpi");
+			const map = {
+				active:         ["CH Transfer Manifest", { status: ["not in", ["Closed","Cancelled"]] }],
+				in_transit:     ["CH Transfer Manifest", { status: "In Transit" }],
+				pending_pickup: ["CH Transfer Manifest", { status: ["in", ["Assigned","Draft"]] }],
+				rejected:       ["CH Transfer Manifest", { status: "Rejected" }],
+				delivered_today:["CH Transfer Manifest", { status: ["in", ["Delivered","Closed"]] }],
+				overdue:        ["CH Transfer Manifest", { status: ["not in", ["Delivered","Closed","Cancelled"]] }],
+				damage:         ["CH Transfer Manifest", { damage_reported: 1 }],
+			};
+			if (map[k]) this._go_list(map[k][0], map[k][1]);
+		});
+	}
+
+	/* ── AI Insights + Financial Control ──────────────────────── */
+
+	_ov_intelligence($ov, data) {
+		const insights = data.ai_insights || [];
+		const fc = data.financial_control || {};
+		const sev_clr = { High: "#ef4444", Medium: "#f59e0b", Info: "#3b82f6" };
+
+		const insight_html = insights.length
+			? insights.map((i) => `
+				<div class="lcc-insight-card" style="border-left-color:${sev_clr[i.severity]||"#6b7280"}">
+					<div class="lcc-insight-hdr">
+						<i class="fa fa-${i.icon}"></i>
+						<span class="lcc-badge lcc-badge-${i.severity==="High"?"red":i.severity==="Medium"?"yellow":"blue"}">${__(i.severity)}</span>
+					</div>
+					<div class="lcc-insight-title">${i.title}</div>
+					<div class="lcc-insight-detail">${i.detail}</div>
+				</div>`).join("")
+			: `<div class="lcc-empty">${__("No insights available.")}</div>`;
+
+		const mom_arrow = fc.mom_change > 0 ? "↑" : fc.mom_change < 0 ? "↓" : "→";
+		const mom_cls = fc.mom_change > 0 ? "lcc-text-green" : fc.mom_change < 0 ? "lcc-text-red" : "";
+
+		const fc_items = [
+			["#f59e0b", fc.total_manifests_mtd || 0,               "Manifests MTD"],
+			["#22c55e", fc.delivered_mtd || 0,                      "Delivered MTD"],
+			["#0ea5e9", parseInt(fc.qty_moved_mtd || 0),            "Qty Moved MTD"],
+			["#6366f1", `${fc.avg_transit_hours || 0}h`,            "Avg Transit"],
+			["#22c55e", `${fc.otd_pct || 0}%`,                      "On-Time %"],
+			["#ef4444", `${fc.damage_pct || 0}%`,                   "Damage Rate"],
+			["#f97316", fc.avg_items_per_manifest || 0,             "Avg Items/MF"],
+			["#8b5cf6", `<span class="${mom_cls}">${mom_arrow} ${Math.abs(fc.mom_change || 0)}%</span>`, "vs Last Month"],
+		];
+		const fc_html = `<div class="lcc-mini-kpi-grid">
+			${fc_items.map(([c, v, l]) => `
+				<div class="lcc-mini-kpi" style="--mk:${c}">
+					<div class="lcc-mini-kpi-val">${v}</div>
+					<div class="lcc-mini-kpi-lbl">${__(l)}</div>
+				</div>`).join("")}
+		</div>`;
+
+		$ov.append(`
+			<div class="lcc-section">
+				<div class="lcc-intel-grid">
+					<div class="lcc-intel-col">
+						<h5 class="lcc-section-title"><i class="fa fa-bolt"></i> ${__("AI Logistics Insights")}</h5>
+						<div class="lcc-insights-list">${insight_html}</div>
+					</div>
+					<div class="lcc-intel-col">
+						<h5 class="lcc-section-title"><i class="fa fa-bar-chart"></i> ${__("Financial Control")}</h5>
+						${fc_html}
+					</div>
+				</div>
+			</div>`);
+	}
+
+	/* ── Planning Suggestions ─────────────────────────────────── */
+
+	_ov_planning($ov, suggestions) {
+		if (!suggestions.length) return;
+		const type_clr = { Consolidation:"#8b5cf6", Assignment:"#f59e0b", Action:"#3b82f6", Capacity:"#10b981", Info:"#6b7280" };
+		const cards = suggestions.map((s) => `
+			<div class="lcc-plan-card" style="border-left-color:${type_clr[s.type]||"#6b7280"}">
+				<div class="lcc-plan-hdr">
+					<i class="fa fa-${s.icon}"></i>
+					<span class="lcc-plan-type">${s.type}</span>
+				</div>
+				<div class="lcc-plan-title">${s.title}</div>
+				<div class="lcc-plan-detail">${s.detail}</div>
+			</div>`).join("");
+
+		$ov.append(`
+			<div class="lcc-section">
+				<h5 class="lcc-section-title"><i class="fa fa-lightbulb-o"></i> ${__("Planning Suggestions")}</h5>
+				<div class="lcc-plan-grid">${cards}</div>
+			</div>`);
+	}
+
+	/* ── Route Lane Analysis ──────────────────────────────────── */
+
+	_ov_route_lanes($ov, lanes) {
+		if (!lanes.length) return;
+		const rows = lanes.map((l) => {
+			const otd_c = l.otd_pct >= 90 ? "lcc-badge-green" : l.otd_pct >= 70 ? "lcc-badge-yellow" : "lcc-badge-red";
+			const dmg_c = l.damage_pct === 0 ? "lcc-badge-green" : l.damage_pct <= 2 ? "lcc-badge-yellow" : "lcc-badge-red";
+			return `<tr>
+				<td><strong>${l.origin || "—"}</strong></td>
+				<td><strong>${l.destination || "—"}</strong></td>
+				<td class="tr">${l.manifests}</td>
+				<td class="tr">${parseInt(l.total_qty)}</td>
+				<td class="tr">${l.avg_hours || "—"}h</td>
+				<td class="tc"><span class="lcc-badge ${otd_c}">${l.otd_pct}%</span></td>
+				<td class="tc"><span class="lcc-badge ${dmg_c}">${l.damage_pct}%</span></td>
+			</tr>`;
+		}).join("");
+
+		$ov.append(`
+			<div class="lcc-section">
+				<h5 class="lcc-section-title"><i class="fa fa-map-signs"></i> ${__("Route Lane Analysis")}</h5>
+				<div class="lcc-table-wrap"><table class="lcc-table">
+					<thead><tr>
+						<th>${__("Origin")}</th><th>${__("Destination")}</th>
+						<th class="tr">${__("Manifests")}</th><th class="tr">${__("Qty")}</th>
+						<th class="tr">${__("Avg Hours")}</th>
+						<th class="tc">${__("OTD %")}</th><th class="tc">${__("Damage %")}</th>
+					</tr></thead>
+					<tbody>${rows}</tbody>
+				</table></div>
+			</div>`);
+	}
+
+	/* ── Driver Scorecard ─────────────────────────────────────── */
+
+	_ov_driver_scorecard($ov, drivers) {
+		if (!drivers.length) return;
+		const rows = drivers.map((d) => {
+			const otd_c = d.otd_pct >= 90 ? "lcc-badge-green" : d.otd_pct >= 70 ? "lcc-badge-yellow" : "lcc-badge-red";
+			const dmg_c = d.damage_pct === 0 ? "lcc-badge-green" : d.damage_pct <= 2 ? "lcc-badge-yellow" : "lcc-badge-red";
+			const rating = d.otd_pct >= 95 && d.damage_pct === 0 ? "⭐" : d.otd_pct >= 80 ? "👍" : "⚠️";
+			return `<tr>
+				<td><strong>${d.driver_name || "—"}</strong></td>
+				<td class="tr">${d.total_manifests}</td>
+				<td class="tr">${d.delivered}</td>
+				<td class="tc"><span class="lcc-badge ${otd_c}">${d.otd_pct}%</span></td>
+				<td class="tc"><span class="lcc-badge ${dmg_c}">${d.damage_pct}%</span></td>
+				<td class="tr">${d.avg_hours || "—"}h</td>
+				<td class="tr">${parseInt(d.total_qty)}</td>
+				<td class="tc">${rating}</td>
+			</tr>`;
+		}).join("");
+
+		$ov.append(`
+			<div class="lcc-section">
+				<h5 class="lcc-section-title"><i class="fa fa-id-card"></i> ${__("Driver Scorecard")}</h5>
+				<div class="lcc-table-wrap"><table class="lcc-table">
+					<thead><tr>
+						<th>${__("Driver")}</th>
+						<th class="tr">${__("Total")}</th><th class="tr">${__("Delivered")}</th>
+						<th class="tc">${__("OTD %")}</th><th class="tc">${__("Damage %")}</th>
+						<th class="tr">${__("Avg Hours")}</th><th class="tr">${__("Qty")}</th>
+						<th class="tc">${__("Rating")}</th>
+					</tr></thead>
+					<tbody>${rows}</tbody>
+				</table></div>
+			</div>`);
+	}
+
+	/* ── Quick Actions ────────────────────────────────────────── */
+
+	_ov_quick_actions($ov) {
+		$ov.append(`
+			<div class="lcc-section">
+				<h5 class="lcc-section-title"><i class="fa fa-bolt"></i> ${__("Quick Actions")}</h5>
+				<div class="lcc-actions-grid">
+					<button class="lcc-action-btn" data-act="new_manifest"><i class="fa fa-plus"></i> ${__("New Transfer Manifest")}</button>
+					<button class="lcc-action-btn" data-act="new_transfer"><i class="fa fa-exchange"></i> ${__("New Material Transfer")}</button>
+					<button class="lcc-action-btn" data-act="new_trip"><i class="fa fa-road"></i> ${__("New Trip")}</button>
+					<button class="lcc-action-btn" data-act="ops_view"><i class="fa fa-sitemap"></i> ${__("Operations Board")}</button>
+					<button class="lcc-action-btn" data-act="manifest_list"><i class="fa fa-list-ul"></i> ${__("All Manifests")}</button>
+					<button class="lcc-action-btn" data-act="stock_entry_list"><i class="fa fa-cubes"></i> ${__("Stock Entries")}</button>
+					<button class="lcc-action-btn" data-act="delivery_app"><i class="fa fa-map-marker"></i> ${__("Delivery App")}</button>
+					<button class="lcc-action-btn" data-act="buy_spares"><i class="fa fa-shopping-cart"></i> ${__("Buy Spares")}</button>
+				</div>
+			</div>`);
+
+		$ov.on("click", ".lcc-action-btn", (e) => {
+			const act = $(e.currentTarget).data("act");
+			const fn = {
+				new_manifest:    () => frappe.new_doc("CH Transfer Manifest"),
+				new_transfer:    () => frappe.new_doc("Stock Entry", { stock_entry_type: "Material Transfer" }),
+				new_trip:        () => this._dlg_new_trip(),
+				ops_view:        () => this._switch_mode("ops"),
+				manifest_list:   () => this._go_list("CH Transfer Manifest"),
+				stock_entry_list:() => this._go_list("Stock Entry", { stock_entry_type: "Material Transfer" }),
+				delivery_app:    () => frappe.set_route("delivery-app"),
+				buy_spares:      () => frappe.new_doc("Purchase Order"),
+			}[act];
+			if (fn) fn();
+		});
+	}
+
+	/* ── Manifest detail tabs (Active | Deliveries | Overdue) ─── */
+	/* NOTE: "Pending Pickup" removed — it lives in Operations > Unassigned Manifests */
+
+	_ov_manifest_tables($ov, data) {
+		const tabs = [
+			{ key: "active",     label: "Active Manifests",   count: (data.active_manifests || []).length },
+			{ key: "deliveries", label: "Recent Deliveries",  count: (data.recent_deliveries || []).length },
+			{ key: "overdue",    label: "Overdue",            count: (data.overdue_manifests || []).length },
+		];
+		const tab_btns = tabs.map((t, i) => `
+			<button class="lcc-tab ${i === 0 ? "active" : ""}" data-tab="${t.key}">
+				${__(t.label)} <span class="lcc-tab-badge">${t.count}</span>
+			</button>`).join("");
+		const panels = tabs.map((t, i) => `
+			<div class="lcc-tab-panel ${i === 0 ? "active" : ""}" data-panel="${t.key}"></div>`).join("");
+
+		$ov.append(`
+			<div class="lcc-section" id="lcc-ov-tables">
+				<h5 class="lcc-section-title"><i class="fa fa-list"></i> ${__("Manifest Detail")}</h5>
+				<div class="lcc-tabs">${tab_btns}</div>
+				${panels}
+			</div>`);
+
+		$ov.on("click", ".lcc-tab", function () {
+			const tab = $(this).data("tab");
+			$(this).siblings(".lcc-tab").removeClass("active");
+			$(this).addClass("active");
+			$(this).closest(".lcc-section").find(".lcc-tab-panel").removeClass("active");
+			$(this).closest(".lcc-section").find(`[data-panel="${tab}"]`).addClass("active");
+		});
+
+		this._ov_tbl_active($ov, data.active_manifests || []);
+		this._ov_tbl_deliveries($ov, data.recent_deliveries || []);
+		this._ov_tbl_overdue($ov, data.overdue_manifests || []);
+	}
+
+	_ov_activate_tab(key) {
+		const $sec = $("#lcc-ov-tables");
+		$sec.find(".lcc-tab").removeClass("active");
+		$sec.find(`.lcc-tab[data-tab="${key}"]`).addClass("active");
+		$sec.find(".lcc-tab-panel").removeClass("active");
+		$sec.find(`[data-panel="${key}"]`).addClass("active");
+		$sec[0]?.scrollIntoView({ behavior: "smooth", block: "start" });
+	}
+
+	_ov_tbl_active($ov, items) {
+		const $p = $ov.find('[data-panel="active"]');
+		if (!items.length) { $p.html(`<div class="lcc-empty"><i class="fa fa-check-circle"></i> ${__("No active manifests")}</div>`); return; }
+		const sc = { Draft:"lcc-badge-grey", Assigned:"lcc-badge-yellow", Packed:"lcc-badge-blue", "In Transit":"lcc-badge-purple", Delivered:"lcc-badge-green" };
+		const rows = items.map((r) => {
+			const dmg = r.damage_reported ? `<span class="lcc-damage-flag"><i class="fa fa-exclamation-triangle"></i> Damage</span>` : "";
+			const route = [r.source_store || r.source_warehouse, r.destination_store || r.destination_warehouse].filter(Boolean).join(" → ");
+			const over = r.estimated_delivery_date && new Date(r.estimated_delivery_date) < new Date()
+				&& !["Delivered","Closed"].includes(r.status)
+				? `<span class="lcc-badge lcc-badge-red" style="margin-left:4px">OVERDUE</span>` : "";
+			return `<tr data-name="${r.name}">
+				<td><a href="/app/ch-transfer-manifest/${r.name}">${r.name}</a></td>
+				<td><span class="lcc-badge ${sc[r.status]||"lcc-badge-grey"}">${r.status}</span>${dmg}${over}</td>
+				<td class="lcc-route-cell" title="${route}">${route || "—"}</td>
+				<td>${r.driver_name || "—"}</td>
+				<td class="tr">${parseFloat(r.total_qty) || 0}</td>
+				<td>${frappe.datetime.str_to_user(r.manifest_date) || "—"}</td>
+			</tr>`;
+		}).join("");
+		$p.html(`<div class="lcc-table-wrap"><table class="lcc-table"><thead><tr>
+			<th>${__("Manifest")}</th><th>${__("Status")}</th><th>${__("Route")}</th>
+			<th>${__("Driver")}</th><th class="tr">${__("Qty")}</th><th>${__("Date")}</th>
+		</tr></thead><tbody>${rows}</tbody></table></div>`);
+		$p.find("tbody tr").on("click", function (e) { if (e.target.tagName === "A") return; frappe.set_route("Form", "CH Transfer Manifest", $(this).data("name")); });
+	}
+
+	_ov_tbl_deliveries($ov, items) {
+		const $p = $ov.find('[data-panel="deliveries"]');
+		if (!items.length) { $p.html(`<div class="lcc-empty"><i class="fa fa-inbox"></i> ${__("No deliveries this month")}</div>`); return; }
+		const rows = items.map((r) => {
+			const dmg = r.damage_reported
+				? `<span class="lcc-damage-flag"><i class="fa fa-exclamation-triangle"></i> ${r.damage_notes || "Damage"}</span>`
+				: `<span class="lcc-ok-flag"><i class="fa fa-check"></i> OK</span>`;
+			const route = [r.source_store, r.destination_store].filter(Boolean).join(" → ");
+			const sc = r.status === "Closed" ? "lcc-badge-grey" : "lcc-badge-green";
+			let otd = "";
+			if (r.delivery_datetime && r.estimated_delivery_date) {
+				otd = new Date(r.delivery_datetime) <= new Date(r.estimated_delivery_date)
+					? `<span class="lcc-badge lcc-badge-green" style="margin-left:4px">On-Time</span>`
+					: `<span class="lcc-badge lcc-badge-red" style="margin-left:4px">Late</span>`;
+			}
+			return `<tr data-name="${r.name}">
+				<td><a href="/app/ch-transfer-manifest/${r.name}">${r.name}</a></td>
+				<td><span class="lcc-badge ${sc}">${r.status}</span>${otd}</td>
+				<td>${route || "—"}</td>
+				<td>${r.driver_name || "—"}</td>
+				<td>${r.receiver_name || "—"}</td>
+				<td class="tr">${parseFloat(r.total_qty) || 0}</td>
+				<td>${dmg}</td>
+				<td>${frappe.datetime.str_to_user(r.delivery_datetime) || "—"}</td>
+			</tr>`;
+		}).join("");
+		$p.html(`<div class="lcc-table-wrap"><table class="lcc-table"><thead><tr>
+			<th>${__("Manifest")}</th><th>${__("Status")}</th><th>${__("Route")}</th>
+			<th>${__("Driver")}</th><th>${__("Receiver")}</th>
+			<th class="tr">${__("Qty")}</th><th>${__("Condition")}</th><th>${__("Delivered")}</th>
+		</tr></thead><tbody>${rows}</tbody></table></div>`);
+		$p.find("tbody tr").on("click", function (e) { if (e.target.tagName === "A") return; frappe.set_route("Form", "CH Transfer Manifest", $(this).data("name")); });
+	}
+
+	_ov_tbl_overdue($ov, items) {
+		const $p = $ov.find('[data-panel="overdue"]');
+		if (!items.length) { $p.html(`<div class="lcc-empty"><i class="fa fa-check-circle"></i> ${__("No overdue manifests — all on track!")}</div>`); return; }
+		const rows = items.map((r) => {
+			const route = [r.source_store || r.source_warehouse, r.destination_store || r.destination_warehouse].filter(Boolean).join(" → ");
+			const days = parseInt(r.days_overdue) || 0;
+			const sev = days >= 5 ? "lcc-badge-red" : days >= 2 ? "lcc-badge-orange" : "lcc-badge-yellow";
+			return `<tr data-name="${r.name}">
+				<td><a href="/app/ch-transfer-manifest/${r.name}">${r.name}</a></td>
+				<td><span class="lcc-badge lcc-badge-grey">${r.status}</span></td>
+				<td>${route || "—"}</td>
+				<td>${r.driver_name || "<em>Unassigned</em>"}</td>
+				<td>${frappe.datetime.str_to_user(r.estimated_delivery_date) || "—"}</td>
+				<td class="tc"><span class="lcc-badge ${sev}">${days}d late</span></td>
+				<td class="tr">${parseFloat(r.total_qty) || 0}</td>
+			</tr>`;
+		}).join("");
+		$p.html(`<div class="lcc-table-wrap"><table class="lcc-table"><thead><tr>
+			<th>${__("Manifest")}</th><th>${__("Status")}</th><th>${__("Route")}</th>
+			<th>${__("Driver")}</th><th>${__("ETA")}</th>
+			<th class="tc">${__("Overdue")}</th><th class="tr">${__("Qty")}</th>
+		</tr></thead><tbody>${rows}</tbody></table></div>`);
+		$p.find("tbody tr").on("click", function (e) { if (e.target.tagName === "A") return; frappe.set_route("Form", "CH Transfer Manifest", $(this).data("name")); });
+	}
+
+	// ══════════════════════════════════════════════════════════════
+	// OPERATIONS MODE
+	// ══════════════════════════════════════════════════════════════
+
+	_ops_init() {
+		const co = this.filters?.fields?.company?.get_value() || "";
+		$("#lcc-content").html(`
+			<div class="lcc-ops">
+				<div class="lcc-ops-toolbar">
+					<div class="lcc-ops-toolbar-left">
+						<label class="lcc-ops-label">${__("Date")}:</label>
+						<input type="date" class="form-control input-sm lcc-ops-date" value="${this.trip_date}">
+						<label class="lcc-ops-label">${__("Days")}:</label>
+						<select class="form-control input-sm lcc-ops-days">
+							<option value="1" ${this.include_days===1?"selected":""}>1</option>
+							<option value="3" ${this.include_days===3?"selected":""}>3</option>
+							<option value="7" ${this.include_days===7?"selected":""}>7</option>
+						</select>
+						<button class="btn btn-sm btn-default lcc-ops-refresh-btn">
+							<i class="fa fa-refresh"></i> ${__("Refresh")}
+						</button>
+						<button class="btn btn-sm btn-default lcc-ops-map-btn">
+							<i class="fa fa-map-marker"></i> ${__("Map")}
+						</button>
+					</div>
+					<div class="lcc-ops-kpi-bar" id="lcc-ops-kpi-bar"></div>
+				</div>
+
+				<div class="lcc-ops-board" id="lcc-ops-board">
+					<div class="lcc-loading">${__("Loading…")}</div>
+				</div>
+
+				<div class="lcc-ops-map-wrap" id="lcc-ops-map-wrap" style="display:none">
+					<div class="lcc-ops-map-info" id="lcc-ops-map-info"></div>
+					<div id="lcc-ops-map" style="height:440px;border-radius:var(--lcc-radius);border:1px solid var(--lcc-border);"></div>
+				</div>
+
+				<div class="lcc-tabs lcc-ops-tabs">
+					<button class="lcc-tab active" data-tab="manifests">
+						<i class="fa fa-inbox"></i> ${__("Unassigned Manifests")}
+						<span class="lcc-tab-badge" id="lcc-cnt-mf">0</span>
+					</button>
+					<button class="lcc-tab" data-tab="exceptions">
+						<i class="fa fa-exclamation-triangle"></i> ${__("Exception Inbox")}
+						<span class="lcc-tab-badge lcc-tab-badge-warn" id="lcc-cnt-exc">0</span>
+					</button>
+					<button class="lcc-tab" data-tab="drivers">
+						<i class="fa fa-id-card"></i> ${__("Drivers")}
+						<span class="lcc-tab-badge" id="lcc-cnt-drv">0</span>
+					</button>
+				</div>
+				<div class="lcc-ops-bottom" id="lcc-ops-bottom"></div>
+			</div>
+		`);
+		this._ops_bind_events();
+		this._ops_load();
+	}
+
+	_ops_bind_events() {
+		const $r = this.$root;
+		$r.on("change", ".lcc-ops-date",    (e) => { this.trip_date = $(e.currentTarget).val(); this._ops_load(); });
+		$r.on("change", ".lcc-ops-days",    (e) => { this.include_days = parseInt($(e.currentTarget).val()) || 1; this._ops_load(); });
+		$r.on("click",  ".lcc-ops-refresh-btn", () => this._ops_load());
+		$r.on("click",  ".lcc-ops-map-btn", () => this._ops_map_toggle());
+
+		$r.on("click", ".lcc-ops-tabs .lcc-tab", (e) => {
+			this.bottom_tab = $(e.currentTarget).data("tab");
+			$r.find(".lcc-ops-tabs .lcc-tab").removeClass("active");
+			$(e.currentTarget).addClass("active");
+			this._ops_render_bottom();
+		});
+
+		$r.on("click",  ".lcc-trip-card",     (e) => this._ops_open_trip($(e.currentTarget).data("name")));
+		$r.on("click",  ".lcc-side-close",    () => this._ops_close_side());
+		$r.on("change", ".lcc-mf-check",      (e) => { const n = $(e.currentTarget).data("name"); e.currentTarget.checked ? this.selected_manifests.add(n) : this.selected_manifests.delete(n); this._ops_update_attach(); });
+		$r.on("click",  ".lcc-attach-btn",    () => this._ops_attach());
+		$r.on("click",  ".lcc-exc-resolve",   (e) => this._ops_resolve_exc($(e.currentTarget).data("trip"), $(e.currentTarget).data("row")));
+		$r.on("click",  "#lcc-side-assign",   () => this._ops_assign_driver());
+		$r.on("click",  "#lcc-side-start",    () => this._ops_trip_action("trip_start"));
+		$r.on("click",  "#lcc-side-complete", () => this._ops_trip_action("trip_complete"));
+		$r.on("click",  "#lcc-side-close-trip",()=> this._ops_trip_action("trip_close"));
+		$r.on("click",  "#lcc-side-cancel",   () => this._ops_trip_action("trip_unassign"));
+		$r.on("click",  ".lcc-side-detach",   (e) => this._ops_detach_manifest($(e.currentTarget).data("name")));
+		$r.on("click",  ".lcc-trip-link",     (e) => { e.preventDefault(); this._ops_open_trip($(e.currentTarget).data("name")); });
+	}
+
+	async _ops_load() {
+		const co = this.filters?.fields?.company?.get_value() || undefined;
+		const args_board = { trip_date: this.trip_date, include_days: this.include_days };
+		if (co) args_board.company = co;
+
+		const [b, u, x, d] = await Promise.all([
+			frappe.call({ method: _LCC + "ops_board",              args: args_board }),
+			frappe.call({ method: _LCC + "ops_unassigned_manifests", args: { limit: 100 } }),
+			frappe.call({ method: _LCC + "ops_exception_inbox",     args: { resolution_status: "Open", limit: 100 } }),
+			frappe.call({ method: _LCC + "ops_drivers_available" }),
+		]);
+
+		this.board      = b.message || { buckets: {}, totals: {} };
+		this.unassigned = u.message || [];
+		this.exceptions = x.message || [];
+		this.drivers    = d.message || [];
+		this.selected_manifests.clear();
+
+		this._ops_render_board();
+		this._ops_render_kpi();
+		this._ops_render_bottom();
+		if (this.active_trip) this._ops_open_trip(this.active_trip);
+	}
+
+	/* ── KPI bar ──────────────────────────────────────────────── */
+
+	_ops_render_kpi() {
+		const t = this.board.totals || {};
+		const total = Object.values(t).reduce((a, b) => a + b, 0);
+		$("#lcc-ops-kpi-bar").html(`
+			<span class="lcc-ops-kpi-total"><b>${total}</b> ${__("trips")}</span>
+			<span class="lcc-ops-kpip lcc-kpip-started">${t.Started || 0} ${__("active")}</span>
+			<span class="lcc-ops-kpip lcc-kpip-assigned">${t.Assigned || 0} ${__("assigned")}</span>
+			<span class="lcc-ops-kpip lcc-kpip-draft">${t.Draft || 0} ${__("draft")}</span>
+		`);
+	}
+
+	/* ── Trip board ───────────────────────────────────────────── */
+
+	_ops_render_board() {
+		const ORDER = ["Draft","Assigned","Started","Completed","Closed","Cancelled"];
+		const buckets = this.board.buckets || {};
+		const $board = $("#lcc-ops-board").empty();
+
+		if (!ORDER.some((s) => (buckets[s] || []).length > 0)) {
+			$board.html(`<div class="lcc-empty"><i class="fa fa-calendar-times-o"></i> ${__("No trips for this period.")}</div>`);
+			return;
+		}
+		ORDER.forEach((status) => {
+			const trips = buckets[status] || [];
+			if (!trips.length && ["Closed","Cancelled"].includes(status)) return;
+			const $col = $(`
+				<div class="lcc-ops-col">
+					<div class="lcc-ops-col-head lcc-ops-s-${status.toLowerCase().replace(/ /g,"-")}">
+						${__(status)} <span class="lcc-ops-col-cnt">${trips.length}</span>
+					</div>
+					<div class="lcc-ops-col-body"></div>
+				</div>`).appendTo($board);
+			trips.forEach((t) => $col.find(".lcc-ops-col-body").append(this._trip_card(t)));
+		});
+	}
+
+	_trip_card(t) {
+		const dir = t.direction === "Reverse" ? "↩" : t.direction === "Mixed" ? "↔" : "→";
+		const start = t.planned_start ? frappe.datetime.str_to_user(t.planned_start) : "—";
+		const exc_badge = (t.open_exceptions || 0) > 0
+			? `<span class="lcc-card-exc ${t.critical_exceptions ? "is-crit" : ""}"><i class="fa fa-exclamation-triangle"></i> ${t.open_exceptions}</span>` : "";
+		return `<div class="lcc-trip-card" data-name="${frappe.utils.escape_html(t.name)}">
+			<div class="lcc-card-top">
+				<span class="lcc-card-name">${dir} ${frappe.utils.escape_html(t.name)}</span>
+				${exc_badge}
+			</div>
+			<div class="lcc-card-meta">
+				<div><i class="fa fa-user"></i> ${frappe.utils.escape_html(t.driver_name || __("Unassigned"))}</div>
+				<div><i class="fa fa-truck"></i> ${frappe.utils.escape_html(t.vehicle_number || "—")}</div>
+				<div><i class="fa fa-clock-o"></i> ${start}</div>
+				<div><i class="fa fa-cube"></i> ${t.total_shipments || 0} ${__("shipments")}</div>
+			</div>
+		</div>`;
+	}
+
+	/* ── Bottom tabs ──────────────────────────────────────────── */
+
+	_ops_render_bottom() {
+		const exc_cnt = this.exceptions.length;
+		$("#lcc-cnt-mf").text(this.unassigned.length);
+		$("#lcc-cnt-exc").text(exc_cnt).toggleClass("has-items", exc_cnt > 0);
+		$("#lcc-cnt-drv").text(this.drivers.length);
+
+		const $b = $("#lcc-ops-bottom").empty();
+		if (this.bottom_tab === "manifests")  return this._ops_render_manifests($b);
+		if (this.bottom_tab === "exceptions") return this._ops_render_exceptions($b);
+		if (this.bottom_tab === "drivers")    return this._ops_render_drivers($b);
+	}
+
+	_ops_render_manifests($b) {
+		if (!this.unassigned.length) {
+			$b.html(`<div class="lcc-empty"><i class="fa fa-check-circle"></i> ${__("No unassigned manifests.")}</div>`);
+			return;
+		}
+		const rows = this.unassigned.map((m) => `<tr>
+			<td><input type="checkbox" class="lcc-mf-check" data-name="${m.name}"></td>
+			<td><a href="/app/ch-transfer-manifest/${m.name}" target="_blank">${frappe.utils.escape_html(m.name)}</a></td>
+			<td>${frappe.utils.escape_html(m.direction || "—")}</td>
+			<td><span class="lcc-prio lcc-prio-${(m.shipment_priority || "Normal").toLowerCase()}">${m.shipment_priority || "Normal"}</span></td>
+			<td>${frappe.utils.escape_html(m.source_warehouse || "—")} → ${frappe.utils.escape_html(m.destination_warehouse || "—")}</td>
+			<td>${m.total_qty || 0}</td>
+			<td>${m.box_count || 0}</td>
+			<td>${frappe.datetime.str_to_user(m.creation)}</td>
+		</tr>`).join("");
+
+		$b.html(`
+			<div class="lcc-ops-bar">
+				<button class="btn btn-sm btn-primary lcc-attach-btn" disabled>
+					<i class="fa fa-link"></i> ${__("Attach to Trip")} (<span class="lcc-attach-n">0</span>)
+				</button>
+			</div>
+			<div class="lcc-table-wrap"><table class="lcc-table">
+				<thead><tr>
+					<th style="width:32px"></th>
+					<th>${__("Manifest")}</th><th>${__("Dir")}</th><th>${__("Priority")}</th>
+					<th>${__("Route")}</th><th class="tr">${__("Qty")}</th>
+					<th class="tr">${__("Boxes")}</th><th>${__("Created")}</th>
+				</tr></thead>
+				<tbody>${rows}</tbody>
+			</table></div>`);
+	}
+
+	_ops_render_exceptions($b) {
+		if (!this.exceptions.length) {
+			$b.html(`<div class="lcc-empty"><i class="fa fa-check-circle"></i> ${__("No open exceptions.")}</div>`);
+			return;
+		}
+		const rows = this.exceptions.map((e) => `<tr>
+			<td><span class="lcc-sev lcc-sev-${(e.severity || "medium").toLowerCase()}">${e.severity || ""}</span></td>
+			<td>${frappe.utils.escape_html(e.exception_type || "")}</td>
+			<td>
+				<a href="#" class="lcc-trip-link" data-name="${e.trip}">${e.trip}</a>
+				<div class="lcc-muted">${frappe.utils.escape_html(e.driver_name || "")}</div>
+			</td>
+			<td>${e.stop_sequence || "—"}</td>
+			<td class="lcc-exc-remarks">${frappe.utils.escape_html(e.remarks || "")}</td>
+			<td>${frappe.datetime.str_to_user(e.occurred_at)}</td>
+			<td>
+				<button class="btn btn-xs btn-success lcc-exc-resolve"
+					data-trip="${e.trip}" data-row="${e.row_name}">${__("Resolve")}</button>
+			</td>
+		</tr>`).join("");
+
+		$b.html(`<div class="lcc-table-wrap"><table class="lcc-table">
+			<thead><tr>
+				<th>${__("Severity")}</th><th>${__("Type")}</th><th>${__("Trip / Driver")}</th>
+				<th>${__("Stop")}</th><th>${__("Remarks")}</th><th>${__("When")}</th><th></th>
+			</tr></thead>
+			<tbody>${rows}</tbody>
+		</table></div>`);
+	}
+
+	_ops_render_drivers($b) {
+		if (!this.drivers.length) {
+			$b.html(`<div class="lcc-empty">${__("No drivers found.")}</div>`);
+			return;
+		}
+		const rows = this.drivers.map((d) => `<tr>
+			<td><strong>${frappe.utils.escape_html(d.full_name || d.name)}</strong></td>
+			<td>${frappe.utils.escape_html(d.cell_number || "—")}</td>
+			<td><span class="lcc-avail lcc-avail-${(d.availability_status || "Available").replace(/ /g,"-").toLowerCase()}">${d.availability_status || "—"}</span></td>
+			<td>${d.current_trip ? `<a href="#" class="lcc-trip-link" data-name="${d.current_trip}">${d.current_trip}</a>` : "—"}</td>
+			<td>${frappe.utils.escape_html(d.status || "")}</td>
+		</tr>`).join("");
+
+		$b.html(`<div class="lcc-table-wrap"><table class="lcc-table">
+			<thead><tr>
+				<th>${__("Driver")}</th><th>${__("Phone")}</th>
+				<th>${__("Availability")}</th><th>${__("Current Trip")}</th><th>${__("HR Status")}</th>
+			</tr></thead>
+			<tbody>${rows}</tbody>
+		</table></div>`);
+	}
+
+	_ops_update_attach() {
+		const n = this.selected_manifests.size;
+		this.$root.find(".lcc-attach-btn").prop("disabled", n === 0).find(".lcc-attach-n").text(n);
+	}
+
+	/* ── Side panel ───────────────────────────────────────────── */
+
+	async _ops_open_trip(name) {
+		this.active_trip = name;
+		const $s = $("#lcc-side").addClass("open");
+		$s.html(`<div class="lcc-loading">${__("Loading…")}</div>`);
+		const r = await frappe.call({ method: _LCC + "get_trip_detail", args: { trip: name } });
+		const t = r.message;
+		if (!t) { $s.html(`<div class="lcc-empty">${__("Trip not found.")}</div>`); return; }
+		$s.html(this._ops_side_html(t));
+	}
+
+	_ops_close_side() {
+		$("#lcc-side").removeClass("open").empty();
+		this.active_trip = null;
+	}
+
+	_ops_side_html(t) {
+		const can_assign   = ["Draft","Assigned"].includes(t.status);
+		const can_start    = t.status === "Assigned";
+		const can_complete = t.status === "Started";
+		const can_close    = t.status === "Completed";
+		const can_unassign = t.status === "Assigned";
+
+		const mf_by_stop = {};
+		(t.manifests || []).forEach((m) => {
+			const k = m.stop_sequence || 0;
+			(mf_by_stop[k] = mf_by_stop[k] || []).push(m);
+		});
+
+		const stops_html = (t.stops || []).map((s) => {
+			const mfs = (mf_by_stop[s.sequence] || []).map((m) => `
+				<div class="lcc-side-mf">
+					<a href="/app/ch-transfer-manifest/${m.name}" target="_blank">${m.name}</a>
+					<span class="lcc-muted">${m.status || ""} · ${m.total_qty || 0}q</span>
+					${can_assign ? `<button class="btn btn-xs btn-default lcc-side-detach" data-name="${m.name}"><i class="fa fa-unlink"></i></button>` : ""}
+				</div>`).join("") || `<div class="lcc-muted">${__("No manifests")}</div>`;
+			return `<div class="lcc-side-stop">
+				<div class="lcc-side-stop-head">
+					<b>#${s.sequence}</b> ${frappe.utils.escape_html(s.warehouse || "")}
+					<span class="lcc-sev lcc-sev-${(s.status || "").toLowerCase().replace(/ /g,"-")}">${s.status}</span>
+				</div>
+				<div class="lcc-side-stop-meta">${s.stop_type || ""} · ETA ${s.eta ? frappe.datetime.str_to_user(s.eta) : "—"}</div>
+				<div class="lcc-side-mfs">${mfs}</div>
+			</div>`;
+		}).join("") || `<div class="lcc-empty">${__("No stops")}</div>`;
+
+		const excs_html = (t.exceptions || []).length
+			? `<div class="lcc-side-sec">${__("Exceptions")}</div>` +
+			  t.exceptions.map((e) => `
+				<div class="lcc-side-exc">
+					<span class="lcc-sev lcc-sev-${(e.severity||"medium").toLowerCase()}">${e.severity}</span>
+					<b>${frappe.utils.escape_html(e.exception_type || "")}</b>
+					<span class="lcc-muted">#${e.stop_sequence || "—"} · ${e.resolution_status}</span>
+					<div>${frappe.utils.escape_html(e.remarks || "")}</div>
+				</div>`).join("")
+			: "";
+
+		return `
+			<div class="lcc-side-head">
+				<div>
+					<h4>${frappe.utils.escape_html(t.name)}
+						<span class="lcc-side-status lcc-ops-s-${(t.status||"").toLowerCase()}">${t.status}</span>
+					</h4>
+					<div class="lcc-muted">${t.trip_date} · ${t.direction} · ${frappe.utils.escape_html(t.route || "—")}</div>
+				</div>
+				<button class="btn btn-sm btn-default lcc-side-close">✕</button>
+			</div>
+			<div class="lcc-side-info">
+				<div><b>${__("Driver")}:</b> ${frappe.utils.escape_html(t.driver_name || __("Unassigned"))}${t.driver_phone ? ` · ${t.driver_phone}` : ""}</div>
+				<div><b>${__("Vehicle")}:</b> ${frappe.utils.escape_html(t.vehicle_number || "—")}</div>
+				<div><b>${__("Hub")}:</b> ${frappe.utils.escape_html(t.hub_warehouse || "—")}</div>
+				<div><b>${__("Shipments")}:</b> ${t.total_shipments || 0}</div>
+			</div>
+			<div class="lcc-side-actions">
+				${can_assign   ? `<button class="btn btn-sm btn-default" id="lcc-side-assign"><i class="fa fa-user-plus"></i> ${__("Assign Driver")}</button>` : ""}
+				${can_start    ? `<button class="btn btn-sm btn-warning" id="lcc-side-start"><i class="fa fa-play"></i> ${__("Start")}</button>` : ""}
+				${can_complete ? `<button class="btn btn-sm btn-success" id="lcc-side-complete"><i class="fa fa-check"></i> ${__("Complete")}</button>` : ""}
+				${can_close    ? `<button class="btn btn-sm btn-primary" id="lcc-side-close-trip"><i class="fa fa-archive"></i> ${__("Close")}</button>` : ""}
+				${can_unassign ? `<button class="btn btn-sm btn-default" id="lcc-side-cancel"><i class="fa fa-user-times"></i> ${__("Unassign")}</button>` : ""}
+			</div>
+			<div class="lcc-side-sec">${__("Stops")}</div>
+			${stops_html}
+			${excs_html}
+		`;
+	}
+
+	_ops_trip_action(method) {
+		if (!this.active_trip) return;
+		frappe.call({ method: _LCC + method, args: { trip: this.active_trip } })
+			.then(() => { frappe.show_alert({ message: __("Done"), indicator: "green" }); this._ops_load(); });
+	}
+
+	_ops_assign_driver() {
+		if (!this.active_trip) return;
+		const trip = this.active_trip;
+		const d = new frappe.ui.Dialog({
+			title: __("Assign Driver"),
+			fields: [
+				{ fieldtype: "Link", fieldname: "driver", label: __("Driver"), options: "Driver", reqd: 1 },
+				{ fieldtype: "Link", fieldname: "vehicle", label: __("Vehicle"), options: "Vehicle" },
+			],
+			primary_action_label: __("Assign"),
+			primary_action: (vals) => {
+				frappe.call({ method: _LCC + "trip_assign_driver", args: { trip, driver: vals.driver, vehicle: vals.vehicle || null } })
+					.then(() => { d.hide(); frappe.show_alert({ message: __("Driver assigned"), indicator: "green" }); this._ops_load(); });
+			},
+		});
+		d.show();
+	}
+
+	_ops_detach_manifest(manifest) {
+		frappe.confirm(__("Detach manifest {0}?", [manifest]), () => {
+			frappe.call({ method: _LCC + "detach_manifest", args: { manifest } })
+				.then(() => { frappe.show_alert({ message: __("Detached"), indicator: "green" }); this._ops_load(); });
+		});
+	}
+
+	_ops_attach() {
+		if (!this.selected_manifests.size) return;
+		const manifests = Array.from(this.selected_manifests);
+		const opts = [];
+		Object.values(this.board.buckets || {}).flat()
+			.filter((t) => ["Draft","Assigned"].includes(t.status))
+			.forEach((t) => opts.push(t.name));
+
+		if (!opts.length) {
+			frappe.msgprint(__("No open trips (Draft/Assigned) available to attach to."));
+			return;
+		}
+		const d = new frappe.ui.Dialog({
+			title: __("Attach {0} manifest(s) to trip", [manifests.length]),
+			fields: [{ fieldtype: "Select", fieldname: "trip", label: __("Trip"), options: opts.join("\n"), reqd: 1 }],
+			primary_action_label: __("Attach"),
+			primary_action: (vals) => {
+				frappe.call({ method: _LCC + "attach_manifests", args: { trip: vals.trip, manifests: JSON.stringify(manifests) } })
+					.then(() => { d.hide(); frappe.show_alert({ message: __("Attached"), indicator: "green" }); this._ops_load(); });
+			},
+		});
+		d.show();
+	}
+
+	_ops_resolve_exc(trip, row_name) {
+		frappe.call({ method: _LCC + "exception_resolve", args: { trip, row_name, resolution_status: "Resolved" } })
+			.then(() => { frappe.show_alert({ message: __("Exception resolved"), indicator: "green" }); this._ops_load(); });
+	}
+
+	/* ── Map ──────────────────────────────────────────────────── */
+
+	async _ops_map_toggle() {
+		this.map_open = !this.map_open;
+		const $wrap = $("#lcc-ops-map-wrap");
+		if (!this.map_open) { $wrap.hide(); return; }
+		$wrap.show();
+		try { await this._ensure_leaflet(); } catch (err) {
+			$("#lcc-ops-map-info").html(`<div class="lcc-empty">${__("Could not load map: {0}", [err.message || err])}</div>`);
+			return;
+		}
+		this._ops_load_map();
+	}
+
+	_ensure_leaflet() {
+		if (window.L) return Promise.resolve();
+		if (this._leaflet_loading) return this._leaflet_loading;
+		this._leaflet_loading = new Promise((resolve, reject) => {
+			const css = document.createElement("link"); css.rel = "stylesheet";
+			css.href = "https://unpkg.com/leaflet@1.9.4/dist/leaflet.css";
+			document.head.appendChild(css);
+			const js = document.createElement("script");
+			js.src = "https://unpkg.com/leaflet@1.9.4/dist/leaflet.js";
+			js.onload = resolve; js.onerror = () => reject(new Error("network"));
+			document.head.appendChild(js);
+		});
+		return this._leaflet_loading;
+	}
+
+	async _ops_load_map() {
+		const r = await frappe.call({ method: _LCC + "ops_map_data", args: { trip_date: this.trip_date, include_days: this.include_days } });
+		const data = r.message || { trips: [], manifests_with_coords: 0, manifests_total: 0 };
+		const $info = $("#lcc-ops-map-info");
+		$info.html(`<span class="lcc-map-summary"><b>${data.trips.length}</b> ${__("trips")} · ${data.manifests_with_coords}/${data.manifests_total} ${__("manifests with coords")}</span>`);
+
+		const el = document.getElementById("lcc-ops-map");
+		if (this._map) { this._map.remove(); this._map = null; }
+		this._map = L.map(el).setView([20.5937, 78.9629], 5);
+		L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 19, attribution: "&copy; OpenStreetMap" }).addTo(this._map);
+
+		if (!data.trips.length || !data.manifests_with_coords) {
+			$info.append(` <span class="lcc-muted">${__("No GPS coordinates yet.")}</span>`);
+			return;
+		}
+		const sc = { Draft:"#9aa0a6", Assigned:"#f29900", Started:"#1a73e8", Completed:"#188038", Closed:"#5f6368" };
+		const all_pts = [];
+		data.trips.forEach((t) => {
+			const clr = sc[t.status] || "#1a73e8";
+			const pts = [];
+			t.manifests.forEach((m) => {
+				if (m.pickup) {
+					const ll = [m.pickup.lat, m.pickup.lng];
+					L.circleMarker(ll, { radius: 7, color: "#188038", fillColor: "#188038", fillOpacity: 0.85, weight: 2 })
+						.bindPopup(`<b>${__("Pickup")}</b><br>${frappe.utils.escape_html(m.name)}`).addTo(this._map);
+					pts.push(ll); all_pts.push(ll);
+				}
+				if (m.delivery) {
+					const ll = [m.delivery.lat, m.delivery.lng];
+					L.circleMarker(ll, { radius: 7, color: "#1a73e8", fillColor: "#1a73e8", fillOpacity: 0.85, weight: 2 })
+						.bindPopup(`<b>${__("Delivery")}</b><br>${frappe.utils.escape_html(m.name)}`).addTo(this._map);
+					pts.push(ll); all_pts.push(ll);
+				}
+			});
+			if (pts.length >= 2) L.polyline(pts, { color: clr, weight: 3, opacity: 0.6 }).bindTooltip(`${t.trip} · ${t.status}`).addTo(this._map);
+		});
+		if (all_pts.length) this._map.fitBounds(L.latLngBounds(all_pts), { padding: [40, 40] });
+	}
+
+	// ══════════════════════════════════════════════════════════════
+	// DIALOGS
+	// ══════════════════════════════════════════════════════════════
+
+	_dlg_new_trip() {
+		const d = new frappe.ui.Dialog({
+			title: __("New Trip"),
+			fields: [
+				{ fieldtype: "Date",     fieldname: "trip_date",     label: __("Trip Date"),   reqd: 1, default: this.trip_date },
+				{ fieldtype: "Link",     fieldname: "company",       label: __("Company"),     options: "Company", reqd: 1, default: frappe.defaults.get_default("company") },
+				{ fieldtype: "Link",     fieldname: "route",         label: __("Route"),       options: "CH Route" },
+				{ fieldtype: "Select",   fieldname: "direction",     label: __("Direction"),   options: "Forward\nReverse\nMixed", default: "Forward" },
+				{ fieldtype: "Column Break" },
+				{ fieldtype: "Link",     fieldname: "driver",        label: __("Driver"),      options: "Driver" },
+				{ fieldtype: "Link",     fieldname: "vehicle",       label: __("Vehicle"),     options: "Vehicle" },
+				{ fieldtype: "Datetime", fieldname: "planned_start", label: __("Planned Start") },
+				{ fieldtype: "Datetime", fieldname: "planned_end",   label: __("Planned End") },
+			],
+			primary_action_label: __("Create"),
+			primary_action: (vals) => {
+				frappe.call({ method: _LCC + "trip_create", args: vals }).then((r) => {
+					d.hide();
+					frappe.show_alert({ message: __("Trip {0} created", [r.message]), indicator: "green" });
+					if (this.mode === "ops") {
+						this._ops_load();
+						if (r.message) this._ops_open_trip(r.message);
+					} else {
+						this._switch_mode("ops");
+					}
+				});
+			},
+		});
+		d.show();
+	}
+
+	_dlg_auto_plan() {
+		const d = new frappe.ui.Dialog({
+			title: __("Auto-plan Trips"),
+			fields: [
+				{ fieldname: "trip_date",     fieldtype: "Date",   label: __("Trip Date"), reqd: 1, default: this.trip_date },
+				{ fieldname: "direction",     fieldtype: "Select", label: __("Direction"), options: "Forward\nReverse\nMixed", default: "Forward", reqd: 1 },
+				{ fieldname: "company",       fieldtype: "Link",   label: __("Company"),   options: "Company", reqd: 1, default: frappe.defaults.get_user_default("Company") },
+				{ fieldname: "hub_warehouse", fieldtype: "Link",   label: __("Hub Warehouse"), options: "Warehouse" },
+				{ fieldname: "max_stops",     fieldtype: "Int",    label: __("Max Stops / Trip"), default: 20 },
+				{ fieldname: "driver",        fieldtype: "Link",   label: __("Driver (optional)"), options: "Driver" },
+			],
+			primary_action_label: __("Preview"),
+			primary_action: (vals) => {
+				frappe.call({ method: _LCC + "auto_plan_trips", args: { ...vals, commit: 0 }, freeze: true })
+					.then((r) => {
+						const res = r.message || { proposals: [] };
+						if (!res.proposals.length) {
+							frappe.msgprint({ title: __("No proposals"), message: res.skipped_reason || __("No unassigned manifests match.") });
+							return;
+						}
+						const html = res.proposals.map((p, i) =>
+							`<div style="margin-bottom:8px"><b>${__("Trip")} ${i + 1}</b> — ${p.stops.length} ${__("stops")}, ${p.manifests.length} ${__("manifests")}
+							<ul style="margin:4px 0 0 18px">${p.stops.map((s) => `<li>${frappe.utils.escape_html(s.store || s.warehouse)} <span class="text-muted">(${s.stop_type || "Drop"} · ${s.manifest_count})</span></li>`).join("")}</ul></div>`
+						).join("");
+						frappe.confirm(
+							`<div>${__("Create")} <b>${res.proposals.length}</b> ${__("trip(s)?")}</div>
+							 <div style="max-height:300px;overflow:auto;margin-top:8px">${html}</div>`,
+							() => {
+								frappe.call({ method: _LCC + "auto_plan_trips", args: { ...vals, commit: 1 }, freeze: true })
+									.then((r2) => {
+										const c = (r2.message && r2.message.created) || [];
+										frappe.show_alert({ message: __("Created {0} trip(s)", [c.length]), indicator: "green" });
+										d.hide();
+										if (this.mode === "ops") this._ops_load();
+									});
+							}
+						);
+					});
+			},
+		});
+		d.show();
+	}
+
+	// ══════════════════════════════════════════════════════════════
+	// SHARED HELPERS
+	// ══════════════════════════════════════════════════════════════
+
+	_go_list(doctype, filters = {}) {
+		const from = this.filters?.fields?.from_date?.get_value();
+		const to   = this.filters?.fields?.to_date?.get_value();
+		const co   = this.filters?.fields?.company?.get_value();
+		if (co) filters.company = co;
+		const df_map = { "CH Transfer Manifest": "manifest_date", "Stock Entry": "posting_date" };
+		const df = df_map[doctype];
+		if (df && from && to)  filters[df] = ["between", [from, to]];
+		else if (df && from)   filters[df] = [">=", from];
+		else if (df && to)     filters[df] = ["<=", to];
+		frappe.set_route("List", doctype, filters);
+	}
+}

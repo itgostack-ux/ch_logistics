@@ -1,0 +1,684 @@
+{
+ "actions": [],
+ "allow_import": 1,
+ "allow_rename": 0,
+ "autoname": "naming_series:",
+ "creation": "2026-04-08 10:00:00.000000",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "naming_series",
+  "manifest_date",
+  "company",
+  "col_break_header",
+  "status",
+  "trip",
+  "amended_from",
+  "sec_route",
+  "source_warehouse",
+  "source_store",
+  "col_break_route",
+  "destination_warehouse",
+  "destination_store",
+  "sec_logistics",
+  "courier_partner",
+  "tracking_number",
+  "vehicle_number",
+  "col_break_logistics",
+  "driver",
+  "driver_name",
+  "driver_phone",
+  "estimated_delivery_date",
+  "sec_transfers",
+  "transfers",
+  "sec_packages",
+  "packages",
+  "sec_pickup",
+  "pickup_photo",
+  "pickup_datetime",
+  "col_break_pickup",
+  "pickup_lat",
+  "pickup_lng",
+  "pickup_notes",
+  "sec_delivery",
+  "delivery_photo",
+  "delivery_datetime",
+  "col_break_delivery",
+  "delivery_lat",
+  "delivery_lng",
+  "receiver_name",
+  "delivery_otp",
+  "delivery_otp_verified",
+  "sec_receiving",
+  "received_by",
+  "received_datetime",
+  "col_break_receiving",
+  "damage_reported",
+  "damage_notes",
+  "damage_photo",
+  "sec_summary",
+  "total_stock_entries",
+  "total_items",
+  "col_break_summary",
+  "total_qty",
+  "notes",
+  "sec_recall",
+  "recall_reason",
+  "recall_initiated_by",
+  "recall_initiated_at",
+  "col_break_recall",
+  "recall_notes",
+  "return_photo",
+  "return_confirmed_by",
+  "return_confirmed_at",
+  "reversed_stock_entries",
+  "direction",
+  "stop_sequence",
+  "shipment_priority",
+  "box_count",
+  "qr_payload"
+ ],
+ "fields": [
+  {
+   "fieldname": "naming_series",
+   "fieldtype": "Select",
+   "hidden": 1,
+   "label": "Naming Series",
+   "options": "TM-.YYYY.-.#####",
+   "default": "TM-.YYYY.-.#####"
+  },
+  {
+   "fieldname": "manifest_date",
+   "fieldtype": "Date",
+   "default": "Today",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Manifest Date",
+   "reqd": 1,
+   "search_index": 1
+  },
+  {
+   "fieldname": "company",
+   "fieldtype": "Link",
+   "label": "Company",
+   "options": "Company",
+   "reqd": 1
+  },
+  {
+   "fieldname": "col_break_header",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "status",
+   "fieldtype": "Select",
+   "default": "Draft",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Status",
+   "options": "Draft\nPacked\nAssigned\nPickup Started\nRejected\nIn Transit\nRecall Initiated\nDelivered\nPartially Received\nReceived\nClosed\nCancelled\nReturned",
+   "read_only": 1,
+   "search_index": 1
+  },
+  {
+   "fieldname": "trip",
+   "fieldtype": "Link",
+   "in_standard_filter": 1,
+   "label": "Logistics Trip",
+   "options": "CH Logistics Trip",
+   "read_only": 1,
+   "search_index": 1
+  },
+  {
+   "fieldname": "amended_from",
+   "fieldtype": "Link",
+   "hidden": 1,
+   "label": "Amended From",
+   "no_copy": 1,
+   "options": "CH Transfer Manifest",
+   "print_hide": 1,
+   "read_only": 1
+  },
+  {
+   "fieldname": "sec_route",
+   "fieldtype": "Section Break",
+   "label": "Route"
+  },
+  {
+   "fieldname": "source_warehouse",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "Source Warehouse",
+   "options": "Warehouse",
+   "reqd": 1
+  },
+  {
+   "fieldname": "source_store",
+   "fieldtype": "Link",
+   "label": "Source Store",
+   "options": "CH Store"
+  },
+  {
+   "fieldname": "col_break_route",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "destination_warehouse",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "Destination Warehouse",
+   "options": "Warehouse",
+   "reqd": 1
+  },
+  {
+   "fieldname": "destination_store",
+   "fieldtype": "Link",
+   "label": "Destination Store",
+   "options": "CH Store"
+  },
+  {
+   "fieldname": "sec_logistics",
+   "fieldtype": "Section Break",
+   "label": "Logistics"
+  },
+  {
+   "fieldname": "courier_partner",
+   "fieldtype": "Link",
+   "label": "Courier Partner",
+   "options": "Courier Partner"
+  },
+  {
+   "fieldname": "tracking_number",
+   "fieldtype": "Data",
+   "label": "Tracking / AWB Number"
+  },
+  {
+   "fieldname": "vehicle_number",
+   "fieldtype": "Data",
+   "label": "Vehicle Number"
+  },
+  {
+   "fieldname": "col_break_logistics",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "driver",
+   "fieldtype": "Link",
+   "in_standard_filter": 1,
+   "label": "Driver",
+   "options": "Driver",
+   "search_index": 1
+  },
+  {
+   "fieldname": "driver_name",
+   "fieldtype": "Data",
+   "fetch_from": "driver.full_name",
+   "label": "Driver Name",
+   "read_only": 1
+  },
+  {
+   "fieldname": "driver_phone",
+   "fieldtype": "Data",
+   "fetch_from": "driver.cell_number",
+   "label": "Driver Phone",
+   "read_only": 1
+  },
+  {
+   "fieldname": "estimated_delivery_date",
+   "fieldtype": "Datetime",
+   "label": "Estimated Delivery"
+  },
+  {
+   "fieldname": "sec_transfers",
+   "fieldtype": "Section Break",
+   "label": "Stock Transfers"
+  },
+  {
+   "fieldname": "transfers",
+   "fieldtype": "Table",
+   "label": "Transfers",
+   "options": "CH Transfer Manifest Item",
+   "reqd": 1
+  },
+  {
+   "fieldname": "sec_packages",
+   "fieldtype": "Section Break",
+   "collapsible": 1,
+   "label": "Package Details"
+  },
+  {
+   "fieldname": "packages",
+   "fieldtype": "Table",
+   "label": "Packages",
+   "options": "CH Transfer Package"
+  },
+  {
+   "fieldname": "sec_pickup",
+   "fieldtype": "Section Break",
+   "depends_on": "eval:doc.status!='Draft' && doc.status!='Packed' && doc.status!='Assigned'",
+   "label": "Pickup Proof"
+  },
+  {
+   "fieldname": "pickup_photo",
+   "fieldtype": "Attach Image",
+   "label": "Pickup Photo"
+  },
+  {
+   "fieldname": "pickup_datetime",
+   "fieldtype": "Datetime",
+   "label": "Pickup At",
+   "read_only": 1
+  },
+  {
+   "fieldname": "col_break_pickup",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "pickup_lat",
+   "fieldtype": "Float",
+   "hidden": 1,
+   "label": "Pickup Latitude"
+  },
+  {
+   "fieldname": "pickup_lng",
+   "fieldtype": "Float",
+   "hidden": 1,
+   "label": "Pickup Longitude"
+  },
+  {
+   "fieldname": "pickup_notes",
+   "fieldtype": "Small Text",
+   "label": "Pickup Notes"
+  },
+  {
+   "fieldname": "sec_delivery",
+   "fieldtype": "Section Break",
+   "depends_on": "eval:['Delivered','Received','Closed'].includes(doc.status)",
+   "label": "Delivery Proof"
+  },
+  {
+   "fieldname": "delivery_photo",
+   "fieldtype": "Attach Image",
+   "label": "Delivery Photo"
+  },
+  {
+   "fieldname": "delivery_datetime",
+   "fieldtype": "Datetime",
+   "label": "Delivered At",
+   "read_only": 1
+  },
+  {
+   "fieldname": "col_break_delivery",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "delivery_lat",
+   "fieldtype": "Float",
+   "hidden": 1,
+   "label": "Delivery Latitude"
+  },
+  {
+   "fieldname": "delivery_lng",
+   "fieldtype": "Float",
+   "hidden": 1,
+   "label": "Delivery Longitude"
+  },
+  {
+   "fieldname": "receiver_name",
+   "fieldtype": "Data",
+   "label": "Receiver Name"
+  },
+  {
+   "fieldname": "delivery_otp",
+   "fieldtype": "Data",
+   "hidden": 1,
+   "label": "Delivery OTP"
+  },
+  {
+   "fieldname": "delivery_otp_verified",
+   "fieldtype": "Check",
+   "default": "0",
+   "label": "OTP Verified",
+   "read_only": 1
+  },
+  {
+   "fieldname": "sec_receiving",
+   "fieldtype": "Section Break",
+   "depends_on": "eval:['Received','Closed'].includes(doc.status)",
+   "label": "Store Receiving"
+  },
+  {
+   "fieldname": "received_by",
+   "fieldtype": "Data",
+   "label": "Received By",
+   "read_only": 1
+  },
+  {
+   "fieldname": "received_datetime",
+   "fieldtype": "Datetime",
+   "label": "Received At",
+   "read_only": 1
+  },
+  {
+   "fieldname": "col_break_receiving",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "damage_reported",
+   "fieldtype": "Check",
+   "default": "0",
+   "label": "Damage Reported"
+  },
+  {
+   "fieldname": "damage_notes",
+   "fieldtype": "Small Text",
+   "depends_on": "eval:doc.damage_reported",
+   "label": "Damage Notes"
+  },
+  {
+   "fieldname": "damage_photo",
+   "fieldtype": "Attach Image",
+   "depends_on": "eval:doc.damage_reported",
+   "label": "Damage Photo"
+  },
+  {
+   "fieldname": "sec_summary",
+   "fieldtype": "Section Break",
+   "label": "Summary"
+  },
+  {
+   "fieldname": "total_stock_entries",
+   "fieldtype": "Int",
+   "label": "Total Stock Entries",
+   "read_only": 1
+  },
+  {
+   "fieldname": "total_items",
+   "fieldtype": "Int",
+   "label": "Total Item Lines",
+   "read_only": 1
+  },
+  {
+   "fieldname": "col_break_summary",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "total_qty",
+   "fieldtype": "Float",
+   "label": "Total Qty",
+   "read_only": 1
+  },
+  {
+   "fieldname": "notes",
+   "fieldtype": "Small Text",
+   "label": "Notes"
+  },
+  {
+   "fieldname": "sec_recall",
+   "fieldtype": "Section Break",
+   "label": "Recall / Reversal",
+   "collapsible": 1,
+   "depends_on": "eval:['Recall Initiated','Returned'].includes(doc.status)"
+  },
+  {
+   "fieldname": "recall_reason",
+   "fieldtype": "Small Text",
+   "label": "Recall Reason",
+   "read_only": 1
+  },
+  {
+   "fieldname": "recall_initiated_by",
+   "fieldtype": "Link",
+   "label": "Recall Initiated By",
+   "options": "User",
+   "read_only": 1
+  },
+  {
+   "fieldname": "recall_initiated_at",
+   "fieldtype": "Datetime",
+   "label": "Recall Initiated At",
+   "read_only": 1
+  },
+  {
+   "fieldname": "col_break_recall",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "recall_notes",
+   "fieldtype": "Small Text",
+   "label": "Recall Notes",
+   "read_only": 1
+  },
+  {
+   "fieldname": "return_photo",
+   "fieldtype": "Attach Image",
+   "label": "Return Photo"
+  },
+  {
+   "fieldname": "return_confirmed_by",
+   "fieldtype": "Data",
+   "label": "Return Confirmed By",
+   "read_only": 1
+  },
+  {
+   "fieldname": "return_confirmed_at",
+   "fieldtype": "Datetime",
+   "label": "Return Confirmed At",
+   "read_only": 1
+  },
+  {
+   "fieldname": "reversed_stock_entries",
+   "fieldtype": "Small Text",
+   "label": "Reversed Stock Entries",
+   "read_only": 1,
+   "hidden": 0,
+   "depends_on": "eval:doc.status=='Returned'"
+  },
+  {
+   "fieldname": "sec_freight",
+   "fieldtype": "Section Break",
+   "label": "Freight & Costing",
+   "insert_after": "notes"
+  },
+  {
+   "fieldname": "total_weight_kg",
+   "fieldtype": "Float",
+   "label": "Total Weight (kg)",
+   "read_only": 1,
+   "insert_after": "sec_freight"
+  },
+  {
+   "fieldname": "freight_amount",
+   "fieldtype": "Currency",
+   "label": "Freight Amount (\u20b9)",
+   "read_only": 1,
+   "insert_after": "total_weight_kg",
+   "description": "Auto-computed from courier rate card \u00d7 billable weight"
+  },
+  {
+   "fieldname": "col_break_freight",
+   "fieldtype": "Column Break",
+   "insert_after": "freight_amount"
+  },
+  {
+   "fieldname": "freight_account",
+   "fieldtype": "Link",
+   "label": "Freight Expense Account",
+   "options": "Account",
+   "insert_after": "col_break_freight"
+  },
+  {
+   "fieldname": "freight_journal_entry",
+   "fieldtype": "Link",
+   "label": "Freight JE",
+   "options": "Journal Entry",
+   "read_only": 1,
+   "no_copy": 1,
+   "print_hide": 1,
+   "insert_after": "freight_account"
+  },
+  {
+   "fieldname": "direction",
+   "fieldtype": "Select",
+   "label": "Direction",
+   "options": "Forward\nReverse\nMixed",
+   "in_list_view": 1,
+   "in_standard_filter": 1
+  },
+  {
+   "fieldname": "stop_sequence",
+   "fieldtype": "Int",
+   "label": "Stop Sequence"
+  },
+  {
+   "fieldname": "shipment_priority",
+   "fieldtype": "Select",
+   "label": "Shipment Priority",
+   "options": "Normal\nUrgent\nCritical",
+   "default": "Normal",
+   "in_list_view": 1,
+   "in_standard_filter": 1
+  },
+  {
+   "fieldname": "box_count",
+   "fieldtype": "Int",
+   "label": "Box Count"
+  },
+  {
+   "fieldname": "qr_payload",
+   "fieldtype": "Small Text",
+   "label": "QR Payload",
+   "hidden": 1
+  }
+ ],
+ "index_web_pages_for_search": 0,
+ "is_submittable": 1,
+ "links": [],
+ "modified": "2026-04-23 10:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Logistics",
+ "name": "CH Transfer Manifest",
+ "naming_rule": "By \"Naming Series\" field",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "cancel": 1,
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 1,
+   "submit": 1,
+   "write": 1
+  },
+  {
+   "cancel": 1,
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "Stock Manager",
+   "share": 1,
+   "submit": 1,
+   "write": 1
+  },
+  {
+   "cancel": 1,
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "Delivery Manager",
+   "share": 1,
+   "submit": 1,
+   "write": 1
+  },
+  {
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "Store Manager",
+   "share": 1,
+   "write": 1
+  },
+  {
+   "create": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "Stock User",
+   "share": 1,
+   "submit": 1,
+   "write": 1
+  },
+  {
+   "read": 1,
+   "write": 1,
+   "role": "Delivery User"
+  }
+ ],
+ "sort_field": "creation",
+ "sort_order": "DESC",
+ "states": [
+  {
+   "title": "Draft",
+   "color": "darkgrey"
+  },
+  {
+   "title": "Packed",
+   "color": "blue"
+  },
+  {
+   "title": "Assigned",
+   "color": "purple"
+  },
+  {
+   "title": "Pickup Started",
+   "color": "orange"
+  },
+  {
+   "title": "In Transit",
+   "color": "orange"
+  },
+  {
+   "title": "Delivered",
+   "color": "cyan"
+  },
+  {
+   "title": "Received",
+   "color": "green"
+  },
+  {
+   "title": "Closed",
+   "color": "green"
+  },
+  {
+   "title": "Recall Initiated",
+   "color": "red"
+  },
+  {
+   "title": "Returned",
+   "color": "gray"
+  },
+  {
+   "title": "Cancelled",
+   "color": "red"
+  }
+ ],
+ "title_field": "status",
+ "track_changes": 1
+}

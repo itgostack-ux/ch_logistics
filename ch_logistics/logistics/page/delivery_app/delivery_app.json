@@ -1,0 +1,14 @@
+{
+ "content": null,
+ "creation": "2025-01-01 00:00:00",
+ "doctype": "Page",
+ "icon": "fa fa-truck",
+ "idx": 0,
+ "modified": "2025-01-01 00:00:00",
+ "module": "Logistics",
+ "name": "delivery-app",
+ "page_name": "delivery-app",
+ "standard": "Yes",
+ "system_page": 0,
+ "title": "Delivery App"
+}

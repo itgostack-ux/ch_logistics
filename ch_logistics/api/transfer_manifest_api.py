@@ -1,0 +1,879 @@
+"""
+Transfer Manifest API — Whitelisted endpoints.
+
+Used by both the CH Transfer Manifest form buttons and the Delivery App page.
+"""
+
+import hashlib
+import hmac
+import json as _json
+
+import frappe
+from frappe import _
+from frappe.rate_limiter import rate_limit
+from frappe.utils import now_datetime, cint, flt
+
+
+# ── Role gating (Phase B — Outward / Inward governance) ─────────────────────
+# Maps each transition to the roles allowed to perform it. System Manager
+# always bypasses. Keep in sync with the role list in ch_transfer_manifest.json.
+_STAGE_ROLES = {
+    # Outward stages — source-store dispatch lane
+    "assign_driver":     {"Delivery Manager", "Stock Manager", "Store Manager"},
+    "start_pickup":      {"Delivery Manager", "Delivery User", "Stock Manager"},
+    "reject_manifest":   {"Delivery Manager", "Delivery User", "Stock Manager"},
+    "complete_delivery": {"Delivery User", "Delivery Manager"},
+    # Inward stages — destination-store receipt lane
+    "accept_delivery":   {"Store Manager", "Stock Manager"},
+    "close_manifest":    {"Store Manager", "Stock Manager"},
+    # Reversal — manager-only
+    "initiate_recall":   {"Stock Manager", "Delivery Manager", "Store Manager"},
+    "confirm_return":    {"Stock Manager", "Delivery Manager"},
+}
+
+
+def _require_stage_role(stage: str) -> None:
+    """Raise PermissionError if current user lacks any role required for `stage`.
+
+    System Manager and Administrator always bypass.
+    """
+    user = frappe.session.user
+    if user == "Administrator":
+        return
+    user_roles = set(frappe.get_roles(user))
+    if "System Manager" in user_roles:
+        return
+    needed = _STAGE_ROLES.get(stage, set())
+    if not needed:
+        return
+    if user_roles & needed:
+        return
+    frappe.throw(
+        _("You do not have the required role to <b>{0}</b>. Required: {1}").format(
+            stage.replace("_", " ").title(),
+            ", ".join(sorted(needed)),
+        ),
+        frappe.PermissionError,
+        title=_("Transfer Manifest — Role Required"),
+    )
+
+
+# ── Manifest CRUD ────────────────────────────────────────────────────────────
+
+@frappe.whitelist()
+def create_manifest(stock_entries, source_warehouse=None, destination_warehouse=None,
+                    source_store=None, destination_store=None) -> dict:
+    """Create a manifest from a list of Stock Entry names (comma-separated or list)."""
+    if isinstance(stock_entries, str):
+        stock_entries = [s.strip() for s in stock_entries.split(",") if s.strip()]
+
+    if not stock_entries:
+        frappe.throw(_("No Stock Entries provided."), title=_("API Error"))
+
+    # Infer warehouses from first Stock Entry if not supplied
+    if not source_warehouse or not destination_warehouse:
+        se = frappe.get_doc("Stock Entry", stock_entries[0])
+        source_warehouse = source_warehouse or se.from_warehouse
+        destination_warehouse = destination_warehouse or se.to_warehouse
+
+    doc = frappe.new_doc("CH Transfer Manifest")
+    doc.source_warehouse = source_warehouse
+    doc.destination_warehouse = destination_warehouse
+    doc.source_store = source_store
+    doc.destination_store = destination_store
+
+    for se_name in stock_entries:
+        doc.append("transfers", {"stock_entry": se_name})
+
+    doc.insert()
+    return doc.name
+
+
+@frappe.whitelist()
+def get_manifest(manifest) -> dict:
+    """Return full manifest doc as dict."""
+    doc = frappe.get_doc("CH Transfer Manifest", manifest)
+    doc.check_permission("read")
+    return doc.as_dict()
+
+
+# ── Status Transitions ──────────────────────────────────────────────────────
+
+@frappe.whitelist()
+def assign_driver(manifest, driver, courier_partner=None, vehicle_number=None,
+                  tracking_number=None, estimated_delivery_date=None,
+                  vehicle=None, external_booking_id=None) -> dict:
+    _require_stage_role("assign_driver")
+    doc = frappe.get_doc("CH Transfer Manifest", manifest)
+    doc.check_permission("write")
+    doc.assign_driver(
+        driver=driver,
+        courier_partner=courier_partner,
+        vehicle_number=vehicle_number,
+        tracking_number=tracking_number,
+        estimated_delivery_date=estimated_delivery_date,
+        vehicle=vehicle,
+        external_booking_id=external_booking_id,
+    )
+    _send_delivery_otp(doc)
+    return {"status": doc.status, "vehicle": doc.get("custom_vehicle"), "delivery_otp": doc.get("delivery_otp")}
+
+
+@frappe.whitelist()
+def start_pickup(manifest, pickup_photo, lat=None, lng=None, notes=None,
+                 scanned_qr=None) -> dict:
+    _require_stage_role("start_pickup")
+    doc = frappe.get_doc("CH Transfer Manifest", manifest)
+    doc.check_permission("write")
+    doc.start_pickup(pickup_photo=pickup_photo, lat=lat, lng=lng, notes=notes,
+                     scanned_qr=scanned_qr)
+    return {"status": doc.status}
+
+
+@frappe.whitelist()
+def reject_manifest(manifest, rejection_reason, rejection_photo,
+                    rejection_notes=None) -> dict:
+    """Driver rejects a pickup that cannot be completed (FR-022 → FR-027)."""
+    _require_stage_role("reject_manifest")
+    doc = frappe.get_doc("CH Transfer Manifest", manifest)
+    doc.check_permission("write")
+    doc.reject_manifest(
+        rejection_reason=rejection_reason,
+        rejection_photo=rejection_photo,
+        rejection_notes=rejection_notes,
+    )
+    return {"status": doc.status}
+
+
+@frappe.whitelist()
+def complete_delivery(manifest, delivery_photo, receiver_name, otp=None,
+                      lat=None, lng=None) -> dict:
+    _require_stage_role("complete_delivery")
+    doc = frappe.get_doc("CH Transfer Manifest", manifest)
+    doc.check_permission("write")
+    doc.complete_delivery(
+        delivery_photo=delivery_photo,
+        receiver_name=receiver_name,
+        otp=otp, lat=lat, lng=lng,
+    )
+    return {"status": doc.status}
+
+
+@frappe.whitelist()
+def accept_delivery(manifest, damage_reported=0, damage_notes=None,
+                    damage_photo=None, received_lines=None) -> dict:
+    _require_stage_role("accept_delivery")
+    doc = frappe.get_doc("CH Transfer Manifest", manifest)
+    doc.check_permission("write")
+    doc.accept_delivery(
+        damage_reported=cint(damage_reported),
+        damage_notes=damage_notes,
+        damage_photo=damage_photo,
+        received_lines=received_lines,
+    )
+    return {
+        "status": doc.status,
+        "shortage_total": sum(
+            (r.get("custom_shortage_qty") or 0) for r in doc.transfers
+        ),
+    }
+
+
+@frappe.whitelist()
+def close_manifest(manifest) -> dict:
+    _require_stage_role("close_manifest")
+    doc = frappe.get_doc("CH Transfer Manifest", manifest)
+    doc.check_permission("write")
+    doc.close_manifest()
+    return {"status": doc.status}
+
+
+# ── Recall / Reversal ────────────────────────────────────────────────────────
+
+@frappe.whitelist()
+def initiate_recall(manifest, reason, notes=None) -> dict:
+    """Initiate a transfer recall. Notifies driver and stores via email + in-app.
+
+    Allowed statuses: Packed, Assigned, In Transit, Delivered.
+    """
+    if not reason:
+        frappe.throw(_("Recall reason is required."), title=_("API Error"))
+    _require_stage_role("initiate_recall")
+    doc = frappe.get_doc("CH Transfer Manifest", manifest)
+    doc.check_permission("write")
+    doc.initiate_recall(reason=reason, notes=notes)
+    return {
+        "status": doc.status,
+        "recall_initiated_at": str(doc.recall_initiated_at),
+        "message": _("Transfer recall initiated. Driver and stores have been notified."),
+    }
+
+
+@frappe.whitelist()
+def confirm_return(manifest, return_photo, confirmed_by=None) -> dict:
+    """Delivery person confirms all items returned to source warehouse.
+
+    Cancels/reverses the underlying Stock Entries to reinstate stock.
+    Status → Returned.
+    """
+    if not return_photo:
+        frappe.throw(_("Return photo is required."), title=_("API Error"))
+    _require_stage_role("confirm_return")
+    doc = frappe.get_doc("CH Transfer Manifest", manifest)
+    doc.check_permission("write")
+    reversed_ses = doc.confirm_return(
+        return_photo=return_photo,
+        confirmed_by=confirmed_by,
+    )
+    return {
+        "status": doc.status,
+        "return_confirmed_at": str(doc.return_confirmed_at),
+        "reversed_stock_entries": reversed_ses,
+        "message": _("Return confirmed. Stock has been reversed to source warehouse."),
+    }
+
+
+@frappe.whitelist()
+def resend_otp(manifest) -> dict:
+    """Regenerate and send OTP to destination store manager."""
+    doc = frappe.get_doc("CH Transfer Manifest", manifest)
+    doc.check_permission("write")
+    if doc.status not in ("Assigned", "In Transit"):
+        frappe.throw(_("OTP can only be resent in Assigned/In Transit status."), title=_("API Error"))
+    doc._generate_delivery_otp()
+    doc.flags.ignore_validate_update_after_submit = True
+    doc.save()
+    frappe.db.commit()
+
+    _send_delivery_otp(doc)
+    return {"message": _("OTP sent to destination store contact.")}
+
+
+def _split_contact_values(raw_value: str | None) -> list[str]:
+    """Split comma/semicolon/newline-separated contact values into clean tokens."""
+    if not raw_value:
+        return []
+    normalized = str(raw_value).replace(";", ",").replace("\n", ",")
+    return [v.strip() for v in normalized.split(",") if v and v.strip()]
+
+
+def _uniq_keep_order(values: list[str]) -> list[str]:
+    seen = set()
+    out = []
+    for v in values or []:
+        if not v:
+            continue
+        if v in seen:
+            continue
+        seen.add(v)
+        out.append(v)
+    return out
+
+
+def _resolve_destination_pos_profile(destination_store: str | None) -> str | None:
+    """Resolve destination POS Profile from CH Store first, then known mappings."""
+    if not destination_store:
+        return None
+
+    # Canonical mapping: CH Store.pos_profile
+    pos_profile = frappe.db.get_value("CH Store", destination_store, "pos_profile")
+    if pos_profile:
+        return pos_profile
+
+    # Backward-compat mapping via POS Profile Extension
+    if frappe.db.exists("DocType", "POS Profile Extension"):
+        pos_profile = frappe.db.get_value(
+            "POS Profile Extension", {"store": destination_store, "disabled": 0}, "pos_profile"
+        )
+        if pos_profile:
+            return pos_profile
+
+    # Legacy custom field fallback: POS Profile.custom_store
+    pos_meta = frappe.get_meta("POS Profile")
+    if pos_meta.has_field("custom_store"):
+        return frappe.db.get_value(
+            "POS Profile", {"custom_store": destination_store, "disabled": 0}, "name"
+        )
+
+    return None
+
+
+def _collect_pos_profile_contacts(pos_profile: str | None) -> tuple[list[str], list[str]]:
+    """Collect POS Profile contact email/mobile values (site-specific custom fields)."""
+    if not pos_profile:
+        return [], []
+
+    meta = frappe.get_meta("POS Profile")
+
+    email_fields = [
+        "custom_store_email",
+        "custom_contact_email",
+        "custom_manager_email",
+        "custom_delivery_otp_email",
+        "contact_email",
+        "email_id",
+    ]
+    mobile_fields = [
+        "custom_cug_mobile",
+        "custom_store_mobile",
+        "custom_contact_mobile",
+        "custom_manager_mobile",
+        "custom_delivery_otp_mobile",
+        "custom_store_phone",
+        "mobile_no",
+        "phone",
+        "contact_phone",
+    ]
+
+    # Some deployments store store manager as User Link/email in this field.
+    manager_field = "custom_store_manager"
+
+    emails = []
+    mobiles = []
+
+    for fieldname in email_fields:
+        if not meta.has_field(fieldname):
+            continue
+        raw = frappe.db.get_value("POS Profile", pos_profile, fieldname)
+        for val in _split_contact_values(raw):
+            if "@" in val:
+                emails.append(val)
+
+    for fieldname in mobile_fields:
+        if not meta.has_field(fieldname):
+            continue
+        raw = frappe.db.get_value("POS Profile", pos_profile, fieldname)
+        for val in _split_contact_values(raw):
+            mobiles.append(val)
+
+    if meta.has_field(manager_field):
+        mgr = frappe.db.get_value("POS Profile", pos_profile, manager_field)
+        if mgr:
+            if "@" in str(mgr):
+                emails.append(str(mgr).strip())
+            elif frappe.db.exists("User", mgr):
+                mgr_email = frappe.db.get_value("User", mgr, "email")
+                mgr_mobile = frappe.db.get_value("User", mgr, "mobile_no")
+                if mgr_email:
+                    emails.append(mgr_email)
+                if mgr_mobile:
+                    mobiles.append(mgr_mobile)
+
+    return _uniq_keep_order(emails), _uniq_keep_order(mobiles)
+
+
+def _collect_store_manager_contacts(destination_store: str | None) -> tuple[list[str], list[str], list[str]]:
+    """Collect manager users + email/mobile from CH Store user mappings."""
+    from ch_erp15.ch_erp15.store_request_api import _get_store_managers
+
+    users = _uniq_keep_order(_get_store_managers(destination_store) if destination_store else [])
+    emails = []
+    mobiles = []
+    for user in users:
+        email = frappe.db.get_value("User", user, "email")
+        mobile = frappe.db.get_value("User", user, "mobile_no")
+        if email:
+            emails.append(email)
+        if mobile:
+            mobiles.append(mobile)
+    return users, _uniq_keep_order(emails), _uniq_keep_order(mobiles)
+
+
+def _send_delivery_otp(doc) -> None:
+    """Send delivery OTP to destination store POS Profile + store manager contacts.
+
+    Preferred recipients are destination store POS Profile contact email/mobile
+    (including CUG fields where configured). Falls back to CH Store manager
+    users and CH Store.contact_phone.
+    """
+    manager_users = []
+    manager_emails = []
+    manager_mobiles = []
+
+    if doc.destination_store:
+        try:
+            manager_users, manager_emails, manager_mobiles = _collect_store_manager_contacts(
+                doc.destination_store
+            )
+        except Exception:
+            frappe.log_error(frappe.get_traceback(), "Manifest OTP — store managers lookup failed")
+
+    pos_profile = _resolve_destination_pos_profile(doc.destination_store)
+    profile_emails, profile_mobiles = _collect_pos_profile_contacts(pos_profile)
+
+    store_phone = frappe.db.get_value("CH Store", doc.destination_store, "contact_phone") if doc.destination_store else None
+
+    email_recipients = _uniq_keep_order(manager_emails + profile_emails)
+    sms_recipients = _uniq_keep_order(manager_mobiles + profile_mobiles + ([store_phone] if store_phone else []))
+
+    if not manager_users and not email_recipients and not sms_recipients:
+        frappe.log_error(
+            f"OTP for manifest {doc.name} could not be sent — no destination store contact.",
+            "Manifest OTP Delivery",
+        )
+        return
+
+    subject = _("Delivery OTP for Manifest {0}").format(doc.name)
+    manifest_url = frappe.utils.get_url_to_form("CH Transfer Manifest", doc.name)
+    company_name = doc.company or "Congruence Holdings"
+    message = _(
+        "<div style='font-family:Segoe UI,Arial,sans-serif;max-width:680px;border:1px solid #e5e7eb;border-radius:10px;overflow:hidden'>"
+        "<div style='background:#0f172a;color:#ffffff;padding:12px 16px;font-weight:600'>{company_name} - Transfer Delivery OTP</div>"
+        "<div style='padding:16px'><p>A delivery is on its way to your store.</p>"
+        "<table style='border-collapse:collapse;font-size:14px'>"
+        "<tr><td style='padding:6px;font-weight:bold'>Manifest</td>"
+        "<td style='padding:6px'>{manifest}</td></tr>"
+        "<tr><td style='padding:6px;font-weight:bold'>Driver</td>"
+        "<td style='padding:6px'>{driver}</td></tr>"
+        "<tr><td style='padding:6px;font-weight:bold'>Items</td>"
+        "<td style='padding:6px'>{items} lines / {qty} units</td></tr>"
+        "</table>"
+        "<p style='font-size:20px;font-weight:bold;letter-spacing:4px'>"
+        "OTP: {otp}</p>"
+        "<p>Share this OTP with the driver only after physically verifying all items.</p>"
+        "<p style='margin-top:16px'><a href='{manifest_url}' style='background:#0b57d0;color:#ffffff;text-decoration:none;padding:10px 14px;border-radius:6px;display:inline-block;font-weight:600'>Open Manifest</a></p>"
+        "</div></div>"
+    ).format(
+        company_name=company_name,
+        manifest=doc.name,
+        driver=doc.driver_name or doc.driver or "—",
+        items=doc.total_items or 0,
+        qty=doc.total_qty or 0,
+        otp=doc.delivery_otp,
+        manifest_url=manifest_url,
+    )
+
+    for user in manager_users:
+        try:
+            frappe.publish_realtime(
+                event="notification",
+                message={
+                    "subject": subject,
+                    "message": _("OTP {0} for manifest {1}. Share only after item verification.").format(
+                        doc.delivery_otp, doc.name
+                    ),
+                    "type": "info",
+                    "from_user": frappe.session.user,
+                },
+                user=user,
+            )
+        except Exception:
+            pass
+
+    if sms_recipients:
+        try:
+            from frappe.core.doctype.sms_settings.sms_settings import send_sms
+            sms_message = _(
+                "CH Logistics: Delivery OTP {0} for Manifest {1}. Share only after item verification."
+            ).format(doc.delivery_otp, doc.name)
+            send_sms(sms_recipients, sms_message)
+        except Exception:
+            frappe.log_error(frappe.get_traceback(), f"Manifest OTP SMS failed: {doc.name}")
+
+    try:
+        default_outgoing = frappe.db.get_value(
+            "Email Account", {"default_outgoing": 1, "enable_outgoing": 1}, "name"
+        )
+        if default_outgoing and email_recipients:
+            frappe.sendmail(
+                recipients=email_recipients,
+                subject=subject,
+                message=message,
+                reference_doctype="CH Transfer Manifest",
+                reference_name=doc.name,
+                delayed=False,
+            )
+    except Exception:
+        frappe.log_error(frappe.get_traceback(), f"Manifest OTP email failed: {doc.name}")
+
+
+def _extract_tracking_status(payload):
+    """Extract a human-readable shipment status from common courier API payload shapes."""
+    if isinstance(payload, dict):
+        for key in ("status", "current_status", "shipment_status", "tracking_status", "latest_status", "state"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        for key in ("data", "result", "shipment", "tracking", "response", "latest_event"):
+            value = payload.get(key)
+            if isinstance(value, dict):
+                status = _extract_tracking_status(value)
+                if status:
+                    return status
+            elif isinstance(value, list):
+                for row in reversed(value):
+                    status = _extract_tracking_status(row)
+                    if status:
+                        return status
+    return None
+
+
+def _map_courier_status(status_text):
+    text = (status_text or "").strip().lower()
+    if not text:
+        return None
+    if any(token in text for token in ("delivered", "delivery completed", "pod", "received by consignee")):
+        return "Delivered"
+    if any(token in text for token in ("in transit", "out for delivery", "shipped", "dispatched", "picked up", "pickup completed")):
+        return "In Transit"
+    if any(token in text for token in ("assigned", "booked", "manifested", "scheduled")):
+        return "Assigned"
+    return None
+
+
+def _fetch_partner_tracking_payload(courier_doc, tracking_number):
+    import requests
+
+    if not courier_doc.api_base_url:
+        return {}
+
+    url = courier_doc.api_base_url.strip()
+    params = {}
+    if "{tracking_number}" in url:
+        url = url.replace("{tracking_number}", tracking_number)
+    else:
+        params["tracking_number"] = tracking_number
+
+    headers = {"Accept": "application/json"}
+    if courier_doc.api_key:
+        headers["Authorization"] = f"Bearer {courier_doc.api_key}"
+        headers["X-API-Key"] = courier_doc.api_key
+
+    response = requests.get(url, params=params, headers=headers, timeout=15)
+    response.raise_for_status()
+    try:
+        return response.json()
+    except Exception:
+        return {"status": response.text[:140]}
+
+
+@frappe.whitelist()
+def poll_courier_statuses(dry_run=0) -> dict:
+    """Poll enabled courier partners and sync the latest manifest delivery status."""
+    dry_run = cint(dry_run)
+    manifests = frappe.get_all(
+        "CH Transfer Manifest",
+        filters={
+            "docstatus": 1,
+            "status": ["in", ["Assigned", "In Transit", "Delivered"]],
+            "courier_partner": ["is", "set"],
+            "tracking_number": ["is", "set"],
+        },
+        fields=["name", "status", "courier_partner", "tracking_number", "modified"],
+        order_by="modified asc",
+        limit=200,
+    )
+
+    result = {
+        "checked": len(manifests),
+        "updated": 0,
+        "skipped": 0,
+        "errors": 0,
+        "dry_run": dry_run,
+        "details": [],
+    }
+
+    for row in manifests:
+        detail = {
+            "manifest": row.name,
+            "courier_partner": row.courier_partner,
+            "tracking_number": row.tracking_number,
+            "current_status": row.status,
+        }
+        try:
+            courier_doc = frappe.get_cached_doc("Courier Partner", row.courier_partner)
+            if not cint(courier_doc.api_enabled) or not courier_doc.api_base_url:
+                result["skipped"] += 1
+                detail["reason"] = "API not configured"
+                result["details"].append(detail)
+                continue
+
+            if dry_run:
+                detail["reason"] = "eligible"
+                result["details"].append(detail)
+                continue
+
+            payload = _fetch_partner_tracking_payload(courier_doc, row.tracking_number)
+            external_status = _extract_tracking_status(payload)
+            mapped_status = _map_courier_status(external_status)
+            detail["external_status"] = external_status
+
+            if mapped_status and mapped_status != row.status:
+                doc = frappe.get_doc("CH Transfer Manifest", row.name)
+                doc.flags.ignore_validate_update_after_submit = True
+                doc.db_set("status", mapped_status, update_modified=True)
+                doc._sync_logistics_status_to_entries(mapped_status)
+                try:
+                    doc.add_comment(
+                        "Comment",
+                        _("Courier update from {0}: {1}").format(row.courier_partner, external_status or mapped_status),
+                    )
+                except Exception:
+                    pass
+                detail["updated_to"] = mapped_status
+                result["updated"] += 1
+            else:
+                result["skipped"] += 1
+                detail["reason"] = "No status change"
+        except Exception as e:
+            result["errors"] += 1
+            detail["error"] = str(e)
+            frappe.log_error(frappe.get_traceback(), f"Courier polling failed for manifest {row.name}")
+
+        result["details"].append(detail)
+
+    if result["updated"] and not dry_run:
+        frappe.db.commit()
+
+    return result
+
+
+# ── Delivery App Endpoints ───────────────────────────────────────────────────
+
+@frappe.whitelist()
+def get_driver_assignments() -> list:
+    """Return manifests assigned to the logged-in user (as Driver)."""
+    user = frappe.session.user
+    user_roles = frappe.get_roles(user)
+    is_ops = bool({"System Manager", "Delivery Manager", "Delivery User"} & set(user_roles))
+
+    # Find Driver record: match on `user` field (Frappe native) then on linked Employee
+    driver = (
+        frappe.db.get_value("Driver", {"user": user}, "name")
+        or frappe.db.get_value("Driver", {"employee": user}, "name")
+    )
+
+    filters = {"docstatus": 1}
+    if driver:
+        filters["driver"] = driver
+    elif is_ops:
+        pass  # ops roles see all manifests
+    else:
+        return []
+
+    filters["status"] = ["in", ["Assigned", "In Transit"]]
+
+    manifests = frappe.get_all(
+        "CH Transfer Manifest",
+        filters=filters,
+        fields=[
+            "name", "status", "source_warehouse", "destination_warehouse",
+            "source_store", "destination_store",
+            "driver_name", "driver_phone",
+            "total_stock_entries", "total_items", "total_qty",
+            "estimated_delivery_date", "creation",
+        ],
+        order_by="creation desc",
+        limit=50,
+    )
+
+    # Enrichment: store addresses
+    for m in manifests:
+        if m.get("source_store"):
+            addr = frappe.db.get_value("CH Store", m["source_store"], "address")
+            m["source_address"] = addr or ""
+        if m.get("destination_store"):
+            addr = frappe.db.get_value("CH Store", m["destination_store"], "address")
+            m["destination_address"] = addr or ""
+
+    return manifests
+
+
+@frappe.whitelist()
+def get_delivery_history() -> list:
+    """Return recently delivered/received manifests for current driver."""
+    user = frappe.session.user
+    user_roles = frappe.get_roles(user)
+    is_ops = bool({"System Manager", "Delivery Manager", "Delivery User"} & set(user_roles))
+
+    driver = (
+        frappe.db.get_value("Driver", {"user": user}, "name")
+        or frappe.db.get_value("Driver", {"employee": user}, "name")
+    )
+
+    filters = {
+        "docstatus": 1,
+        "status": ["in", ["Delivered", "Received", "Closed"]],
+    }
+    if driver:
+        filters["driver"] = driver
+    elif is_ops:
+        pass
+    else:
+        return []
+
+    return frappe.get_all(
+        "CH Transfer Manifest",
+        filters=filters,
+        fields=[
+            "name", "status", "source_warehouse", "destination_warehouse",
+            "source_store", "destination_store",
+            "total_stock_entries", "total_items", "total_qty",
+            "delivery_datetime", "received_datetime",
+        ],
+        order_by="modified desc",
+        limit=20,
+    )
+
+
+@frappe.whitelist()
+def get_manifest_detail(manifest) -> dict:
+    """Return manifest detail for the delivery app."""
+    doc = frappe.get_doc("CH Transfer Manifest", manifest)
+    doc.check_permission("read")
+
+    result = doc.as_dict()
+    # Add Stock Entry item details
+    items = []
+    for row in doc.transfers:
+        se_items = frappe.get_all(
+            "Stock Entry Detail",
+            filters={"parent": row.stock_entry},
+            fields=["item_code", "item_name", "qty", "serial_no", "batch_no"],
+        )
+        items.append({
+            "stock_entry": row.stock_entry,
+            "from_warehouse": row.from_warehouse,
+            "to_warehouse": row.to_warehouse,
+            "items": se_items,
+        })
+    result["transfer_items_detail"] = items
+
+    # Store addresses
+    if doc.source_store:
+        result["source_address"] = frappe.db.get_value("CH Store", doc.source_store, "address") or ""
+    if doc.destination_store:
+        result["destination_address"] = frappe.db.get_value("CH Store", doc.destination_store, "address") or ""
+
+    return result
+
+
+# ── Operations Hub Integration ───────────────────────────────────────────────
+
+@frappe.whitelist()
+def get_manifest_queue(tab="active", warehouse="") -> list:
+    """Return manifest list for Ops Hub integration."""
+    filters = {"docstatus": 1}
+
+    if tab == "active":
+        filters["status"] = ["in", ["Packed", "Assigned", "In Transit"]]
+    elif tab == "delivered":
+        filters["status"] = ["in", ["Delivered", "Received"]]
+    elif tab == "closed":
+        filters["status"] = "Closed"
+    elif tab == "all":
+        pass
+
+    if warehouse:
+        filters["source_warehouse"] = warehouse
+
+    return frappe.get_all(
+        "CH Transfer Manifest",
+        filters=filters,
+        fields=[
+            "name", "status", "source_warehouse", "destination_warehouse",
+            "source_store", "destination_store",
+            "driver_name", "courier_partner",
+            "total_stock_entries", "total_items", "total_qty",
+            "estimated_delivery_date", "creation", "modified",
+        ],
+        order_by="creation desc",
+        limit=100,
+    )
+
+
+# ── Courier Push Webhook Receiver ────────────────────────────────────────────
+
+@frappe.whitelist(allow_guest=True, methods=["POST"])
+@rate_limit(limit=300, seconds=60, methods=["POST"], ip_based=True)
+def receive_courier_webhook(courier_partner: str, payload: str = None) -> dict:
+    """Receive push delivery status updates from courier partners.
+
+    Courier partners must POST to:
+      /api/method/ch_erp15.ch_erp15.transfer_manifest_api.receive_courier_webhook
+      ?courier_partner=<name>
+
+        HMAC-SHA256 signature:
+      Header: X-Signature: sha256=<hex_digest>
+      Body: raw JSON payload
+
+    Payload must contain a tracking_number and a status field.
+    """
+    # --- HMAC verification ---
+    courier_doc = frappe.get_cached_doc("Courier Partner", courier_partner)
+    if not courier_doc.api_key:
+        frappe.response["http_status_code"] = 401
+        frappe.log_error(
+            title="Courier Webhook",
+            message=f"Courier partner {courier_partner!r} has no API key configured.",
+        )
+        return {"error": "Webhook signature is not configured"}
+
+    sig_header = frappe.request.headers.get("X-Signature") or ""
+    raw_body = frappe.request.get_data(as_text=True) or ""
+    expected = "sha256=" + hmac.new(
+        courier_doc.api_key.encode("utf-8"),
+        raw_body.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(sig_header, expected):
+        frappe.response["http_status_code"] = 401
+        return {"error": "Invalid signature"}
+
+    # --- Parse payload ---
+    if payload is None:
+        raw = frappe.request.get_data(as_text=True) or "{}"
+        try:
+            data = _json.loads(raw)
+        except Exception:
+            frappe.response["http_status_code"] = 400
+            return {"error": "Invalid JSON"}
+    else:
+        data = _json.loads(payload) if isinstance(payload, str) else payload
+
+    tracking_number = (
+        data.get("tracking_number")
+        or data.get("awb")
+        or data.get("waybill")
+        or data.get("tracking_id")
+        or ""
+    )
+    if not tracking_number:
+        frappe.response["http_status_code"] = 400
+        return {"error": "tracking_number missing from payload"}
+
+    external_status = _extract_tracking_status(data)
+    mapped_status = _map_courier_status(external_status)
+
+    # Find manifest by tracking number
+    manifest_name = frappe.db.get_value(
+        "CH Transfer Manifest",
+        {"tracking_number": tracking_number, "docstatus": 1},
+        "name",
+    )
+    if not manifest_name:
+        # Unknown tracking number — log and return 200 (don't let courier retry forever)
+        frappe.log_error(
+            f"Webhook from {courier_partner}: tracking {tracking_number!r} not found.",
+            "Courier Webhook",
+        )
+        return {"received": True, "matched": False}
+
+    if mapped_status:
+        doc = frappe.get_doc("CH Transfer Manifest", manifest_name)
+        if mapped_status != doc.status:
+            doc.flags.ignore_validate_update_after_submit = True
+            doc.db_set("status", mapped_status, update_modified=True)
+            doc._sync_logistics_status_to_entries(mapped_status)
+            try:
+                doc.add_comment(
+                    "Comment",
+                    _("Courier webhook from {0}: {1}").format(
+                        courier_partner, external_status or mapped_status
+                    ),
+                )
+            except Exception:
+                pass
+            frappe.db.commit()
+
+    return {"received": True, "matched": True, "manifest": manifest_name, "status": mapped_status}

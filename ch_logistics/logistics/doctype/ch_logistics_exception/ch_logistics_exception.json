@@ -1,0 +1,85 @@
+{
+ "creation": "2026-05-26 00:00:00.000000",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "occurred_at",
+  "exception_type",
+  "severity",
+  "stop_sequence",
+  "remarks",
+  "photo",
+  "resolution_status",
+  "escalated_to",
+  "resolved_at"
+ ],
+ "fields": [
+  {
+   "fieldname": "occurred_at",
+   "fieldtype": "Datetime",
+   "in_list_view": 1,
+   "label": "Occurred At",
+   "reqd": 1
+  },
+  {
+   "fieldname": "exception_type",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "label": "Type",
+   "options": "Customer Not Available\nAddress Issue\nVehicle Breakdown\nDamage\nStockout\nWrong Item\nPayment Issue\nOther",
+   "reqd": 1
+  },
+  {
+   "fieldname": "severity",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "label": "Severity",
+   "options": "Low\nMedium\nHigh\nCritical",
+   "default": "Medium",
+   "reqd": 1
+  },
+  {
+   "fieldname": "stop_sequence",
+   "fieldtype": "Int",
+   "label": "Stop Seq"
+  },
+  {
+   "fieldname": "remarks",
+   "fieldtype": "Small Text",
+   "in_list_view": 1,
+   "label": "Remarks"
+  },
+  {
+   "fieldname": "photo",
+   "fieldtype": "Attach Image",
+   "label": "Photo"
+  },
+  {
+   "fieldname": "resolution_status",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "label": "Resolution",
+   "options": "Open\nIn Progress\nResolved\nEscalated",
+   "default": "Open"
+  },
+  {
+   "fieldname": "escalated_to",
+   "fieldtype": "Link",
+   "label": "Escalated To",
+   "options": "User"
+  },
+  {
+   "fieldname": "resolved_at",
+   "fieldtype": "Datetime",
+   "label": "Resolved At",
+   "read_only": 1
+  }
+ ],
+ "istable": 1,
+ "modified": "2026-05-26 00:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Logistics",
+ "name": "CH Logistics Exception",
+ "owner": "Administrator"
+}

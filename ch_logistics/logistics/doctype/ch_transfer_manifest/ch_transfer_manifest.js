@@ -1,0 +1,436 @@
+frappe.ui.form.on("CH Transfer Manifest", {
+    refresh(frm) {
+        render_status_badge(frm);
+        render_lane_banner(frm);
+        add_action_buttons(frm);
+    },
+
+    source_store(frm) {
+        if (frm.doc.source_store) {
+            frappe.db.get_value("CH Store", frm.doc.source_store, "warehouse", (r) => {
+                if (r && r.warehouse) frm.set_value("source_warehouse", r.warehouse);
+            });
+        }
+    },
+
+    destination_store(frm) {
+        if (frm.doc.destination_store) {
+            frappe.db.get_value("CH Store", frm.doc.destination_store, "warehouse", (r) => {
+                if (r && r.warehouse) frm.set_value("destination_warehouse", r.warehouse);
+            });
+        }
+    },
+});
+
+frappe.ui.form.on("CH Transfer Manifest Item", {
+    stock_entry(frm, cdt, cdn) {
+        let row = locals[cdt][cdn];
+        if (!row.stock_entry) return;
+        frappe.call({
+            method: "frappe.client.get",
+            args: { doctype: "Stock Entry", name: row.stock_entry },
+            callback(r) {
+                if (!r.message) return;
+                let se = r.message;
+                frappe.model.set_value(cdt, cdn, "from_warehouse", se.from_warehouse);
+                frappe.model.set_value(cdt, cdn, "to_warehouse", se.to_warehouse);
+                frappe.model.set_value(cdt, cdn, "material_request", se.material_request);
+                frappe.model.set_value(cdt, cdn, "transfer_status", se.custom_status || "Draft");
+                let item_count = (se.items || []).length;
+                let total_qty = (se.items || []).reduce((s, i) => s + (i.qty || 0), 0);
+                frappe.model.set_value(cdt, cdn, "item_count", item_count);
+                frappe.model.set_value(cdt, cdn, "total_qty", total_qty);
+            }
+        });
+    }
+});
+
+function render_status_badge(frm) {
+    if (!frm.doc.status) return;
+    const colors = {
+        "Draft": "gray", "Packed": "blue", "Assigned": "orange",
+        "Pickup Started": "yellow", "In Transit": "blue",
+        "Delivered": "purple", "Received": "green", "Closed": "darkgray",
+        "Recall Initiated": "red", "Returned": "gray",
+        "Cancelled": "red",
+    };
+    frm.page.set_indicator(frm.doc.status, colors[frm.doc.status] || "gray");
+
+    if (frm.doc.driver_name) {
+        frm.dashboard.set_headline(
+            `<span class="indicator-pill ${colors[frm.doc.status] || "gray"}">
+                <i class="fa fa-truck"></i> ${frm.doc.driver_name}
+                ${frm.doc.driver_phone ? " &middot; " + frm.doc.driver_phone : ""}
+            </span>`
+        );
+    }
+}
+
+// Phase B lane banner — classifies the manifest as Outward (source-store
+// dispatch lane) or Inward (destination-store receipt lane) so staff at each
+// end see at-a-glance whether they own the next action. Pure UX overlay; no
+// state mutation — actual role gating lives in transfer_manifest_api.py.
+const OUTWARD_STATES = new Set(["Draft", "Packed", "Assigned", "Pickup Started", "In Transit"]);
+const INWARD_STATES  = new Set(["Delivered", "Partially Received", "Received"]);
+
+function render_lane_banner(frm) {
+    if (!frm.doc.status) return;
+    if (frm.doc.docstatus === 2) return;
+    let pill = null;
+    if (OUTWARD_STATES.has(frm.doc.status)) {
+        pill = `<span class="indicator-pill orange">
+            ↗ OUTWARD — source store: ${frappe.utils.escape_html(frm.doc.source_store || frm.doc.source_warehouse || "?")}
+        </span>`;
+    } else if (INWARD_STATES.has(frm.doc.status)) {
+        pill = `<span class="indicator-pill green">
+            ↙ INWARD — destination store: ${frappe.utils.escape_html(frm.doc.destination_store || frm.doc.destination_warehouse || "?")}
+        </span>`;
+    }
+    if (pill) {
+        const prior = (frm.dashboard.headline && frm.dashboard.headline.html) ? frm.dashboard.headline.html() : "";
+        frm.dashboard.set_headline(prior ? prior + "&nbsp;" + pill : pill);
+    }
+}
+
+function add_action_buttons(frm) {
+    if (frm.doc.docstatus !== 1) return;
+    const api = "ch_logistics.api.transfer_manifest_api.";
+
+    // Driver assignment is handled from the Logistics Trip flow, not per
+    // manifest — the "Assign Driver" button was intentionally removed here.
+
+    if (frm.doc.status === "Assigned") {
+        frm.add_custom_button(__("Start Pickup"), () => show_pickup_dialog(frm, api));
+    }
+
+    if (frm.doc.status === "In Transit") {
+        frm.add_custom_button(__("Complete Delivery"), () => show_delivery_dialog(frm, api));
+    }
+
+    if (frm.doc.status === "Delivered") {
+        frm.add_custom_button(__("Accept Delivery"), () => show_accept_dialog(frm, api));
+    }
+
+    if (frm.doc.status === "Received") {
+        frm.add_custom_button(__("Close Manifest"), () => {
+            frappe.confirm(__("Close this manifest?"), () => {
+                frappe.call({
+                    method: api + "close_manifest",
+                    args: { manifest: frm.doc.name },
+                    callback: () => frm.reload_doc()
+                });
+            });
+        });
+    }
+
+    // ── Recall / Reversal ─────────────────────────────────────────────
+    const recallAllowed = ["Packed", "Assigned", "In Transit", "Delivered"];
+    if (recallAllowed.includes(frm.doc.status)) {
+        frm.add_custom_button(__("Initiate Recall"), () => show_recall_dialog(frm, api), __("Actions"));
+    }
+
+    if (frm.doc.status === "Recall Initiated") {
+        frm.add_custom_button(__("Confirm Return"), () => show_return_confirm_dialog(frm, api), __("Actions"));
+        // Highlight the recall state prominently
+        frm.dashboard.set_headline(
+            `<span class="indicator-pill red">
+                ⚠ Transfer Recalled — ${frm.doc.recall_reason || ""}
+                <br/><small>Initiated by ${frm.doc.recall_initiated_by || ""} at ${frm.doc.recall_initiated_at || ""}</small>
+            </span>`
+        );
+    }
+
+    if (frm.doc.status === "Returned") {
+        frm.dashboard.set_headline(
+            `<span class="indicator-pill gray">
+                ↩ Transfer Returned — Stock reversed
+                <br/><small>Confirmed by ${frm.doc.return_confirmed_by || ""} at ${frm.doc.return_confirmed_at || ""}</small>
+            </span>`
+        );
+    }
+
+    // Resend OTP for Delivered status
+    if (frm.doc.status === "Assigned" || frm.doc.status === "In Transit") {
+        frm.add_custom_button(__("Resend OTP"), () => {
+            frappe.call({
+                method: api + "resend_otp",
+                args: { manifest: frm.doc.name },
+                callback: (r) => {
+                    frappe.msgprint(__("OTP sent to destination store."));
+                    frm.reload_doc();
+                }
+            });
+        }, __("Actions"));
+    }
+}
+
+function show_pickup_dialog(frm, api) {
+    let d = new frappe.ui.Dialog({
+        title: __("Start Pickup"),
+        fields: [
+            { fieldname: "pickup_photo", fieldtype: "Attach Image", label: __("Pickup Photo"), reqd: 1 },
+            { fieldname: "notes", fieldtype: "Small Text", label: __("Notes") },
+        ],
+        primary_action_label: __("Confirm Pickup"),
+        primary_action(values) {
+            d.hide();
+            // Get GPS
+            capture_gps((lat, lng) => {
+                frappe.call({
+                    method: api + "start_pickup",
+                    args: {
+                        manifest: frm.doc.name,
+                        pickup_photo: values.pickup_photo,
+                        lat, lng,
+                        notes: values.notes,
+                    },
+                    callback: () => frm.reload_doc()
+                });
+            });
+        }
+    });
+    d.show();
+}
+
+function show_delivery_dialog(frm, api) {
+    let d = new frappe.ui.Dialog({
+        title: __("Complete Delivery"),
+        fields: [
+            { fieldname: "delivery_photo", fieldtype: "Attach Image", label: __("Delivery Photo"), reqd: 1 },
+            { fieldname: "receiver_name", fieldtype: "Data", label: __("Receiver Name"), reqd: 1 },
+            { fieldname: "otp", fieldtype: "Data", label: __("Delivery OTP"), reqd: 1 },
+        ],
+        primary_action_label: __("Confirm Delivery"),
+        primary_action(values) {
+            d.hide();
+            capture_gps((lat, lng) => {
+                frappe.call({
+                    method: api + "complete_delivery",
+                    args: {
+                        manifest: frm.doc.name,
+                        delivery_photo: values.delivery_photo,
+                        receiver_name: values.receiver_name,
+                        otp: values.otp,
+                        lat, lng,
+                    },
+                    callback: () => frm.reload_doc()
+                });
+            });
+        }
+    });
+    d.show();
+}
+
+function show_accept_dialog(frm, api) {
+    const transfers = frm.doc.transfers || [];
+    let d = new frappe.ui.Dialog({
+        title: __("Accept Delivery"),
+        size: "large",
+        fields: [
+            { fieldname: "receipt_html", fieldtype: "HTML", label: __("Received Quantities") },
+            { fieldname: "damage_reported", fieldtype: "Check", label: __("Damage Reported") },
+            { fieldname: "damage_notes", fieldtype: "Small Text", label: __("Damage Notes"), depends_on: "damage_reported" },
+            { fieldname: "damage_photo", fieldtype: "Attach Image", label: __("Damage Photo"), depends_on: "damage_reported" },
+        ],
+        primary_action_label: __("Accept"),
+        primary_action(values) {
+            const received_lines = [];
+            d.$wrapper.find(".ch-recv-qty").each(function () {
+                received_lines.push({
+                    stock_entry: $(this).data("se"),
+                    received_qty: parseFloat($(this).val()) || 0,
+                });
+            });
+            d.hide();
+            frappe.call({
+                method: api + "accept_delivery",
+                args: {
+                    manifest: frm.doc.name,
+                    damage_reported: values.damage_reported,
+                    damage_notes: values.damage_notes,
+                    damage_photo: values.damage_photo,
+                    received_lines: JSON.stringify(received_lines),
+                },
+                callback: () => frm.reload_doc()
+            });
+        }
+    });
+
+    // Per-transfer received-qty grid (defaults to the full expected qty).
+    let body;
+    if (transfers.length) {
+        let rows = transfers.map((t) => `
+            <tr>
+                <td>${frappe.utils.escape_html(t.stock_entry || "—")}</td>
+                <td class="text-right">${flt(t.total_qty) || 0}</td>
+                <td style="width:120px">
+                    <input type="number" min="0" step="any"
+                        class="form-control input-sm ch-recv-qty"
+                        data-se="${frappe.utils.escape_html(t.stock_entry || "")}"
+                        value="${flt(t.total_qty) || 0}">
+                </td>
+            </tr>`).join("");
+        body = `
+            <div class="text-muted small" style="margin-bottom:6px">
+                ${__("Confirm the quantity physically received per transfer. A shortage auto-raises a delivery claim.")}
+            </div>
+            <table class="table table-bordered" style="margin-bottom:0">
+                <thead><tr>
+                    <th>${__("Stock Entry")}</th>
+                    <th class="text-right">${__("Expected")}</th>
+                    <th>${__("Received")}</th>
+                </tr></thead>
+                <tbody>${rows}</tbody>
+            </table>`;
+    } else {
+        body = `<div class="text-muted">${__("No transfers on this manifest.")}</div>`;
+    }
+    d.fields_dict.receipt_html.$wrapper.html(body);
+
+    d.show();
+}
+
+function capture_gps(callback) {
+    if (navigator.geolocation) {
+        navigator.geolocation.getCurrentPosition(
+            (pos) => callback(pos.coords.latitude, pos.coords.longitude),
+            () => callback(0, 0),
+            { timeout: 5000 }
+        );
+    } else {
+        callback(0, 0);
+    }
+}
+
+// ── Recall / Return Dialogs ──────────────────────────────────────────────────
+
+function show_recall_dialog(frm, api) {
+    let d = new frappe.ui.Dialog({
+        title: __("Initiate Transfer Recall"),
+        fields: [
+            {
+                fieldname: "info_html",
+                fieldtype: "HTML",
+                options: `<div class="alert alert-warning" style="padding:12px;border-radius:6px;background:#fff3cd;border:1px solid #ffc107;">
+                    <strong>⚠ Warning:</strong> This will recall the transfer and notify the driver and store contacts immediately.
+                    The driver will be instructed to return all items to <strong>${frm.doc.source_warehouse}</strong>.
+                    Stock will be reversed once the driver confirms the return.
+                </div>`
+            },
+            {
+                fieldname: "reason",
+                fieldtype: "Select",
+                label: __("Recall Reason"),
+                options: [
+                    "Wrong items packed",
+                    "Wrong destination",
+                    "Customer order cancelled",
+                    "Pricing error — items not to be dispatched",
+                    "Quality issue — items need re-inspection",
+                    "Transfer not authorized",
+                    "Emergency stock requirement at source",
+                    "Other"
+                ].join("\n"),
+                reqd: 1
+            },
+            {
+                fieldname: "notes",
+                fieldtype: "Small Text",
+                label: __("Additional Notes"),
+                description: __("Provide any extra context for the driver and store")
+            },
+        ],
+        primary_action_label: __("Recall Transfer"),
+        primary_action(values) {
+            d.hide();
+            frappe.confirm(
+                __("Are you sure you want to recall manifest {0}? The driver will be notified immediately.", [frm.doc.name]),
+                () => {
+                    frappe.call({
+                        method: api + "initiate_recall",
+                        args: {
+                            manifest: frm.doc.name,
+                            reason: values.reason,
+                            notes: values.notes,
+                        },
+                        freeze: true,
+                        freeze_message: __("Sending recall notifications..."),
+                        callback(r) {
+                            if (r.message) {
+                                frappe.show_alert({
+                                    message: r.message.message || __("Recall initiated. Driver and stores notified."),
+                                    indicator: "orange"
+                                }, 5);
+                                frm.reload_doc();
+                            }
+                        }
+                    });
+                }
+            );
+        }
+    });
+    d.show();
+}
+
+function show_return_confirm_dialog(frm, api) {
+    let d = new frappe.ui.Dialog({
+        title: __("Confirm Return to Source"),
+        fields: [
+            {
+                fieldname: "info_html",
+                fieldtype: "HTML",
+                options: `<div class="alert alert-info" style="padding:12px;border-radius:6px;background:#d1ecf1;border:1px solid #bee5eb;">
+                    <strong>Return Checklist:</strong>
+                    <ul style="margin:8px 0 0 0;padding-left:18px">
+                        <li>All items have been physically returned to <strong>${frm.doc.source_warehouse}</strong></li>
+                        <li>Each item has been scanned / counted and matches the manifest</li>
+                        <li>A photo has been taken of the returned items</li>
+                    </ul>
+                </div>`
+            },
+            {
+                fieldname: "return_photo",
+                fieldtype: "Attach Image",
+                label: __("Return Photo (Required)"),
+                description: __("Photo of all items returned to source warehouse"),
+                reqd: 1
+            },
+            {
+                fieldname: "confirmed_by",
+                fieldtype: "Data",
+                label: __("Received By (Name at Source)"),
+                description: __("Name of person who received the returned items at source warehouse")
+            },
+        ],
+        primary_action_label: __("Confirm Return & Reverse Stock"),
+        primary_action(values) {
+            d.hide();
+            frappe.confirm(
+                __("Confirm that all items have been returned? This will reverse the stock entries and cannot be undone."),
+                () => {
+                    frappe.call({
+                        method: api + "confirm_return",
+                        args: {
+                            manifest: frm.doc.name,
+                            return_photo: values.return_photo,
+                            confirmed_by: values.confirmed_by,
+                        },
+                        freeze: true,
+                        freeze_message: __("Reversing stock entries..."),
+                        callback(r) {
+                            if (r.message) {
+                                let reversed = (r.message.reversed_stock_entries || []).join(", ");
+                                frappe.show_alert({
+                                    message: __("Return confirmed. Stock reversed: {0}", [reversed || "N/A"]),
+                                    indicator: "green"
+                                }, 7);
+                                frm.reload_doc();
+                            }
+                        }
+                    });
+                }
+            );
+        }
+    });
+    d.show();
+}

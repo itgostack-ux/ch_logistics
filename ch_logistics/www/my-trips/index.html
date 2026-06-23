@@ -1,0 +1,123 @@
+{% extends "templates/web.html" %}
+
+{% block title %}{{ title }}{% endblock %}
+
+{% block page_content %}
+<style>
+  .mt-wrap { max-width: 960px; margin: 0 auto; padding: 16px; font-family: Arial, sans-serif; }
+  .mt-driver { color: #555; font-size: 12px; margin-bottom: 12px; }
+  .mt-trip { border: 1px solid #ddd; border-radius: 6px; padding: 14px;
+             margin-bottom: 14px; background: #fff; }
+  .mt-trip .head { display: flex; justify-content: space-between; align-items: baseline; }
+  .mt-trip .id { font-weight: 700; font-size: 15px; }
+  .mt-meta { color: #555; font-size: 11px; margin-top: 4px; }
+  table.mt-stops { width: 100%; border-collapse: collapse; margin-top: 10px; }
+  .mt-stops th, .mt-stops td { border: 1px solid #ddd; padding: 6px 8px;
+                                font-size: 11px; vertical-align: top; }
+  .mt-stops th { background: #f5f5f5; }
+  .mt-actions button { padding: 4px 8px; font-size: 11px; cursor: pointer;
+                       border: 1px solid #888; border-radius: 4px; background: #fafafa; }
+  .mt-actions button + button { margin-left: 4px; }
+  .mt-status-done { color: #176638; font-weight: 600; }
+  .mt-empty { text-align: center; color: #888; padding: 40px 10px; }
+  .mt-err { padding: 14px; border: 1px solid #f5b5b5; background: #ffefef;
+            color: #8a1f1f; border-radius: 6px; }
+</style>
+
+<div class="mt-wrap">
+  <h2 style="margin-bottom:6px;">{{ _("My Trips") }}</h2>
+  <div class="mt-driver">{{ driver.full_name or driver.name }} &middot; {{ frappe.format_value(today, {"fieldtype": "Date"}) }}</div>
+
+  {% if error %}
+    <div class="mt-err">{{ error }}</div>
+  {% elif not trips %}
+    <div class="mt-empty">{{ _("No trips assigned for today.") }}</div>
+  {% else %}
+    {% for t in trips %}
+    <div class="mt-trip">
+      <div class="head">
+        <div class="id">{{ t.name }}</div>
+        <div>{{ _("Status") }}: <b>{{ t.status }}</b></div>
+      </div>
+      <div class="mt-meta">
+        {{ t.direction or "" }} &middot; {{ t.route or "" }} &middot;
+        {{ t.hub_warehouse or "" }} &middot;
+        {{ _("Vehicle") }}: {{ t.vehicle_number or "—" }} &middot;
+        {{ _("Shipments") }}: {{ t.total_shipments or 0 }}
+      </div>
+      <div class="mt-meta">
+        {{ _("Plan") }}:
+        {{ frappe.format_value(t.planned_start, {"fieldtype": "Datetime"}) if t.planned_start else "—" }}
+        → {{ frappe.format_value(t.planned_end, {"fieldtype": "Datetime"}) if t.planned_end else "—" }}
+      </div>
+
+      <table class="mt-stops">
+        <thead>
+          <tr>
+            <th style="width:30px;">#</th>
+            <th>{{ _("Type") }}</th>
+            <th>{{ _("Store / WH") }}</th>
+            <th style="width:110px;">{{ _("ETA") }}</th>
+            <th style="width:110px;">{{ _("ATA") }}</th>
+            <th>{{ _("Status") }}</th>
+            <th style="width:220px;">{{ _("Actions") }}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for s in t.stops %}
+          <tr>
+            <td>{{ s.sequence or loop.index }}</td>
+            <td>{{ s.stop_type or "" }}</td>
+            <td>{{ s.store or s.warehouse or "" }}</td>
+            <td>{{ frappe.format_value(s.eta, {"fieldtype": "Datetime"}) if s.eta else "" }}</td>
+            <td>{{ frappe.format_value(s.ata, {"fieldtype": "Datetime"}) if s.ata else "" }}</td>
+            <td>{{ s.status or "Planned" }}</td>
+            <td class="mt-actions">
+              <button onclick="mtArrive('{{ t.name }}', {{ s.sequence or loop.index }})">{{ _("Arrive") }}</button>
+              <button onclick="mtComplete('{{ t.name }}', {{ s.sequence or loop.index }})">{{ _("Complete") }}</button>
+            </td>
+          </tr>
+          {% else %}
+          <tr><td colspan="7" style="text-align:center;color:#888;">{{ _("No stops") }}</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% endfor %}
+  {% endif %}
+</div>
+
+<script>
+function mtCaptureGPS() {
+  return new Promise((resolve) => {
+    if (!navigator.geolocation) return resolve({});
+    navigator.geolocation.getCurrentPosition(
+      (p) => resolve({lat: p.coords.latitude, lng: p.coords.longitude}),
+      ()  => resolve({}),
+      {timeout: 5000, maximumAge: 30000}
+    );
+  });
+}
+async function mtCall(method, params) {
+  const r = await fetch("/api/method/" + method, {
+    method: "POST",
+    headers: {"Content-Type": "application/x-www-form-urlencoded",
+              "X-Frappe-CSRF-Token": (frappe.csrf_token || "")},
+    body: new URLSearchParams(params)
+  });
+  if (r.ok) location.reload();
+  else alert("Failed: " + r.status + " " + (await r.text()).slice(0, 200));
+}
+async function mtArrive(trip, sequence) {
+  const gps = await mtCaptureGPS();
+  return mtCall("ch_logistics.api.logistics_api.stop_arrive", {
+    trip, sequence, gps_lat: gps.lat || "", gps_lng: gps.lng || ""
+  });
+}
+async function mtComplete(trip, sequence) {
+  return mtCall("ch_logistics.api.logistics_api.stop_complete", {
+    trip, sequence
+  });
+}
+</script>
+{% endblock %}

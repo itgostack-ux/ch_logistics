@@ -23,7 +23,7 @@ import frappe
 from frappe import _
 from frappe.utils import add_to_date, cint, flt, get_datetime, now_datetime
 
-from ch_logistics.ch_logistics.doctype.ch_tracking_settings.ch_tracking_settings import (
+from ch_logistics.logistics.doctype.ch_tracking_settings.ch_tracking_settings import (
 	get_public_config,
 )
 
@@ -276,7 +276,7 @@ def mark_stale_drivers_offline() -> int:
 	for d in stale:
 		try:
 			# Soft transition — never block via raise.
-			from ch_erp15.ch_erp15 import driver_status as ds
+			from ch_logistics.api import driver_status as ds
 			ds.set_status(d, ds.OFFLINE, force=True, touch_activity=False)
 		except Exception:
 			frappe.db.set_value("Driver", d, "availability_status", "Offline",

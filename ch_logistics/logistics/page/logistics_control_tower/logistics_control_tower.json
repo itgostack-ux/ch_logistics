@@ -1,0 +1,22 @@
+{
+ "content": null,
+ "creation": "2026-01-01 00:00:00",
+ "doctype": "Page",
+ "icon": "fa fa-sitemap",
+ "idx": 0,
+ "modified": "2026-05-26 00:00:00",
+ "module": "Logistics",
+ "name": "logistics-control-tower",
+ "page_name": "logistics-control-tower",
+ "roles": [
+  {"role": "System Manager"},
+  {"role": "Operations Manager"},
+  {"role": "Delivery Manager"},
+  {"role": "Delivery User"},
+  {"role": "Stock Manager"},
+  {"role": "Stock User"}
+ ],
+ "standard": "Yes",
+ "system_page": 0,
+ "title": "Logistics Command Center"
+}

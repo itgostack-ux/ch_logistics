@@ -1,0 +1,295 @@
+{
+ "actions": [],
+ "allow_import": 1,
+ "allow_rename": 0,
+ "autoname": "naming_series:",
+ "creation": "2026-05-26 00:00:00.000000",
+ "doctype": "DocType",
+ "document_type": "Document",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "naming_series",
+  "trip_date",
+  "company",
+  "col_break_header",
+  "status",
+  "direction",
+  "sec_route",
+  "route",
+  "hub_warehouse",
+  "col_break_route",
+  "planned_start",
+  "planned_end",
+  "sec_assignment",
+  "driver",
+  "driver_name",
+  "driver_phone",
+  "col_break_assignment",
+  "vehicle",
+  "vehicle_number",
+  "sec_stops",
+  "stops",
+  "sec_execution",
+  "actual_start",
+  "actual_end",
+  "col_break_execution",
+  "total_shipments",
+  "total_distance_actual_km",
+  "total_duration_actual_min",
+  "sec_exceptions",
+  "exceptions",
+  "sec_notes",
+  "notes"
+ ],
+ "fields": [
+  {
+   "fieldname": "naming_series",
+   "fieldtype": "Select",
+   "hidden": 1,
+   "label": "Naming Series",
+   "options": "TRIP-.YYYY.-.#####",
+   "default": "TRIP-.YYYY.-.#####"
+  },
+  {
+   "fieldname": "trip_date",
+   "fieldtype": "Date",
+   "default": "Today",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Trip Date",
+   "reqd": 1,
+   "search_index": 1
+  },
+  {
+   "fieldname": "company",
+   "fieldtype": "Link",
+   "in_standard_filter": 1,
+   "label": "Company",
+   "options": "Company",
+   "reqd": 1
+  },
+  {
+   "fieldname": "col_break_header",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "status",
+   "fieldtype": "Select",
+   "default": "Draft",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Status",
+   "options": "Draft\nAssigned\nStarted\nCompleted\nClosed\nCancelled",
+   "read_only": 1,
+   "search_index": 1
+  },
+  {
+   "fieldname": "direction",
+   "fieldtype": "Select",
+   "default": "Forward",
+   "in_standard_filter": 1,
+   "label": "Direction",
+   "options": "Forward\nReverse\nMixed"
+  },
+  {
+   "fieldname": "sec_route",
+   "fieldtype": "Section Break",
+   "label": "Route"
+  },
+  {
+   "fieldname": "route",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "Route",
+   "options": "CH Route"
+  },
+  {
+   "fieldname": "hub_warehouse",
+   "fieldtype": "Link",
+   "label": "Hub Warehouse",
+   "options": "Warehouse",
+   "fetch_from": "route.hub_warehouse"
+  },
+  {
+   "fieldname": "col_break_route",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "planned_start",
+   "fieldtype": "Datetime",
+   "label": "Planned Start"
+  },
+  {
+   "fieldname": "planned_end",
+   "fieldtype": "Datetime",
+   "label": "Planned End"
+  },
+  {
+   "fieldname": "sec_assignment",
+   "fieldtype": "Section Break",
+   "label": "Assignment"
+  },
+  {
+   "fieldname": "driver",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Driver",
+   "options": "Driver",
+   "search_index": 1
+  },
+  {
+   "fieldname": "driver_name",
+   "fieldtype": "Data",
+   "fetch_from": "driver.full_name",
+   "label": "Driver Name",
+   "read_only": 1
+  },
+  {
+   "fieldname": "driver_phone",
+   "fieldtype": "Data",
+   "fetch_from": "driver.cell_number",
+   "label": "Driver Phone",
+   "read_only": 1
+  },
+  {
+   "fieldname": "col_break_assignment",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "vehicle",
+   "fieldtype": "Link",
+   "label": "Vehicle",
+   "options": "Vehicle"
+  },
+  {
+   "fieldname": "vehicle_number",
+   "fieldtype": "Data",
+   "fetch_from": "vehicle.license_plate",
+   "label": "Vehicle Number",
+   "read_only": 1
+  },
+  {
+   "fieldname": "sec_stops",
+   "fieldtype": "Section Break",
+   "label": "Stops"
+  },
+  {
+   "fieldname": "stops",
+   "fieldtype": "Table",
+   "label": "Stops",
+   "options": "CH Logistics Trip Stop"
+  },
+  {
+   "fieldname": "sec_execution",
+   "fieldtype": "Section Break",
+   "label": "Execution",
+   "collapsible": 1
+  },
+  {
+   "fieldname": "actual_start",
+   "fieldtype": "Datetime",
+   "label": "Actual Start",
+   "read_only": 1
+  },
+  {
+   "fieldname": "actual_end",
+   "fieldtype": "Datetime",
+   "label": "Actual End",
+   "read_only": 1
+  },
+  {
+   "fieldname": "col_break_execution",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "total_shipments",
+   "fieldtype": "Int",
+   "label": "Total Shipments",
+   "read_only": 1
+  },
+  {
+   "fieldname": "total_distance_actual_km",
+   "fieldtype": "Float",
+   "label": "Actual Distance (km)",
+   "precision": "2"
+  },
+  {
+   "fieldname": "total_duration_actual_min",
+   "fieldtype": "Int",
+   "label": "Actual Duration (min)",
+   "read_only": 1
+  },
+  {
+   "fieldname": "sec_exceptions",
+   "fieldtype": "Section Break",
+   "label": "Exceptions",
+   "collapsible": 1
+  },
+  {
+   "fieldname": "exceptions",
+   "fieldtype": "Table",
+   "label": "Exceptions",
+   "options": "CH Logistics Exception"
+  },
+  {
+   "fieldname": "sec_notes",
+   "fieldtype": "Section Break",
+   "label": "Notes",
+   "collapsible": 1
+  },
+  {
+   "fieldname": "notes",
+   "fieldtype": "Small Text",
+   "label": "Notes"
+  }
+ ],
+ "links": [],
+ "modified": "2026-05-26 00:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Logistics",
+ "name": "CH Logistics Trip",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  },
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "Operations Manager",
+   "share": 1,
+   "write": 1
+  },
+  {
+   "create": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "Stock User",
+   "write": 1
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "title_field": "name",
+ "track_changes": 1
+}

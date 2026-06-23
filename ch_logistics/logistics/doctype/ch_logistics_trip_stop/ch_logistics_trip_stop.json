@@ -1,0 +1,116 @@
+{
+ "creation": "2026-05-26 00:00:00.000000",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "sequence",
+  "route_stop",
+  "warehouse",
+  "store",
+  "stop_type",
+  "status",
+  "eta",
+  "ata",
+  "gps_lat",
+  "gps_lng",
+  "manifest_count",
+  "scan_compliance_pct",
+  "notes"
+ ],
+ "fields": [
+  {
+   "fieldname": "sequence",
+   "fieldtype": "Int",
+   "in_list_view": 1,
+   "label": "Seq",
+   "reqd": 1
+  },
+  {
+   "fieldname": "route_stop",
+   "fieldtype": "Link",
+   "label": "Route Stop",
+   "options": "CH Route Stop"
+  },
+  {
+   "fieldname": "warehouse",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "Warehouse",
+   "options": "Warehouse",
+   "reqd": 1
+  },
+  {
+   "fieldname": "store",
+   "fieldtype": "Link",
+   "label": "Store",
+   "options": "CH Store"
+  },
+  {
+   "fieldname": "stop_type",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "label": "Type",
+   "options": "Drop\nPickup\nPickup+Drop",
+   "default": "Drop",
+   "reqd": 1
+  },
+  {
+   "fieldname": "status",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "label": "Status",
+   "options": "Pending\nArrived\nCompleted\nSkipped\nException",
+   "default": "Pending",
+   "read_only": 1
+  },
+  {
+   "fieldname": "eta",
+   "fieldtype": "Datetime",
+   "label": "ETA"
+  },
+  {
+   "fieldname": "ata",
+   "fieldtype": "Datetime",
+   "label": "Actual Arrival",
+   "read_only": 1
+  },
+  {
+   "fieldname": "gps_lat",
+   "fieldtype": "Float",
+   "label": "GPS Lat",
+   "read_only": 1,
+   "precision": "6"
+  },
+  {
+   "fieldname": "gps_lng",
+   "fieldtype": "Float",
+   "label": "GPS Lng",
+   "read_only": 1,
+   "precision": "6"
+  },
+  {
+   "fieldname": "manifest_count",
+   "fieldtype": "Int",
+   "label": "# Manifests",
+   "read_only": 1
+  },
+  {
+   "fieldname": "scan_compliance_pct",
+   "fieldtype": "Percent",
+   "label": "Scan %",
+   "read_only": 1
+  },
+  {
+   "fieldname": "notes",
+   "fieldtype": "Small Text",
+   "label": "Notes"
+  }
+ ],
+ "istable": 1,
+ "modified": "2026-05-26 00:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Logistics",
+ "name": "CH Logistics Trip Stop",
+ "owner": "Administrator"
+}

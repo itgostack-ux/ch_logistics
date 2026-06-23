@@ -1,6 +1,6 @@
 """Install GPS custom fields on the upstream Driver doctype.
 
-These fields are owned by ``ch_logistics`` (module="Ch Logistics") so the
+These fields are owned by ``ch_logistics`` (module="Logistics") so the
 fixture export from this app picks them up and they migrate cleanly with
 the app.
 
@@ -12,7 +12,7 @@ import frappe
 from frappe.custom.doctype.custom_field.custom_field import create_custom_fields
 
 
-MODULE = "Ch Logistics"
+MODULE = "Logistics"
 
 DRIVER_GEO_FIELDS = {
 	"Driver": [

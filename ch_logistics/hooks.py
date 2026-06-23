@@ -57,6 +57,6 @@ scheduler_events = {
 fixtures = [
 	{
 		"dt": "Custom Field",
-		"filters": [["module", "=", "Ch Logistics"]],
+		"filters": [["module", "=", "Logistics"]],
 	},
 ]

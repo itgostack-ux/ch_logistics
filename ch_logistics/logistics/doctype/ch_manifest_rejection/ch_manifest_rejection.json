@@ -1,0 +1,217 @@
+{
+ "actions": [],
+ "allow_rename": 0,
+ "autoname": "format:MR-{YYYY}-{#####}",
+ "creation": "2026-06-23 10:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "manifest",
+  "trip",
+  "driver",
+  "column_break_1",
+  "rejection_reason",
+  "rejected_on",
+  "rejected_by",
+  "proof_section",
+  "proof_image_1",
+  "column_break_2",
+  "proof_image_2",
+  "details_section",
+  "remarks",
+  "geo_section",
+  "latitude",
+  "column_break_3",
+  "longitude",
+  "status_section",
+  "status",
+  "dispatcher_notified",
+  "column_break_4",
+  "resolution_action",
+  "resolved_on"
+ ],
+ "fields": [
+  {
+   "fieldname": "manifest",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Manifest",
+   "options": "CH Transfer Manifest",
+   "reqd": 1
+  },
+  {
+   "fieldname": "trip",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "Trip",
+   "options": "CH Logistics Trip",
+   "read_only": 1
+  },
+  {
+   "fieldname": "driver",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "Driver",
+   "options": "Driver",
+   "reqd": 1
+  },
+  {
+   "fieldname": "column_break_1",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "rejection_reason",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "label": "Reason",
+   "options": "Material Not Ready\nWrong Package\nStore Closed\nDamaged Package\nReceiver Unavailable\nAddress Not Found\nOther",
+   "reqd": 1
+  },
+  {
+   "default": "Now",
+   "fieldname": "rejected_on",
+   "fieldtype": "Datetime",
+   "label": "Rejected On",
+   "read_only": 1,
+   "reqd": 1
+  },
+  {
+   "fieldname": "rejected_by",
+   "fieldtype": "Link",
+   "label": "Rejected By",
+   "options": "User",
+   "read_only": 1
+  },
+  {
+   "fieldname": "proof_section",
+   "fieldtype": "Section Break",
+   "label": "Proof (Both Required)"
+  },
+  {
+   "fieldname": "proof_image_1",
+   "fieldtype": "Attach Image",
+   "label": "Proof Photo 1",
+   "reqd": 1
+  },
+  {
+   "fieldname": "column_break_2",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "proof_image_2",
+   "fieldtype": "Attach Image",
+   "label": "Proof Photo 2",
+   "reqd": 1
+  },
+  {
+   "fieldname": "details_section",
+   "fieldtype": "Section Break",
+   "label": "Details"
+  },
+  {
+   "fieldname": "remarks",
+   "fieldtype": "Small Text",
+   "label": "Remarks"
+  },
+  {
+   "fieldname": "geo_section",
+   "fieldtype": "Section Break",
+   "label": "Location At Rejection"
+  },
+  {
+   "fieldname": "latitude",
+   "fieldtype": "Float",
+   "label": "Latitude",
+   "precision": "7"
+  },
+  {
+   "fieldname": "column_break_3",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "longitude",
+   "fieldtype": "Float",
+   "label": "Longitude",
+   "precision": "7"
+  },
+  {
+   "fieldname": "status_section",
+   "fieldtype": "Section Break",
+   "label": "Resolution"
+  },
+  {
+   "default": "Pending Review",
+   "fieldname": "status",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "label": "Status",
+   "options": "Pending Review\nAcknowledged\nReassigned\nClosed"
+  },
+  {
+   "default": "0",
+   "fieldname": "dispatcher_notified",
+   "fieldtype": "Check",
+   "label": "Dispatcher Notified",
+   "read_only": 1
+  },
+  {
+   "fieldname": "column_break_4",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "resolution_action",
+   "fieldtype": "Small Text",
+   "label": "Resolution Action"
+  },
+  {
+   "fieldname": "resolved_on",
+   "fieldtype": "Datetime",
+   "label": "Resolved On",
+   "read_only": 1
+  }
+ ],
+ "index_web_pages_for_search": 0,
+ "is_submittable": 1,
+ "links": [],
+ "modified": "2026-06-23 10:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Logistics",
+ "name": "CH Manifest Rejection",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "amend": 1,
+   "cancel": 1,
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 1,
+   "submit": 1,
+   "write": 1
+  },
+  {
+   "create": 1,
+   "read": 1,
+   "report": 1,
+   "role": "Logistics Manager",
+   "submit": 1,
+   "write": 1
+  },
+  {
+   "create": 1,
+   "read": 1,
+   "role": "Logistics User",
+   "submit": 1
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "track_changes": 1
+}

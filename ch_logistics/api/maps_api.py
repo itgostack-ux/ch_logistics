@@ -10,7 +10,7 @@ from __future__ import annotations
 import frappe
 from frappe import _
 
-from ch_logistics.ch_logistics.doctype.ch_tracking_settings.ch_tracking_settings import (
+from ch_logistics.logistics.doctype.ch_tracking_settings.ch_tracking_settings import (
 	get_google_maps_api_key,
 )
 

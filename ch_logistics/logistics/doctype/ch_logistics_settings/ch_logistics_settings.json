@@ -1,0 +1,129 @@
+{
+ "actions": [],
+ "creation": "2026-06-22 00:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "driver_app_section",
+  "auto_idle_enabled",
+  "idle_timeout_minutes",
+  "column_break_driver",
+  "enforce_single_device",
+  "proof_section",
+  "enforce_pickup_qr",
+  "enforce_delivery_otp",
+  "push_section",
+  "push_provider",
+  "column_break_push",
+  "fcm_project_id",
+  "fcm_server_key"
+ ],
+ "fields": [
+  {
+   "fieldname": "driver_app_section",
+   "fieldtype": "Section Break",
+   "label": "Driver App"
+  },
+  {
+   "default": "1",
+   "description": "Automatically move idle (inactive) drivers to the Idle status.",
+   "fieldname": "auto_idle_enabled",
+   "fieldtype": "Check",
+   "label": "Auto-Mark Idle Drivers"
+  },
+  {
+   "default": "15",
+   "description": "Minutes of inactivity before an Available driver is marked Idle.",
+   "fieldname": "idle_timeout_minutes",
+   "fieldtype": "Int",
+   "label": "Idle Timeout (minutes)"
+  },
+  {
+   "fieldname": "column_break_driver",
+   "fieldtype": "Column Break"
+  },
+  {
+   "default": "1",
+   "description": "Logging in on a new handset deactivates the driver's other devices.",
+   "fieldname": "enforce_single_device",
+   "fieldtype": "Check",
+   "label": "Enforce Single Device per Driver"
+  },
+  {
+   "fieldname": "proof_section",
+   "fieldtype": "Section Break",
+   "label": "Proof of Delivery"
+  },
+  {
+   "default": "1",
+   "description": "Require a matching manifest/order QR scan before pickup can complete.",
+   "fieldname": "enforce_pickup_qr",
+   "fieldtype": "Check",
+   "label": "Enforce Pickup QR Scan"
+  },
+  {
+   "default": "1",
+   "description": "Require OTP verification before a delivery can complete.",
+   "fieldname": "enforce_delivery_otp",
+   "fieldtype": "Check",
+   "label": "Enforce Delivery OTP"
+  },
+  {
+   "fieldname": "push_section",
+   "fieldtype": "Section Break",
+   "label": "Push Notifications"
+  },
+  {
+   "default": "Frappe Web Push",
+   "description": "Web Push works on the desk delivery app today; FCM targets the native driver app.",
+   "fieldname": "push_provider",
+   "fieldtype": "Select",
+   "label": "Push Provider",
+   "options": "Frappe Web Push\nFCM\nDisabled"
+  },
+  {
+   "fieldname": "column_break_push",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "fcm_project_id",
+   "fieldtype": "Data",
+   "label": "FCM Project ID"
+  },
+  {
+   "fieldname": "fcm_server_key",
+   "fieldtype": "Password",
+   "label": "FCM Server Key"
+  }
+ ],
+ "index_web_pages_for_search": 0,
+ "issingle": 1,
+ "links": [],
+ "modified": "2026-06-22 00:00:00.000000",
+ "module": "Logistics",
+ "name": "CH Logistics Settings",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "print": 1,
+   "read": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  },
+  {
+   "create": 1,
+   "print": 1,
+   "read": 1,
+   "role": "Delivery Manager",
+   "share": 1,
+   "write": 1
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": []
+}
