@@ -220,7 +220,7 @@ class DeliveryApp {
             : (t.direction === "Mixed" ? '<i class="fa fa-random"></i> Mixed' : '<i class="fa fa-arrow-right"></i> Forward');
         let planned = t.planned_start ? frappe.datetime.str_to_user(t.planned_start) : "";
         return `
-            <div class="da-trip-card da-manifest-card" data-name="${frappe.utils.escape_html(t.name)}">
+            <div class="da-trip-card" data-name="${frappe.utils.escape_html(t.name)}">
                 <div class="da-card-header">
                     <span class="da-card-name">${frappe.utils.escape_html(t.name)}</span>
                     <span class="da-card-status da-status-${status_cls}">${frappe.utils.escape_html(t.status)}</span>
