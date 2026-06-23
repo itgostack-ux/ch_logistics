@@ -1,0 +1,18 @@
+# Python
+*.pyc
+__pycache__/
+*.egg-info/
+
+# Frappe
+node_modules/
+dist/
+.parcel-cache/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db

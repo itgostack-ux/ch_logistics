@@ -1,0 +1,179 @@
+{
+ "actions": [],
+ "allow_rename": 0,
+ "autoname": "hash",
+ "creation": "2026-06-23 10:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "driver",
+  "captured_at",
+  "column_break_1",
+  "event_type",
+  "trip",
+  "geo_section",
+  "latitude",
+  "longitude",
+  "column_break_2",
+  "accuracy_m",
+  "speed_kmh",
+  "heading",
+  "device_section",
+  "device_id",
+  "battery_pct",
+  "column_break_3",
+  "is_mock",
+  "source"
+ ],
+ "fields": [
+  {
+   "fieldname": "driver",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Driver",
+   "options": "Driver",
+   "reqd": 1,
+   "search_index": 1
+  },
+  {
+   "fieldname": "captured_at",
+   "fieldtype": "Datetime",
+   "in_list_view": 1,
+   "label": "Captured At",
+   "reqd": 1,
+   "search_index": 1
+  },
+  {
+   "fieldname": "column_break_1",
+   "fieldtype": "Column Break"
+  },
+  {
+   "default": "Heartbeat",
+   "fieldname": "event_type",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Event",
+   "options": "Heartbeat\nPickup\nDelivery\nTripStart\nTripEnd\nReachedLocation\nManual"
+  },
+  {
+   "fieldname": "trip",
+   "fieldtype": "Link",
+   "label": "Trip",
+   "options": "CH Logistics Trip",
+   "search_index": 1
+  },
+  {
+   "fieldname": "geo_section",
+   "fieldtype": "Section Break",
+   "label": "Location"
+  },
+  {
+   "fieldname": "latitude",
+   "fieldtype": "Float",
+   "label": "Latitude",
+   "non_negative": 0,
+   "precision": "7",
+   "reqd": 1
+  },
+  {
+   "fieldname": "longitude",
+   "fieldtype": "Float",
+   "label": "Longitude",
+   "non_negative": 0,
+   "precision": "7",
+   "reqd": 1
+  },
+  {
+   "fieldname": "column_break_2",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "accuracy_m",
+   "fieldtype": "Float",
+   "label": "Accuracy (m)",
+   "precision": "2"
+  },
+  {
+   "fieldname": "speed_kmh",
+   "fieldtype": "Float",
+   "label": "Speed (km/h)",
+   "precision": "2"
+  },
+  {
+   "fieldname": "heading",
+   "fieldtype": "Float",
+   "label": "Heading (deg)",
+   "precision": "2"
+  },
+  {
+   "fieldname": "device_section",
+   "fieldtype": "Section Break",
+   "label": "Device"
+  },
+  {
+   "fieldname": "device_id",
+   "fieldtype": "Data",
+   "label": "Device ID"
+  },
+  {
+   "fieldname": "battery_pct",
+   "fieldtype": "Int",
+   "label": "Battery %"
+  },
+  {
+   "fieldname": "column_break_3",
+   "fieldtype": "Column Break"
+  },
+  {
+   "default": "0",
+   "fieldname": "is_mock",
+   "fieldtype": "Check",
+   "label": "Mock Location?"
+  },
+  {
+   "default": "App",
+   "fieldname": "source",
+   "fieldtype": "Select",
+   "label": "Source",
+   "options": "App\nWeb\nKiosk\nAPI"
+  }
+ ],
+ "in_create": 1,
+ "index_web_pages_for_search": 0,
+ "links": [],
+ "modified": "2026-06-23 10:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Ch Logistics",
+ "name": "CH Driver Location",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 0,
+   "export": 1,
+   "print": 0,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 0,
+   "write": 1
+  },
+  {
+   "read": 1,
+   "report": 1,
+   "role": "Logistics Manager"
+  },
+  {
+   "read": 1,
+   "role": "Logistics User"
+  }
+ ],
+ "sort_field": "captured_at",
+ "sort_order": "DESC",
+ "states": [],
+ "title_field": "driver",
+ "track_changes": 0
+}
