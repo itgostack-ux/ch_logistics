@@ -2,3 +2,5 @@ ch_logistics.patches.v0_0_1.install_driver_geo_fields
 ch_logistics.patches.v0_0_2.rebind_logistics_module
 ch_logistics.patches.v0_0_3.install_logistics_phase2_fields
 ch_logistics.patches.v0_0_3.install_driver_app_fields
+ch_logistics.patches.v0_0_4.install_geo_optimization_fields
+ch_logistics.patches.v0_0_5.install_tracking_token

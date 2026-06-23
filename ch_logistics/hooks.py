@@ -48,6 +48,10 @@ scheduler_events = {
 		"*/5 * * * *": [
 			"ch_logistics.api.tracking_api.mark_stale_drivers_offline",
 		],
+		# Predictive ETA + SLA-breach early warning for in-progress trips.
+		"*/10 * * * *": [
+			"ch_logistics.api.optimizer.check_eta_sla_breaches",
+		],
 	},
 }
 

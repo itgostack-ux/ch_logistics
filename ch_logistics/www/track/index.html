@@ -1,0 +1,80 @@
+{% extends "templates/web.html" %}
+
+{% block title %}{{ _("Track Delivery") }}{% endblock %}
+
+{% block page_content %}
+<style>
+	.trk-wrap { max-width: 560px; margin: 24px auto; padding: 0 16px; }
+	.trk-card { background:#fff; border:1px solid #e5e7eb; border-radius:12px; padding:20px 22px; box-shadow:0 1px 3px rgba(0,0,0,.06); }
+	.trk-status { font-size:22px; font-weight:700; margin:2px 0 2px; }
+	.trk-status.done { color:#16a34a; }
+	.trk-sub { color:#6b7280; font-size:13px; }
+	.trk-meta { display:flex; justify-content:space-between; gap:12px; margin:16px 0; font-size:13px; }
+	.trk-meta .lbl { color:#9ca3af; text-transform:uppercase; letter-spacing:.4px; font-size:10px; }
+	.trk-eta { background:#eff6ff; border:1px solid #bfdbfe; color:#1e40af; border-radius:8px; padding:10px 12px; font-size:14px; margin:8px 0 4px; }
+	.trk-timeline { list-style:none; padding:0; margin:18px 0 0; }
+	.trk-timeline li { position:relative; padding:0 0 18px 26px; }
+	.trk-timeline li:before { content:""; position:absolute; left:6px; top:3px; width:11px; height:11px; border-radius:50%; background:#d1d5db; }
+	.trk-timeline li.done:before { background:#16a34a; }
+	.trk-timeline li:after { content:""; position:absolute; left:11px; top:14px; bottom:0; width:1px; background:#e5e7eb; }
+	.trk-timeline li:last-child:after { display:none; }
+	.trk-tl-label { font-weight:600; font-size:14px; }
+	.trk-tl-time { color:#9ca3af; font-size:12px; }
+	#trk-map { width:100%; height:220px; border-radius:8px; margin-top:14px; }
+	.trk-err { text-align:center; color:#6b7280; padding:40px 16px; }
+</style>
+
+<div class="trk-wrap">
+	{% if not found %}
+		<div class="trk-card trk-err">
+			<i class="fa fa-map-signs fa-2x" style="color:#cbd5e1"></i>
+			<p style="margin-top:12px">{{ error or _("Tracking link not found.") }}</p>
+		</div>
+	{% else %}
+		<div class="trk-card">
+			<div class="trk-sub">{{ _("Order") }} {{ t.order_id }}</div>
+			<div class="trk-status {% if t.is_delivered %}done{% endif %}">{{ t.status }}</div>
+
+			{% if t.eta and not t.is_delivered %}
+				<div class="trk-eta"><i class="fa fa-clock-o"></i> {{ _("Estimated arrival") }}: <b>{{ frappe.utils.format_datetime(t.eta) }}</b></div>
+			{% endif %}
+
+			<div class="trk-meta">
+				<div><div class="lbl">{{ _("From") }}</div>{{ t["from"] or "—" }}</div>
+				<div style="text-align:right"><div class="lbl">{{ _("To") }}</div>{{ t.to or "—" }}</div>
+			</div>
+			{% if t.driver_name %}<div class="trk-sub"><i class="fa fa-user"></i> {{ _("Driver") }}: {{ t.driver_name }}</div>{% endif %}
+
+			{% if t.driver_position and maps_key %}
+				<div id="trk-map"></div>
+			{% endif %}
+
+			<ul class="trk-timeline">
+				{% for step in t.timeline %}
+					<li class="{% if step.done %}done{% endif %}">
+						<div class="trk-tl-label">{{ step.label }}</div>
+						{% if step.time %}<div class="trk-tl-time">{{ frappe.utils.format_datetime(step.time) }}</div>{% endif %}
+					</li>
+				{% endfor %}
+			</ul>
+		</div>
+		<p class="trk-sub" style="text-align:center; margin-top:14px">{{ _("Live status — refresh for updates.") }}</p>
+	{% endif %}
+</div>
+
+{% if found and t.driver_position and maps_key %}
+<script>
+	window.__trk = {{ t.driver_position | tojson }};
+	(function () {
+		const s = document.createElement("script");
+		s.src = "https://maps.googleapis.com/maps/api/js?key={{ maps_key }}&callback=trkInit";
+		s.async = true; document.head.appendChild(s);
+	})();
+	window.trkInit = function () {
+		const p = { lat: parseFloat(window.__trk.lat), lng: parseFloat(window.__trk.lng) };
+		const map = new google.maps.Map(document.getElementById("trk-map"), { center: p, zoom: 14 });
+		new google.maps.Marker({ position: p, map: map, title: "Driver" });
+	};
+</script>
+{% endif %}
+{% endblock %}

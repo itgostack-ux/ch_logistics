@@ -187,6 +187,10 @@ class CHTransferManifest(Document):
             # match against (older manifests are backfilled lazily here).
             if not self.qr_payload:
                 self.qr_payload = self.name
+            # Issue the public track-and-trace token once, at assignment.
+            if not self.get("tracking_token"):
+                from ch_logistics.api.customer_tracking import ensure_token
+                ensure_token(self)
             self.flags.ignore_validate_update_after_submit = True
             self.save()
 
@@ -246,6 +250,9 @@ class CHTransferManifest(Document):
             self.flags.ignore_validate_update_after_submit = True
             self.save()
             self._sync_logistics_status_to_entries("In Transit")
+            # Proactive "out for delivery" to the destination store + track link.
+            from ch_logistics.api.customer_tracking import notify_destination
+            notify_destination(self.name, "out_for_delivery")
         finally:
             frappe.db.sql("SELECT RELEASE_LOCK(%s)", (lock_key,))
 
@@ -365,6 +372,8 @@ class CHTransferManifest(Document):
             self.flags.ignore_validate_update_after_submit = True
             self.save()
             self._sync_logistics_status_to_entries("Delivered")
+            from ch_logistics.api.customer_tracking import notify_destination
+            notify_destination(self.name, "delivered")
         finally:
             frappe.db.sql("SELECT RELEASE_LOCK(%s)", (lock_key,))
 

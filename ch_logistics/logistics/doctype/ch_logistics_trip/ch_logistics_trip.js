@@ -13,6 +13,35 @@ frappe.ui.form.on("CH Logistics Trip", {
 
 		const status = frm.doc.status;
 
+		// Route optimization — only before the driver starts executing.
+		if ((status === "Draft" || status === "Assigned") && (frm.doc.stops || []).length > 1) {
+			frm.add_custom_button(__("Optimize Route"), () => {
+				frappe.xcall("ch_logistics.api.optimizer.optimize_trip", { trip: frm.doc.name })
+					.then((r) => {
+						frappe.show_alert({
+							message: __("Route optimized: {0} km → {1} km (saved {2} km, {3}%)",
+								[r.distance_before_km, r.distance_after_km, r.distance_saved_km, r.saved_pct]),
+							indicator: "green",
+						}, 8);
+						frm.reload_doc();
+					});
+			});
+		}
+
+		// Recompute live ETA from the driver's current position.
+		if ((status === "Assigned" || status === "Started") && (frm.doc.stops || []).length) {
+			frm.add_custom_button(__("Recompute ETA"), () => {
+				frappe.xcall("ch_logistics.api.optimizer.compute_trip_eta", { trip: frm.doc.name })
+					.then((r) => {
+						frappe.show_alert({
+							message: __("ETA updated for {0} stop(s).", [r.updated]),
+							indicator: "blue",
+						});
+						frm.reload_doc();
+					});
+			}, __("Actions"));
+		}
+
 		// Draft → Assigned (requires driver)
 		if (status === "Draft") {
 			frm.add_custom_button(__("Assign Driver"), () => {
