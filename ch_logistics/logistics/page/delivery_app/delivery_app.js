@@ -548,6 +548,13 @@ class DeliveryApp {
                             message: __("Arrival recorded. You can now Complete Delivery."),
                             indicator: "green",
                         });
+                        // The detail view renders from ``this._detail`` (fetched
+                        // via get_manifest_detail), not from ``this.manifests``.
+                        // We must re-fetch the detail so the new
+                        // ``arrival_datetime`` flips the Complete Delivery
+                        // button out of its locked state. ``load_data()`` also
+                        // refreshes the list bucket for the back-list view.
+                        this.show_manifest_detail(this.active_manifest);
                         this.load_data();
                     },
                     error: () => frappe.dom.unfreeze(),
