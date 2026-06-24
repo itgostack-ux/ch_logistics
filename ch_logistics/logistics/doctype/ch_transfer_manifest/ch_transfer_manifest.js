@@ -284,6 +284,8 @@ function show_pickup_dialog(frm, api) {
     let d = new frappe.ui.Dialog({
         title: __("Start Pickup"),
         fields: [
+            { fieldname: "scanned_qr", fieldtype: "Data", label: __("Scan / Enter Manifest QR"), reqd: 1,
+              description: __("Scan the manifest/order QR. Pickup is blocked until it matches.") },
             { fieldname: "pickup_photo", fieldtype: "Attach Image", label: __("Pickup Photo"), reqd: 1 },
             { fieldname: "notes", fieldtype: "Small Text", label: __("Notes") },
         ],
@@ -297,6 +299,7 @@ function show_pickup_dialog(frm, api) {
                     args: {
                         manifest: frm.doc.name,
                         pickup_photo: values.pickup_photo,
+                        scanned_qr: values.scanned_qr,
                         lat, lng,
                         notes: values.notes,
                     },
@@ -312,6 +315,8 @@ function show_delivery_dialog(frm, api) {
     let d = new frappe.ui.Dialog({
         title: __("Complete Delivery"),
         fields: [
+            { fieldname: "scanned_qr", fieldtype: "Data", label: __("Scan / Enter Manifest QR"), reqd: 1,
+              description: __("Scan the manifest/order QR at the receiver. Delivery is blocked until it matches.") },
             { fieldname: "delivery_photo", fieldtype: "Attach Image", label: __("Delivery Photo"), reqd: 1 },
             { fieldname: "receiver_name", fieldtype: "Data", label: __("Receiver Name"), reqd: 1 },
             { fieldname: "otp", fieldtype: "Data", label: __("Delivery OTP"), reqd: 1 },
@@ -326,6 +331,7 @@ function show_delivery_dialog(frm, api) {
                         manifest: frm.doc.name,
                         delivery_photo: values.delivery_photo,
                         receiver_name: values.receiver_name,
+                        scanned_qr: values.scanned_qr,
                         otp: values.otp,
                         lat, lng,
                     },
@@ -407,15 +413,29 @@ function show_accept_dialog(frm, api) {
 }
 
 function capture_gps(callback) {
-    if (navigator.geolocation) {
-        navigator.geolocation.getCurrentPosition(
-            (pos) => callback(pos.coords.latitude, pos.coords.longitude),
-            () => callback(0, 0),
-            { timeout: 5000 }
-        );
-    } else {
-        callback(0, 0);
+    // Driver location is mandatory at pickup / delivery (proof of presence).
+    // Do NOT silently fall back to (0, 0) — that sentinel is rejected by the
+    // server and would also defeat the audit trail.
+    if (!navigator.geolocation) {
+        frappe.msgprint({
+            title: __("Location Required"),
+            indicator: "red",
+            message: __("This device does not support geolocation. Pickup / delivery cannot be confirmed without driver location."),
+        });
+        return;
     }
+    navigator.geolocation.getCurrentPosition(
+        (pos) => callback(pos.coords.latitude, pos.coords.longitude),
+        (err) => {
+            frappe.msgprint({
+                title: __("Location Required"),
+                indicator: "red",
+                message: __("Could not capture driver location ({0}). Enable Location on the device and retry.",
+                            [(err && err.message) || __("permission denied")]),
+            });
+        },
+        { enableHighAccuracy: true, timeout: 8000, maximumAge: 0 }
+    );
 }
 
 // ── Recall / Return Dialogs ──────────────────────────────────────────────────

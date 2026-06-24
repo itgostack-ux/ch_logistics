@@ -147,7 +147,7 @@ def reject_manifest(manifest, rejection_reason, rejection_photo,
 
 @frappe.whitelist()
 def complete_delivery(manifest, delivery_photo, receiver_name, otp=None,
-                      lat=None, lng=None) -> dict:
+                      lat=None, lng=None, scanned_qr=None) -> dict:
     _require_stage_role("complete_delivery")
     doc = frappe.get_doc("CH Transfer Manifest", manifest)
     doc.check_permission("write")
@@ -155,6 +155,7 @@ def complete_delivery(manifest, delivery_photo, receiver_name, otp=None,
         delivery_photo=delivery_photo,
         receiver_name=receiver_name,
         otp=otp, lat=lat, lng=lng,
+        scanned_qr=scanned_qr,
     )
     return {"status": doc.status}
 

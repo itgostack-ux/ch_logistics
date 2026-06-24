@@ -433,6 +433,13 @@ class DeliveryApp {
             title: __("Complete Delivery"),
             fields: [
                 {
+                    fieldname: "scanned_qr",
+                    fieldtype: "Data",
+                    label: __("Scan / Enter Manifest QR"),
+                    reqd: 1,
+                    description: __("Scan the manifest/order QR at the receiver. Delivery is blocked until it matches."),
+                },
+                {
                     fieldname: "delivery_photo",
                     fieldtype: "Attach Image",
                     label: __("Take Photo of Delivery"),
@@ -462,6 +469,7 @@ class DeliveryApp {
                             manifest: this.active_manifest,
                             delivery_photo: values.delivery_photo,
                             receiver_name: values.receiver_name,
+                            scanned_qr: values.scanned_qr,
                             otp: values.otp,
                             lat, lng,
                         },
@@ -544,15 +552,30 @@ class DeliveryApp {
     }
 
     _capture_gps(callback) {
-        if (navigator.geolocation) {
-            navigator.geolocation.getCurrentPosition(
-                (pos) => callback(pos.coords.latitude, pos.coords.longitude),
-                () => callback(0, 0),
-                { timeout: 8000 }
-            );
-        } else {
-            callback(0, 0);
+        // Driver location is mandatory at pickup / delivery (proof of presence).
+        // Do NOT silently fall back to (0, 0) — that sentinel is rejected by the
+        // server and would also defeat the audit trail. If geolocation is
+        // unavailable or denied, surface a clear error and skip the API call.
+        if (!navigator.geolocation) {
+            frappe.msgprint({
+                title: __("Location Required"),
+                indicator: "red",
+                message: __("This device does not support geolocation. Pickup / delivery cannot be confirmed without driver location."),
+            });
+            return;
         }
+        navigator.geolocation.getCurrentPosition(
+            (pos) => callback(pos.coords.latitude, pos.coords.longitude),
+            (err) => {
+                frappe.msgprint({
+                    title: __("Location Required"),
+                    indicator: "red",
+                    message: __("Could not capture driver location ({0}). Enable Location on the device and retry.",
+                                [(err && err.message) || __("permission denied")]),
+                });
+            },
+            { enableHighAccuracy: true, timeout: 8000, maximumAge: 0 }
+        );
     }
 
     // ── Trip detail view ─────────────────────────────────────────

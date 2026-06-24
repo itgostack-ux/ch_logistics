@@ -502,10 +502,12 @@ class CHTransferManifest(Document):
             self._validate_pickup_qr(scanned_qr)
             if not pickup_photo:
                 frappe.throw(_("Pickup photo is mandatory."), title=_("Ch Transfer Manifest Error"))
+            # Mandatory driver GPS at pickup location (proof of presence).
+            lat_f, lng_f = self._validate_geo(lat, lng, kind="pickup")
             self.pickup_photo = pickup_photo
             self.pickup_datetime = now_datetime()
-            self.pickup_lat = flt(lat)
-            self.pickup_lng = flt(lng)
+            self.pickup_lat = lat_f
+            self.pickup_lng = lng_f
             self.pickup_notes = notes
             self.status = "In Transit"
             self.flags.ignore_validate_update_after_submit = True
@@ -532,6 +534,53 @@ class CHTransferManifest(Document):
         if scanned != expected:
             frappe.throw(_("Scanned QR does not match this manifest. Expected {0}.").format(expected),
                          title=_("Wrong QR"))
+
+    def _validate_delivery_qr(self, scanned_qr):
+        """Enforce the mandatory delivery scan (same handover ritual as pickup,
+        on the receiver side). Gated by ``enforce_delivery_qr`` so it can be
+        relaxed for last-mile B2C lanes that don't carry a returnable QR."""
+        enforce = frappe.db.get_single_value("CH Logistics Settings", "enforce_delivery_qr")
+        # Default ON when the flag has never been set (matches JSON default=1).
+        if enforce is not None and not int(enforce):
+            return
+        expected = (self.qr_payload or self.name or "").strip()
+        scanned = (scanned_qr or "").strip()
+        if not scanned:
+            frappe.throw(_("QR scan is mandatory. Scan the manifest/order QR to complete delivery."),
+                         title=_("Scan Required"))
+        if scanned != expected:
+            frappe.throw(_("Scanned QR does not match this manifest. Expected {0}.").format(expected),
+                         title=_("Wrong QR"))
+
+    def _validate_geo(self, lat, lng, kind: str):
+        """Mandatory driver-location proof for pickup/delivery.
+
+        Treats null / blank / non-numeric / sentinel (0, 0) / out-of-bounds
+        coordinates as a missing capture and throws. The (0, 0) sentinel is
+        what the driver app emits when the browser/device denies geolocation,
+        so accepting it would defeat the proof-of-presence requirement.
+
+        Returns the parsed (lat, lng) floats so callers can store them.
+        """
+        label = _("pickup") if kind == "pickup" else _("delivery")
+        try:
+            lat_f = float(lat) if lat not in (None, "") else None
+            lng_f = float(lng) if lng not in (None, "") else None
+        except (TypeError, ValueError):
+            lat_f = lng_f = None
+        if lat_f is None or lng_f is None:
+            frappe.throw(_("Driver location (latitude & longitude) is mandatory at {0}. "
+                           "Enable location on the device and retry.").format(label),
+                         title=_("Location Required"))
+        if not (-90.0 <= lat_f <= 90.0) or not (-180.0 <= lng_f <= 180.0):
+            frappe.throw(_("Driver location for {0} is out of range "
+                           "(lat {1}, lng {2}).").format(label, lat_f, lng_f),
+                         title=_("Invalid Location"))
+        if lat_f == 0.0 and lng_f == 0.0:
+            frappe.throw(_("Driver location for {0} could not be captured "
+                           "(GPS returned 0, 0). Enable location on the device and retry.").format(label),
+                         title=_("Location Required"))
+        return lat_f, lng_f
 
     def reject_manifest(self, rejection_reason, rejection_photo, rejection_notes=None):
         """Driver rejects a pickup that cannot be completed (FR-022 → FR-027).
@@ -600,7 +649,7 @@ class CHTransferManifest(Document):
                              message=frappe.get_traceback())
 
     def complete_delivery(self, delivery_photo, receiver_name, otp=None,
-                          lat=None, lng=None):
+                          lat=None, lng=None, scanned_qr=None):
         lock_key = f"manifest_status_{frappe.scrub(self.name)}"
         lock_result = frappe.db.sql("SELECT GET_LOCK(%s, 10)", (lock_key,))[0][0]
         if not lock_result:
@@ -616,7 +665,11 @@ class CHTransferManifest(Document):
                 frappe.throw(_("Delivery photo is mandatory."), title=_("Ch Transfer Manifest Error"))
             if not receiver_name:
                 frappe.throw(_("Receiver name is mandatory."), title=_("Ch Transfer Manifest Error"))
-            # OTP verification
+            # Mandatory delivery-side QR scan (parallel to pickup scan).
+            self._validate_delivery_qr(scanned_qr)
+            # Mandatory driver GPS at the receiver's doorstep (proof of presence).
+            lat_f, lng_f = self._validate_geo(lat, lng, kind="delivery")
+            # OTP verification (secondary factor, gated by its own flag).
             if self.delivery_otp:
                 if not otp:
                     frappe.throw(_("Delivery OTP is required."), title=_("Ch Transfer Manifest Error"))
@@ -626,8 +679,8 @@ class CHTransferManifest(Document):
 
             self.delivery_photo = delivery_photo
             self.delivery_datetime = now_datetime()
-            self.delivery_lat = flt(lat)
-            self.delivery_lng = flt(lng)
+            self.delivery_lat = lat_f
+            self.delivery_lng = lng_f
             self.receiver_name = receiver_name
             self.status = "Delivered"
             self.flags.ignore_validate_update_after_submit = True

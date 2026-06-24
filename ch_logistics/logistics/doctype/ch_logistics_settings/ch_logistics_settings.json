@@ -11,6 +11,7 @@
   "enforce_single_device",
   "proof_section",
   "enforce_pickup_qr",
+  "enforce_delivery_qr",
   "enforce_delivery_otp",
   "push_section",
   "push_provider",
@@ -64,6 +65,13 @@
    "fieldname": "enforce_pickup_qr",
    "fieldtype": "Check",
    "label": "Enforce Pickup QR Scan"
+  },
+  {
+   "default": "1",
+   "description": "Require a matching manifest/order QR scan before delivery can complete.",
+   "fieldname": "enforce_delivery_qr",
+   "fieldtype": "Check",
+   "label": "Enforce Delivery QR Scan"
   },
   {
    "default": "1",
