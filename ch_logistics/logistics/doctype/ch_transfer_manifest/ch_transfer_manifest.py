@@ -509,6 +509,12 @@ class CHTransferManifest(Document):
             self.pickup_lat = lat_f
             self.pickup_lng = lng_f
             self.pickup_notes = notes
+            # Reset any prior arrival capture so a re-picked manifest forces a
+            # fresh "Reached Location" tap before delivery can be completed.
+            if frappe.get_meta(self.doctype).has_field("arrival_datetime"):
+                self.arrival_datetime = None
+                self.arrival_lat = None
+                self.arrival_lng = None
             self.status = "In Transit"
             self.flags.ignore_validate_update_after_submit = True
             self.save()
@@ -562,7 +568,8 @@ class CHTransferManifest(Document):
 
         Returns the parsed (lat, lng) floats so callers can store them.
         """
-        label = _("pickup") if kind == "pickup" else _("delivery")
+        labels = {"pickup": _("pickup"), "arrival": _("arrival at destination")}
+        label = labels.get(kind, _("delivery"))
         try:
             lat_f = float(lat) if lat not in (None, "") else None
             lng_f = float(lng) if lng not in (None, "") else None
@@ -716,6 +723,59 @@ class CHTransferManifest(Document):
             frappe.log_error(title=f"rejection notify failed for {self.name}",
                              message=frappe.get_traceback())
 
+    def mark_reached_destination(self, lat, lng):
+        """Driver taps 'Reached Location' when they arrive at the receiver.
+
+        Operationally this is the arrival-geofence ping used by every major
+        carrier (Delhivery, BlueDart, Ekart, FedEx, Oracle TMS, SAP TM): the
+        driver has to confirm presence at the destination before the
+        delivery-completion form unlocks. Status stays at 'In Transit' but
+        arrival_datetime + arrival_lat/lng are recorded, which is what
+        ``complete_delivery`` gates on.
+
+        Returns the dict ``complete_delivery`` callers can echo back so the
+        UI knows when the arrival ping was accepted.
+        """
+        lock_key = f"manifest_arrival_{frappe.scrub(self.name)}"
+        if not frappe.db.sql("SELECT GET_LOCK(%s, 10)", (lock_key,))[0][0]:
+            frappe.throw(_("Manifest {0} is being updated by another user. Please refresh and try again.").format(self.name))
+        try:
+            current_status = frappe.db.get_value("CH Transfer Manifest", self.name, "status")
+            if current_status != self.status:
+                self.status = current_status
+            if self.status != "In Transit":
+                frappe.throw(_("Can only record arrival while the manifest is In Transit (current: {0}).")
+                             .format(self.status),
+                             title=_("Ch Transfer Manifest Error"))
+            if not frappe.get_meta(self.doctype).has_field("arrival_datetime"):
+                frappe.throw(_("Arrival capture fields not installed. Run patch "
+                               "ch_logistics.patches.v0_0_6.add_arrival_location_fields."),
+                             title=_("Schema Mismatch"))
+            lat_f, lng_f = self._validate_geo(lat, lng, kind="arrival")
+            self.arrival_datetime = now_datetime()
+            self.arrival_lat = lat_f
+            self.arrival_lng = lng_f
+            self.flags.ignore_validate_update_after_submit = True
+            self.save()
+            # Tell the destination store / warehouse the driver is at the door
+            # so they can prepare to receive — reuses the existing customer
+            # tracking notification pipeline.
+            try:
+                from ch_logistics.api.customer_tracking import notify_destination
+                notify_destination(self.name, "arrived_at_destination")
+            except Exception:
+                # Non-fatal — the geofence ping itself is the source of truth;
+                # the notification is best-effort.
+                frappe.log_error(frappe.get_traceback(),
+                                 f"arrived_at_destination notify failed for {self.name}")
+            return {
+                "arrival_datetime": str(self.arrival_datetime),
+                "arrival_lat": self.arrival_lat,
+                "arrival_lng": self.arrival_lng,
+            }
+        finally:
+            frappe.db.sql("SELECT RELEASE_LOCK(%s)", (lock_key,))
+
     def complete_delivery(self, delivery_photo, receiver_name, otp=None,
                           lat=None, lng=None, scanned_qr=None):
         lock_key = f"manifest_status_{frappe.scrub(self.name)}"
@@ -729,6 +789,15 @@ class CHTransferManifest(Document):
 
             if self.status not in ("In Transit",):
                 frappe.throw(_("Can only deliver when status is In Transit."), title=_("Ch Transfer Manifest Error"))
+            # Two-stage POD: the driver must have explicitly tapped "Reached
+            # Location" before the receiver-side handover can be recorded.
+            # Carrier apps (Delhivery / BlueDart / Ekart / FedEx) all require
+            # the arrival geofence ping before they unlock the delivery form.
+            if frappe.get_meta(self.doctype).has_field("arrival_datetime") and not self.arrival_datetime:
+                frappe.throw(
+                    _("Tap 'Reached Location' to record arrival at the destination before completing delivery."),
+                    title=_("Arrival Not Recorded"),
+                )
             if not delivery_photo:
                 frappe.throw(_("Delivery photo is mandatory."), title=_("Ch Transfer Manifest Error"))
             if not receiver_name:

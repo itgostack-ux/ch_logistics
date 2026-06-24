@@ -21,6 +21,7 @@ _STAGE_ROLES = {
     # Outward stages — source-store dispatch lane
     "assign_driver":     {"Delivery Manager", "Stock Manager", "Store Manager"},
     "start_pickup":      {"Delivery Manager", "Delivery User", "Stock Manager"},
+    "mark_reached_destination": {"Delivery Manager", "Delivery User", "Stock Manager"},
     "reject_manifest":   {"Delivery Manager", "Delivery User", "Stock Manager"},
     "complete_delivery": {"Delivery User", "Delivery Manager"},
     # Inward stages — destination-store receipt lane
@@ -214,6 +215,26 @@ def bulk_reject_other_assignments(accepted_manifest, rejection_reason,
         "rejected": rejected,
         "skipped": skipped,
         "scope": "trip" if trip else "driver",
+    }
+
+
+@frappe.whitelist()
+def mark_reached_destination(manifest, lat, lng) -> dict:
+    """Driver \"Reached Location\" ping at the destination.
+
+    Captures arrival GPS + timestamp on the manifest while keeping status
+    at 'In Transit'. ``complete_delivery`` is gated on this ping, so the
+    Complete Delivery dialog cannot open until the driver has confirmed
+    arrival at the receiver.
+    """
+    _require_stage_role("mark_reached_destination")
+    doc = frappe.get_doc("CH Transfer Manifest", manifest)
+    doc.check_permission("write")
+    info = doc.mark_reached_destination(lat=lat, lng=lng)
+    return {
+        "status": doc.status,
+        "arrival_datetime": info.get("arrival_datetime"),
+        "message": _("Arrival recorded. You can now Complete Delivery."),
     }
 
 
@@ -844,6 +865,7 @@ def get_driver_assignments() -> list:
             "total_stock_entries", "total_items", "total_qty",
             "estimated_delivery_date", "creation",
             "trip",
+            "arrival_datetime",
         ],
         order_by="creation desc",
         limit=100,

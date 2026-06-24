@@ -117,6 +117,7 @@ class DeliveryApp {
         this.$body.on("click", "#da-pickup-btn", () => this.do_pickup());
         this.$body.on("click", "#da-reject-btn", () => this.do_reject());
         this.$body.on("click", "#da-bulk-reject-btn", () => this.do_bulk_reject_others());
+        this.$body.on("click", "#da-arrived-btn", () => this.do_mark_reached());
         this.$body.on("click", "#da-deliver-btn", () => this.do_delivery());
 
         this.$body.on("click", "#da-break-btn", () => this.do_break("set_break"));
@@ -328,12 +329,33 @@ class DeliveryApp {
                 </button>`;
             }
         } else if (d.status === "In Transit") {
-            action_html = `<button id="da-deliver-btn" class="btn btn-success btn-lg btn-block da-action-btn">
-                <i class="fa fa-check-circle"></i> ${__("Complete Delivery")}
-            </button>
-            <button id="da-reject-btn" class="btn btn-danger btn-sm btn-block da-action-btn">
-                <i class="fa fa-exclamation-triangle"></i> ${__("Failed Delivery (mid-trip)")}
-            </button>`;
+            // Two-stage POD: the driver must record arrival at the destination
+            // before the Complete Delivery dialog unlocks. Until arrival is
+            // recorded we surface a prominent "Reached Location" CTA that
+            // captures GPS + timestamp on the manifest.
+            if (!d.arrival_datetime) {
+                action_html = `<button id="da-arrived-btn" class="btn btn-primary btn-lg btn-block da-action-btn">
+                    <i class="fa fa-map-marker"></i> ${__("Reached Location")}
+                </button>
+                <button id="da-deliver-btn" class="btn btn-success btn-lg btn-block da-action-btn" disabled
+                        title="${__("Tap Reached Location first")}">
+                    <i class="fa fa-check-circle"></i> ${__("Complete Delivery")}
+                </button>
+                <button id="da-reject-btn" class="btn btn-danger btn-sm btn-block da-action-btn">
+                    <i class="fa fa-exclamation-triangle"></i> ${__("Failed Delivery (mid-trip)")}
+                </button>`;
+            } else {
+                let arrived_at = frappe.datetime.str_to_user(d.arrival_datetime);
+                action_html = `<div class="alert alert-info da-arrival-banner" style="padding:8px 12px;border-radius:6px;margin-bottom:8px;font-size:13px;">
+                    <i class="fa fa-map-marker"></i> ${__("Arrived at destination")}: ${frappe.utils.escape_html(arrived_at)}
+                </div>
+                <button id="da-deliver-btn" class="btn btn-success btn-lg btn-block da-action-btn">
+                    <i class="fa fa-check-circle"></i> ${__("Complete Delivery")}
+                </button>
+                <button id="da-reject-btn" class="btn btn-danger btn-sm btn-block da-action-btn">
+                    <i class="fa fa-exclamation-triangle"></i> ${__("Failed Delivery (mid-trip)")}
+                </button>`;
+            }
         }
 
         $c.html(`
@@ -446,7 +468,48 @@ class DeliveryApp {
         d.show();
     }
 
+    do_mark_reached() {
+        // "Reached Location" — two-stage POD's first phase at the receiver
+        // end. Captures GPS + timestamp, then refreshes the manifest detail
+        // so the Complete Delivery button unlocks.
+        let manifest = (this.manifests || []).find(m => m.name === this.active_manifest) || {};
+        if (manifest.status !== "In Transit") {
+            frappe.show_alert({
+                message: __("Reached Location is only available while In Transit."),
+                indicator: "orange",
+            });
+            return;
+        }
+        frappe.dom.freeze(__("Capturing location…"));
+        this._capture_gps((lat, lng) => {
+            frappe.call({
+                method: API + "mark_reached_destination",
+                args: { manifest: this.active_manifest, lat, lng },
+                callback: () => {
+                    frappe.dom.unfreeze();
+                    frappe.show_alert({
+                        message: __("Arrival recorded. You can now Complete Delivery."),
+                        indicator: "green",
+                    });
+                    this.load_data();
+                },
+                error: () => frappe.dom.unfreeze(),
+            });
+        });
+    }
+
     do_delivery() {
+        // Two-stage POD gate: never open the Complete Delivery dialog until
+        // arrival has been recorded — even if the user somehow clicked an
+        // un-disabled button (e.g. stale UI). Server enforces the same gate.
+        let manifest = (this.manifests || []).find(m => m.name === this.active_manifest) || {};
+        if (manifest.status === "In Transit" && !manifest.arrival_datetime) {
+            frappe.show_alert({
+                message: __("Tap Reached Location first to record arrival at the destination."),
+                indicator: "orange",
+            });
+            return;
+        }
         // Step 1: request a fresh OTP — server generates a new 6-digit code
         // and emails / SMSes it to the connected destination warehouse plus
         // the store manager contacts. Only after the OTP has been dispatched
