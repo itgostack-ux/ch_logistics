@@ -583,10 +583,26 @@ class CHTransferManifest(Document):
         return lat_f, lng_f
 
     def reject_manifest(self, rejection_reason, rejection_photo, rejection_notes=None):
-        """Driver rejects a pickup that cannot be completed (FR-022 → FR-027).
+        """Driver rejects a manifest that cannot be completed.
 
-        Reason + proof photo are mandatory; the manifest moves to Rejected and
-        the dispatcher is notified. Stock is untouched — nothing was picked."""
+        Two rejection paths are supported — they share this entry point but
+        differ in stock handling:
+
+        * **Pickup-time rejection** (status in Assigned / Pickup Started) —
+          goods never left the source warehouse, so child Stock Entries
+          revert to ``Pending Pickup`` and the manifest is set to
+          ``Rejected``. Standard carrier vocabulary: pickup failure.
+
+        * **In-transit rejection** (status In Transit) — goods are with the
+          driver and physically cannot stay with the receiver (Customer
+          Not Available / Address Not Found / Receiver Refused / Damaged in
+          Transit / Vehicle Breakdown). Child Stock Entries flip to
+          ``Return to Source`` so ops knows the load is coming back, and a
+          trip-level CH Logistics Exception is auto-raised so the control
+          tower sees the failed delivery attempt the same way Delhivery /
+          BlueDart / FedEx surface \"Delivery Exception\".
+
+        Reason + proof photo are mandatory in both paths."""
         lock_key = f"manifest_status_{frappe.scrub(self.name)}"
         if not frappe.db.sql("SELECT GET_LOCK(%s, 10)", (lock_key,))[0][0]:
             frappe.throw(_("Manifest {0} is being updated by another user. Please refresh and try again.").format(self.name))
@@ -594,13 +610,20 @@ class CHTransferManifest(Document):
             current_status = frappe.db.get_value("CH Transfer Manifest", self.name, "status")
             if current_status != self.status:
                 self.status = current_status
-            if self.status not in ("Assigned", "Pickup Started"):
-                frappe.throw(_("Can only reject a manifest before pickup is completed (current: {0}).").format(self.status),
+            if self.status not in ("Assigned", "Pickup Started", "In Transit"):
+                frappe.throw(_("Can only reject a manifest before delivery is completed (current: {0}).").format(self.status),
                              title=_("Ch Transfer Manifest Error"))
-            valid_reasons = {"Material Not Ready", "Wrong Package", "Store Closed",
-                             "Damaged Package", "Other"}
+            during = "In Transit" if self.status == "In Transit" else "Pickup"
+            pickup_reasons = {"Material Not Ready", "Wrong Package", "Store Closed",
+                              "Damaged Package", "Other"}
+            in_transit_reasons = {"Customer Not Available", "Address Not Found",
+                                  "Receiver Refused", "Damaged in Transit",
+                                  "Vehicle Breakdown", "Other"}
+            valid_reasons = in_transit_reasons if during == "In Transit" else pickup_reasons
             if rejection_reason not in valid_reasons:
-                frappe.throw(_("Select a valid rejection reason."), title=_("Ch Transfer Manifest Error"))
+                frappe.throw(_("'{0}' is not a valid rejection reason at {1}. Allowed: {2}.").format(
+                                 rejection_reason, during, ", ".join(sorted(valid_reasons))),
+                             title=_("Ch Transfer Manifest Error"))
             if not rejection_photo:
                 frappe.throw(_("Rejection proof photo is mandatory."), title=_("Ch Transfer Manifest Error"))
 
@@ -609,14 +632,59 @@ class CHTransferManifest(Document):
             self.rejection_notes = rejection_notes
             self.rejected_by = frappe.session.user
             self.rejected_at = now_datetime()
+            if frappe.get_meta(self.doctype).has_field("rejected_during"):
+                self.rejected_during = during
             self.status = "Rejected"
             self.flags.ignore_validate_update_after_submit = True
             self.save()
-            # Goods never left the source — return child entries to Pending Pickup.
-            self._sync_logistics_status_to_entries("Pending Pickup")
+            if during == "In Transit":
+                # Goods are physically with the driver — they need to come
+                # back to source. Source store will receive them as a return.
+                self._sync_logistics_status_to_entries("Return to Source")
+                self._raise_trip_exception_for_rejection(rejection_reason, rejection_notes)
+            else:
+                # Nothing was picked up — child entries go back to the queue.
+                self._sync_logistics_status_to_entries("Pending Pickup")
             self._notify_dispatcher_rejection()
         finally:
             frappe.db.sql("SELECT RELEASE_LOCK(%s)", (lock_key,))
+
+    def _raise_trip_exception_for_rejection(self, reason, notes):
+        """Surface an in-transit rejection on the parent trip's exception log.
+
+        Best-effort — a trip exception is informational for the control
+        tower; if we cannot write it (no trip attached, schema mismatch,
+        etc.) the rejection itself must still succeed."""
+        try:
+            trip_name = self.get("trip")
+            if not trip_name:
+                return
+            trip = frappe.get_doc("CH Logistics Trip", trip_name)
+            # Map carrier-grade reason → trip exception type taxonomy.
+            exc_type_map = {
+                "Customer Not Available": "Customer Not Available",
+                "Address Not Found": "Address Issue",
+                "Receiver Refused": "Customer Not Available",
+                "Damaged in Transit": "Damage",
+                "Vehicle Breakdown": "Vehicle Breakdown",
+            }
+            exc_type = exc_type_map.get(reason, "Other")
+            severity = "High" if reason in ("Damaged in Transit", "Vehicle Breakdown") else "Medium"
+            trip.append("exceptions", {
+                "occurred_at": now_datetime(),
+                "exception_type": exc_type,
+                "severity": severity,
+                "stop_sequence": self.get("stop_sequence") or 0,
+                "remarks": _("Manifest {0} rejected in transit: {1}. {2}").format(
+                    self.name, reason, notes or ""),
+                "photo": self.rejection_photo,
+                "resolution_status": "Open",
+            })
+            trip.flags.ignore_validate_update_after_submit = True
+            trip.save(ignore_permissions=True)
+        except Exception:
+            frappe.log_error(title=f"trip exception raise failed for {self.name}",
+                             message=frappe.get_traceback())
 
     def _notify_dispatcher_rejection(self):
         """FR-026: alert the dispatch desk that a manifest was rejected."""

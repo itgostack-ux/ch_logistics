@@ -146,6 +146,78 @@ def reject_manifest(manifest, rejection_reason, rejection_photo,
 
 
 @frappe.whitelist()
+def bulk_reject_other_assignments(accepted_manifest, rejection_reason,
+                                  rejection_photo, rejection_notes=None) -> dict:
+    """Driver accepts one manifest and rejects all the others assigned to them.
+
+    Standard handover-pool pattern used by Swiggy / Zomato / Dunzo / Ekart
+    driver apps: a driver is offered a batch of orders, picks one, and
+    bounces the rest back to dispatch so they can be re-routed.
+
+    Scope:
+      * If the accepted manifest is attached to a trip, only manifests on
+        the *same* trip in status ``Assigned`` are rejected.
+      * Otherwise, every ``Assigned`` manifest currently sitting on the
+        logged-in driver is rejected.
+
+    Each rejection runs through ``reject_manifest`` so the same reason +
+    photo + dispatcher notification + stock-state revert path is used. We
+    never silently bulk-update behind the controller.
+
+    Returns: {accepted, rejected: [names], skipped: [{name, reason}]}.
+    """
+    _require_stage_role("reject_manifest")
+    if not rejection_reason:
+        frappe.throw(_("Rejection reason is required."), title=_("API Error"))
+    if not rejection_photo:
+        frappe.throw(_("Rejection proof photo is required."), title=_("API Error"))
+
+    accepted_doc = frappe.get_doc("CH Transfer Manifest", accepted_manifest)
+    accepted_doc.check_permission("read")
+    driver = accepted_doc.driver
+    if not driver:
+        frappe.throw(_("Accepted manifest has no driver."), title=_("API Error"))
+
+    # Build the sibling pool: same driver, same trip if any, status Assigned.
+    filters = {
+        "name": ["!=", accepted_manifest],
+        "driver": driver,
+        "docstatus": 1,
+        "status": "Assigned",
+    }
+    trip = accepted_doc.get("trip")
+    if trip:
+        filters["trip"] = trip
+
+    siblings = frappe.get_all("CH Transfer Manifest", filters=filters, pluck="name")
+
+    rejected, skipped = [], []
+    for name in siblings:
+        try:
+            sib = frappe.get_doc("CH Transfer Manifest", name)
+            sib.check_permission("write")
+            sib.reject_manifest(
+                rejection_reason=rejection_reason,
+                rejection_photo=rejection_photo,
+                rejection_notes=rejection_notes,
+            )
+            rejected.append(name)
+        except Exception as exc:
+            # Don't let one bad sibling abort the whole batch — surface
+            # which ones failed so the driver app can flag them.
+            skipped.append({"name": name, "reason": str(exc)})
+            frappe.log_error(title=f"bulk_reject skip {name}",
+                             message=frappe.get_traceback())
+
+    return {
+        "accepted": accepted_manifest,
+        "rejected": rejected,
+        "skipped": skipped,
+        "scope": "trip" if trip else "driver",
+    }
+
+
+@frappe.whitelist()
 def complete_delivery(manifest, delivery_photo, receiver_name, otp=None,
                       lat=None, lng=None, scanned_qr=None) -> dict:
     _require_stage_role("complete_delivery")
@@ -633,7 +705,18 @@ def poll_courier_statuses(dry_run=0) -> dict:
 
 @frappe.whitelist()
 def get_driver_assignments() -> list:
-    """Return manifests assigned to the logged-in user (as Driver)."""
+    """Return active manifests for the logged-in driver.
+
+    Includes every status the driver still owns work on:
+      Assigned        — pending pickup
+      Pickup Started  — in handover (defensive, transient state)
+      In Transit      — on the way to receiver
+      Delivered       — dropped off but receiver hasn't accepted yet,
+                        driver may still need to follow up / collect POD
+
+    Each row carries a ``bucket`` field so the driver app can group them
+    under \"To Pick Up\", \"In Transit\", and \"Awaiting Receipt\".
+    """
     user = frappe.session.user
     user_roles = frappe.get_roles(user)
     is_ops = bool({"System Manager", "Delivery Manager", "Delivery User"} & set(user_roles))
@@ -652,7 +735,8 @@ def get_driver_assignments() -> list:
     else:
         return []
 
-    filters["status"] = ["in", ["Assigned", "In Transit"]]
+    active_statuses = ["Assigned", "Pickup Started", "In Transit", "Delivered"]
+    filters["status"] = ["in", active_statuses]
 
     manifests = frappe.get_all(
         "CH Transfer Manifest",
@@ -663,19 +747,26 @@ def get_driver_assignments() -> list:
             "driver_name", "driver_phone",
             "total_stock_entries", "total_items", "total_qty",
             "estimated_delivery_date", "creation",
+            "trip",
         ],
         order_by="creation desc",
-        limit=50,
+        limit=100,
     )
 
-    # Enrichment: store addresses
+    bucket_by_status = {
+        "Assigned": "to_pickup",
+        "Pickup Started": "to_pickup",
+        "In Transit": "in_transit",
+        "Delivered": "awaiting_receipt",
+    }
     for m in manifests:
+        m["bucket"] = bucket_by_status.get(m.get("status"), "to_pickup")
         if m.get("source_store"):
-            addr = frappe.db.get_value("CH Store", m["source_store"], "address")
-            m["source_address"] = addr or ""
+            m["source_address"] = frappe.db.get_value(
+                "CH Store", m["source_store"], "address") or ""
         if m.get("destination_store"):
-            addr = frappe.db.get_value("CH Store", m["destination_store"], "address")
-            m["destination_address"] = addr or ""
+            m["destination_address"] = frappe.db.get_value(
+                "CH Store", m["destination_store"], "address") or ""
 
     return manifests
 

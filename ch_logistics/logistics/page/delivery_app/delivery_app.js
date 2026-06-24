@@ -116,6 +116,7 @@ class DeliveryApp {
 
         this.$body.on("click", "#da-pickup-btn", () => this.do_pickup());
         this.$body.on("click", "#da-reject-btn", () => this.do_reject());
+        this.$body.on("click", "#da-bulk-reject-btn", () => this.do_bulk_reject_others());
         this.$body.on("click", "#da-deliver-btn", () => this.do_delivery());
 
         this.$body.on("click", "#da-break-btn", () => this.do_break("set_break"));
@@ -303,18 +304,35 @@ class DeliveryApp {
             items_html += `</div>`;
         }
 
-        // Action buttons
+        // Action buttons — carrier-grade three-stage contract:
+        //   Assigned   → Start Pickup | Reject Pickup | Reject Other Assigns
+        //   In Transit → Complete Delivery | Reject Delivery (mid-trip)
+        //   Delivered  → (read-only, waiting on receiver to accept)
         let action_html = "";
         if (d.status === "Assigned") {
+            // Count sibling Assigned manifests this driver still owns — only
+            // worth showing the bulk-reject button when there are siblings.
+            let sibling_count = (this.manifests || []).filter(
+                m => m.status === "Assigned" && m.name !== d.name
+                     && (!d.trip || m.trip === d.trip)
+            ).length;
             action_html = `<button id="da-pickup-btn" class="btn btn-primary btn-lg btn-block da-action-btn">
                 <i class="fa fa-camera"></i> ${__("Start Pickup")}
             </button>
             <button id="da-reject-btn" class="btn btn-danger btn-sm btn-block da-action-btn">
                 <i class="fa fa-ban"></i> ${__("Reject Pickup")}
             </button>`;
+            if (sibling_count > 0) {
+                action_html += `<button id="da-bulk-reject-btn" class="btn btn-warning btn-sm btn-block da-action-btn">
+                    <i class="fa fa-list-ul"></i> ${__("Accept this & reject {0} other", [sibling_count])}
+                </button>`;
+            }
         } else if (d.status === "In Transit") {
             action_html = `<button id="da-deliver-btn" class="btn btn-success btn-lg btn-block da-action-btn">
                 <i class="fa fa-check-circle"></i> ${__("Complete Delivery")}
+            </button>
+            <button id="da-reject-btn" class="btn btn-danger btn-sm btn-block da-action-btn">
+                <i class="fa fa-exclamation-triangle"></i> ${__("Failed Delivery (mid-trip)")}
             </button>`;
         }
 
@@ -489,15 +507,36 @@ class DeliveryApp {
     }
 
     do_reject() {
+        // Status-aware rejection: carrier-grade ERPs (Delhivery / BlueDart /
+        // Ekart / FedEx / Oracle TMS) use different reason codes for pickup
+        // failure versus mid-trip delivery failure. We mirror that split
+        // so dispatch can route the recovery action correctly.
+        let manifest = (this.manifests || []).find(m => m.name === this.active_manifest)
+                       || { status: "Assigned" };
+        let in_transit = manifest.status === "In Transit";
+        let reasons = in_transit ? [
+            "Customer Not Available",
+            "Address Not Found",
+            "Receiver Refused",
+            "Damaged in Transit",
+            "Vehicle Breakdown",
+            "Other",
+        ] : [
+            "Material Not Ready",
+            "Wrong Package",
+            "Store Closed",
+            "Damaged Package",
+            "Other",
+        ];
+        let title = in_transit ? __("Failed Delivery (mid-trip)") : __("Reject Pickup");
         let d = new frappe.ui.Dialog({
-            title: __("Reject Pickup"),
+            title: title,
             fields: [
                 {
                     fieldname: "rejection_reason",
                     fieldtype: "Select",
                     label: __("Reason"),
-                    options: ["Material Not Ready", "Wrong Package", "Store Closed",
-                        "Damaged Package", "Other"].join("\n"),
+                    options: reasons.join("\n"),
                     reqd: 1,
                 },
                 {
@@ -525,10 +564,90 @@ class DeliveryApp {
                     },
                     callback: () => {
                         frappe.show_alert({
-                            message: __("Manifest rejected. Dispatcher notified."),
+                            message: in_transit
+                                ? __("Failed delivery logged. Dispatch notified; goods will be returned to source.")
+                                : __("Manifest rejected. Dispatcher notified."),
                             indicator: "orange",
                         });
                         this.show_manifest_detail(this.active_manifest);
+                        this.load_data();
+                    },
+                });
+            },
+        });
+        d.show();
+    }
+
+    do_bulk_reject_others() {
+        // \"Accept this one, reject the rest\" — the handover-pool pattern
+        // used by Swiggy / Zomato / Dunzo / Ekart driver apps. Scope is
+        // determined server-side (same trip if the accepted manifest is on
+        // a trip, else all Assigned manifests for this driver).
+        let accepted = this.active_manifest;
+        let manifest = (this.manifests || []).find(m => m.name === accepted) || {};
+        let siblings = (this.manifests || []).filter(
+            m => m.status === "Assigned" && m.name !== accepted
+                 && (!manifest.trip || m.trip === manifest.trip)
+        );
+        if (!siblings.length) {
+            frappe.show_alert({ message: __("No other Assigned manifests to reject."), indicator: "blue" });
+            return;
+        }
+        let sibling_html = siblings.map(m =>
+            `<li><code>${frappe.utils.escape_html(m.name)}</code> — ${frappe.utils.escape_html(
+                (m.destination_store || m.destination_warehouse || "\u2014"))}</li>`
+        ).join("");
+        let d = new frappe.ui.Dialog({
+            title: __("Reject {0} Other Assignment(s)", [siblings.length]),
+            fields: [
+                {
+                    fieldname: "preview",
+                    fieldtype: "HTML",
+                    options: `<div class="alert alert-warning" style="padding:10px;border-radius:6px;">
+                        <strong>${__("You will accept:")}</strong> <code>${frappe.utils.escape_html(accepted)}</code><br>
+                        <strong>${__("You will reject:")}</strong>
+                        <ul style="margin:6px 0 0 0;padding-left:20px;">${sibling_html}</ul>
+                    </div>`,
+                },
+                {
+                    fieldname: "rejection_reason",
+                    fieldtype: "Select",
+                    label: __("Reason (applies to all rejected)"),
+                    options: ["Material Not Ready", "Wrong Package", "Store Closed",
+                              "Damaged Package", "Other"].join("\n"),
+                    reqd: 1,
+                },
+                {
+                    fieldname: "rejection_photo",
+                    fieldtype: "Attach Image",
+                    label: __("Proof Photo (shared)"),
+                    reqd: 1,
+                },
+                {
+                    fieldname: "rejection_notes",
+                    fieldtype: "Small Text",
+                    label: __("Notes"),
+                },
+            ],
+            primary_action_label: __("Reject {0} & Continue", [siblings.length]),
+            primary_action: (values) => {
+                d.hide();
+                frappe.call({
+                    method: API + "bulk_reject_other_assignments",
+                    args: {
+                        accepted_manifest: accepted,
+                        rejection_reason: values.rejection_reason,
+                        rejection_photo: values.rejection_photo,
+                        rejection_notes: values.rejection_notes,
+                    },
+                    callback: (r) => {
+                        let res = r.message || {};
+                        let msg = __("Accepted {0}. Rejected {1} of {2}.",
+                            [accepted, (res.rejected || []).length, siblings.length]);
+                        if ((res.skipped || []).length) {
+                            msg += " " + __("Skipped: {0}.", [res.skipped.map(s => s.name).join(", ")]);
+                        }
+                        frappe.show_alert({ message: msg, indicator: "orange" });
                         this.load_data();
                     },
                 });

@@ -78,6 +78,10 @@ def trip_assign_driver(trip, driver, vehicle=None):
     if doc.status == "Draft":
         doc.status = "Assigned"
     doc.save()
+    # Fan the trip's driver assignment out to every manifest already attached
+    # to the trip. Without this the driver app's per-manifest filter
+    # (driver = X) hides them, even though they ride the same vehicle.
+    propagated = _propagate_trip_driver_to_manifests(trip, driver, vehicle)
     _set_driver_availability(driver, "On Trip", doc.name)
     # FR-011: notify the driver of the new assignment.
     try:
@@ -93,7 +97,51 @@ def trip_assign_driver(trip, driver, vehicle=None):
     except Exception:
         frappe.log_error(title="trip_assign_driver notify failed",
                          message=frappe.get_traceback())
-    return doc.name
+    return {"trip": doc.name, "manifests_assigned": propagated}
+
+
+def _propagate_trip_driver_to_manifests(trip, driver, vehicle=None):
+    """Copy the trip's driver onto every manifest attached to it.
+
+    Only touches manifests that are still pre-pickup (Draft / Packed /
+    Assigned) so a driver change cannot retroactively rewrite history on
+    rows already In Transit / Delivered / Closed.
+
+    Returns the list of manifest names whose driver was updated.
+    """
+    if not _has_manifest_trip_field():
+        return []
+    rows = frappe.get_all(
+        "CH Transfer Manifest",
+        filters={"trip": trip, "status": ["in", ["Draft", "Packed", "Assigned"]]},
+        fields=["name", "docstatus", "status", "driver"],
+    )
+    # Driver doctype stores name as `full_name` (Frappe native field).
+    drv_name = frappe.db.get_value("Driver", driver, "full_name") if driver else None
+    drv_phone = frappe.db.get_value("Driver", driver, "cell_number") if driver else None
+    updated = []
+    for r in rows:
+        # Skip rows already driven by someone else — a manager has to detach
+        # them first; we never silently steal a manifest from another driver.
+        if r.get("driver") and r.get("driver") != driver:
+            continue
+        payload = {"driver": driver}
+        if drv_name:
+            payload["driver_name"] = drv_name
+        if drv_phone:
+            payload["driver_phone"] = drv_phone
+        if vehicle and frappe.get_meta("CH Transfer Manifest").has_field("vehicle"):
+            payload["vehicle"] = vehicle
+        # If the manifest is still Packed and the trip-level assignment is
+        # what's putting a driver on it, also flip it to Assigned so the
+        # driver app shows it under "To Pick Up".
+        if r.get("status") == "Packed":
+            payload["status"] = "Assigned"
+        frappe.db.set_value("CH Transfer Manifest", r.name, payload, update_modified=False)
+        updated.append(r.name)
+    if updated:
+        frappe.db.commit()
+    return updated
 
 
 @frappe.whitelist()
@@ -189,6 +237,11 @@ def _attach_manifests(trip, manifests):
     # Refresh totals + per-stop manifest counts
     trip_doc.reload()
     trip_doc.save()
+    # If the trip already has a driver, pull every just-attached pre-pickup
+    # manifest onto that driver as well. Without this, attach-after-assign
+    # leaves the new manifests invisible to the driver app.
+    if trip_doc.driver:
+        _propagate_trip_driver_to_manifests(trip, trip_doc.driver, trip_doc.get("vehicle"))
 
 
 def _assign_stop_sequence(trip_doc, manifest_name):
