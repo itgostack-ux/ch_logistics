@@ -4,7 +4,7 @@ import frappe
 from frappe import _
 from frappe.utils import today
 
-from ch_logistics.api.report_utils import col, current_driver, is_ops_user
+from ch_logistics.api.report_utils import col, current_driver, is_ops_user, resolve_company
 
 
 def execute(filters=None):
@@ -16,6 +16,9 @@ def execute(filters=None):
 
     cond = ["m.manifest_date = %(day)s"]
     vals = {"day": day}
+    company = resolve_company(filters)
+    if company:
+        cond.append("m.company = %(company)s"); vals["company"] = company
     if driver:
         cond.append("m.driver = %(driver)s"); vals["driver"] = driver
     elif not is_ops_user():

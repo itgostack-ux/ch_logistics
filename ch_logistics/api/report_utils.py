@@ -8,6 +8,14 @@ import frappe
 from frappe.utils import flt  # noqa: F401  (re-exported for report convenience)
 
 
+def resolve_company(filters):
+    """The single active-company model used across the suite: use the filter if
+    set, else fall back to the user's active company (the global switcher /
+    company_lock default). Reports are therefore always company-scoped, never
+    leaking across companies when the dropdown is left blank."""
+    return (filters or {}).get("company") or frappe.defaults.get_user_default("Company")
+
+
 def col(label, fieldname, fieldtype="Data", width=130, options=None, precision=None):
     c = {"label": label, "fieldname": fieldname, "fieldtype": fieldtype, "width": width}
     if options:
@@ -22,8 +30,9 @@ def manifest_conditions(filters, alias="m", date_field="manifest_date"):
     f = filters or {}
     cond, vals = ["1=1"], {}
     add = lambda c, k, v: (cond.append(c), vals.__setitem__(k, v))
-    if f.get("company"):
-        add(f"{alias}.company = %(company)s", "company", f["company"])
+    company = resolve_company(f)
+    if company:
+        add(f"{alias}.company = %(company)s", "company", company)
     if f.get("from_date"):
         add(f"{alias}.{date_field} >= %(from_date)s", "from_date", f["from_date"])
     if f.get("to_date"):
@@ -47,8 +56,9 @@ def trip_conditions(filters, alias="t"):
     f = filters or {}
     cond, vals = ["1=1"], {}
     add = lambda c, k, v: (cond.append(c), vals.__setitem__(k, v))
-    if f.get("company"):
-        add(f"{alias}.company = %(company)s", "company", f["company"])
+    company = resolve_company(f)
+    if company:
+        add(f"{alias}.company = %(company)s", "company", company)
     if f.get("from_date"):
         add(f"{alias}.trip_date >= %(from_date)s", "from_date", f["from_date"])
     if f.get("to_date"):

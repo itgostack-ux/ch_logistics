@@ -3,7 +3,7 @@ in-trip exception, for logistics head / ops follow-up."""
 import frappe
 from frappe import _
 
-from ch_logistics.api.report_utils import col
+from ch_logistics.api.report_utils import col, resolve_company
 
 
 def _between(field, vals):
@@ -19,20 +19,27 @@ def execute(filters=None):
     filters = filters or {}
     want = filters.get("record_type")  # "", Rejection, Exception
     drv = filters.get("driver")
+    company = resolve_company(filters)
     p = {k: filters.get(k) for k in ("from_date", "to_date")}
     if drv:
         p["driver"] = drv
+    if company:
+        p["company"] = company
 
     data = []
+    co_clause = " AND {alias}.company = %(company)s" if company else ""
 
     if want in (None, "", "Rejection"):
+        # Rejection has no company column — scope through its manifest.
         rej = frappe.db.sql(f"""
             SELECT 'Rejection' AS record_type, r.rejected_on AS event_time,
                    r.driver, NULL AS severity, r.rejection_reason AS category,
                    r.manifest AS reference, r.status, r.remarks
             FROM `tabCH Manifest Rejection` r
+            JOIN `tabCH Transfer Manifest` m ON m.name = r.manifest
             WHERE 1=1 {_between('DATE(r.rejected_on)', p)}
                   {' AND r.driver = %(driver)s' if drv else ''}
+                  {co_clause.format(alias='m')}
             ORDER BY r.rejected_on DESC
         """, p, as_dict=True)
         data += rej
@@ -47,6 +54,7 @@ def execute(filters=None):
             JOIN `tabCH Logistics Trip` t ON t.name = e.parent
             WHERE 1=1 {_between('DATE(e.occurred_at)', p)}
                   {' AND t.driver = %(driver)s' if drv else ''}
+                  {co_clause.format(alias='t')}
             ORDER BY e.occurred_at DESC
         """, p, as_dict=True)
         data += exc

@@ -52,6 +52,11 @@ scheduler_events = {
 		"*/10 * * * *": [
 			"ch_logistics.api.optimizer.check_eta_sla_breaches",
 		],
+		# Daily logistics digest to managers (server-time hour; gated by
+		# CH Logistics Settings → Send Daily Logistics Digest).
+		"0 3 * * *": [
+			"ch_logistics.api.digest.send_logistics_daily_digest",
+		],
 	},
 }
 

@@ -7,5 +7,7 @@ frappe.query_reports["Driver Delivery Worksheet"] = {
 		{ fieldname: "status", label: __("Status"), fieldtype: "Select",
 		  options: ["", "Assigned", "Pickup Started", "In Transit", "Rejected",
 			"Delivered", "Received", "Closed"].join("\n") },
+		{ fieldname: "company", label: __("Company"), fieldtype: "Link", options: "Company",
+		  default: frappe.defaults.get_user_default("Company") },
 	],
 };

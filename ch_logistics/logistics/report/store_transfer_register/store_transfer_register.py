@@ -4,7 +4,7 @@ still to be received"."""
 import frappe
 from frappe import _
 
-from ch_logistics.api.report_utils import col
+from ch_logistics.api.report_utils import col, resolve_company
 
 
 def execute(filters=None):
@@ -13,8 +13,9 @@ def execute(filters=None):
     lens = filters.get("lens") or "Both"
 
     cond, vals = ["1=1"], {}
-    if filters.get("company"):
-        cond.append("m.company = %(company)s"); vals["company"] = filters["company"]
+    company = resolve_company(filters)
+    if company:
+        cond.append("m.company = %(company)s"); vals["company"] = company
     if filters.get("from_date"):
         cond.append("m.manifest_date >= %(from_date)s"); vals["from_date"] = filters["from_date"]
     if filters.get("to_date"):

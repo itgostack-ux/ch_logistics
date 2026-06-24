@@ -16,7 +16,11 @@
   "push_provider",
   "column_break_push",
   "fcm_project_id",
-  "fcm_server_key"
+  "fcm_server_key",
+  "digest_section",
+  "daily_digest_enabled",
+  "column_break_digest",
+  "digest_recipients"
  ],
  "fields": [
   {
@@ -94,6 +98,28 @@
    "fieldname": "fcm_server_key",
    "fieldtype": "Password",
    "label": "FCM Server Key"
+  },
+  {
+   "fieldname": "digest_section",
+   "fieldtype": "Section Break",
+   "label": "Reports & Email Digest"
+  },
+  {
+   "default": "1",
+   "description": "Email a daily logistics summary (deliveries, overdue, rejections, fleet status) to managers each morning.",
+   "fieldname": "daily_digest_enabled",
+   "fieldtype": "Check",
+   "label": "Send Daily Logistics Digest"
+  },
+  {
+   "fieldname": "column_break_digest",
+   "fieldtype": "Column Break"
+  },
+  {
+   "description": "Comma-separated emails, in addition to Delivery Manager / Stock Manager role holders.",
+   "fieldname": "digest_recipients",
+   "fieldtype": "Small Text",
+   "label": "Extra Digest Recipients"
   }
  ],
  "index_web_pages_for_search": 0,

@@ -8,15 +8,16 @@ import frappe
 from frappe import _
 from frappe.utils import flt
 
-from ch_logistics.api.report_utils import col
+from ch_logistics.api.report_utils import col, resolve_company
 
 
-def _dt(filters, field, alias=""):
+def _dt(filters, field, alias="", with_company=True):
     a = (alias + ".") if alias else ""
     cond, vals = [], {}
-    if filters.get("company"):
+    company = resolve_company(filters) if with_company else None
+    if company:
         cond.append(f"{a}company = %(company)s")
-        vals["company"] = filters["company"]
+        vals["company"] = company
     if filters.get("from_date"):
         cond.append(f"{a}{field} >= %(from_date)s")
         vals["from_date"] = filters["from_date"]
@@ -56,7 +57,7 @@ def execute(filters=None):
         GROUP BY m.driver
     """, mv, as_dict=True)
 
-    rw, rv = _dt(filters, "rejected_on", "r")
+    rw, rv = _dt(filters, "rejected_on", "r", with_company=False)  # rejection has no company
     rejs = frappe.db.sql(f"""
         SELECT r.driver, COUNT(*) rejections
         FROM `tabCH Manifest Rejection` r
