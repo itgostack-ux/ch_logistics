@@ -337,9 +337,10 @@ class DeliveryApp {
                 action_html = `<button id="da-arrived-btn" class="btn btn-primary btn-lg btn-block da-action-btn">
                     <i class="fa fa-map-marker"></i> ${__("Reached Location")}
                 </button>
-                <button id="da-deliver-btn" class="btn btn-success btn-lg btn-block da-action-btn" disabled
+                <button id="da-deliver-btn" class="btn btn-success btn-lg btn-block da-action-btn da-btn-disabled" disabled
+                        style="opacity:0.45;cursor:not-allowed;"
                         title="${__("Tap Reached Location first")}">
-                    <i class="fa fa-check-circle"></i> ${__("Complete Delivery")}
+                    <i class="fa fa-lock"></i> ${__("Complete Delivery")}
                 </button>
                 <button id="da-reject-btn" class="btn btn-danger btn-sm btn-block da-action-btn">
                     <i class="fa fa-exclamation-triangle"></i> ${__("Failed Delivery (mid-trip)")}
@@ -470,8 +471,10 @@ class DeliveryApp {
 
     do_mark_reached() {
         // "Reached Location" — two-stage POD's first phase at the receiver
-        // end. Captures GPS + timestamp, then refreshes the manifest detail
-        // so the Complete Delivery button unlocks.
+        // end. Captures device GPS, surfaces the readings to the driver for
+        // visual confirmation, then POSTs to ``mark_reached_destination``.
+        // We show the captured lat/lng (read-only) so the driver can verify
+        // they're at the right doorstep before committing the arrival ping.
         let manifest = (this.manifests || []).find(m => m.name === this.active_manifest) || {};
         if (manifest.status !== "In Transit") {
             frappe.show_alert({
@@ -480,22 +483,85 @@ class DeliveryApp {
             });
             return;
         }
-        frappe.dom.freeze(__("Capturing location…"));
+        frappe.dom.freeze(__("Capturing GPS…"));
         this._capture_gps((lat, lng) => {
-            frappe.call({
-                method: API + "mark_reached_destination",
-                args: { manifest: this.active_manifest, lat, lng },
-                callback: () => {
-                    frappe.dom.unfreeze();
-                    frappe.show_alert({
-                        message: __("Arrival recorded. You can now Complete Delivery."),
-                        indicator: "green",
-                    });
-                    this.load_data();
-                },
-                error: () => frappe.dom.unfreeze(),
-            });
+            frappe.dom.unfreeze();
+            this._show_arrival_dialog(lat, lng);
         });
+    }
+
+    _show_arrival_dialog(lat, lng) {
+        let destination = (this.manifests || []).find(
+            m => m.name === this.active_manifest) || {};
+        let dest_label = destination.destination_store
+            || destination.destination_warehouse || "—";
+        let lat_str = (typeof lat === "number") ? lat.toFixed(6) : String(lat);
+        let lng_str = (typeof lng === "number") ? lng.toFixed(6) : String(lng);
+        let maps_url = `https://maps.google.com/?q=${lat_str},${lng_str}`;
+        let d = new frappe.ui.Dialog({
+            title: __("Confirm Arrival at Destination"),
+            fields: [
+                {
+                    fieldname: "info", fieldtype: "HTML",
+                    options: `<div class="alert alert-success" style="padding:10px;border-radius:6px;margin-bottom:10px;">
+                        <strong><i class="fa fa-map-marker"></i> ${__("Destination")}:</strong>
+                        ${frappe.utils.escape_html(dest_label)}
+                    </div>`,
+                },
+                {
+                    fieldname: "arrival_lat", fieldtype: "Data",
+                    label: __("Latitude"), default: lat_str, read_only: 1,
+                },
+                {
+                    fieldname: "arrival_lng", fieldtype: "Data",
+                    label: __("Longitude"), default: lng_str, read_only: 1,
+                },
+                {
+                    fieldname: "preview", fieldtype: "HTML",
+                    options: `<div style="text-align:center;margin:8px 0 4px 0;">
+                        <a href="${maps_url}" target="_blank" rel="noopener"
+                           class="btn btn-default btn-xs">
+                           <i class="fa fa-external-link"></i> ${__("Open in Google Maps")}
+                        </a>
+                    </div>`,
+                },
+                {
+                    fieldname: "note", fieldtype: "HTML",
+                    options: `<small class="text-muted">${__(
+                        "Tap 'Confirm Arrival' to record this location on the manifest. " +
+                        "Complete Delivery will then unlock.")}</small>`,
+                },
+            ],
+            primary_action_label: __("Confirm Arrival"),
+            primary_action: () => {
+                d.hide();
+                frappe.dom.freeze(__("Recording arrival…"));
+                frappe.call({
+                    method: API + "mark_reached_destination",
+                    args: {
+                        manifest: this.active_manifest,
+                        lat: lat, lng: lng,
+                    },
+                    callback: () => {
+                        frappe.dom.unfreeze();
+                        frappe.show_alert({
+                            message: __("Arrival recorded. You can now Complete Delivery."),
+                            indicator: "green",
+                        });
+                        this.load_data();
+                    },
+                    error: () => frappe.dom.unfreeze(),
+                });
+            },
+            secondary_action_label: __("Re-capture GPS"),
+            secondary_action: () => {
+                d.hide();
+                // Re-open the GPS capture loop — useful when the driver moved
+                // a few steps and wants a fresher fix.
+                this.do_mark_reached();
+            },
+        });
+        d.show();
     }
 
     do_delivery() {
