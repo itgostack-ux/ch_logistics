@@ -476,20 +476,69 @@ def _collect_store_manager_contacts(destination_store: str | None) -> tuple[list
 def _collect_warehouse_contacts(warehouse: str | None) -> tuple[list[str], list[str]]:
     """Return (emails, mobiles) configured on the destination Warehouse.
 
-    ERPNext's Warehouse doctype carries ``email_id``, ``phone_no`` and
-    ``mobile_no`` for exactly this kind of operational handoff. We honour
-    all three so a warehouse can be notified independently of any POS
-    profile / store manager mapping.
+    Honours two ERPNext contact-binding patterns so a warehouse can be
+    notified independently of any POS profile / store manager mapping:
+
+      1. Direct Warehouse fields — ``email_id``, ``phone_no``, ``mobile_no``.
+      2. Linked Contact docs (the standard "Address and Contact" panel
+         on the Warehouse form). Contacts are bound to Warehouse via
+         Dynamic Link, exactly the same pattern ERPNext uses for
+         Customer / Supplier / Warehouse. Each Contact may carry
+         multiple Contact Email / Contact Phone rows — we honour every
+         entry and de-dupe at the end.
     """
     if not warehouse:
         return [], []
+
+    emails: list[str] = []
+    mobiles: list[str] = []
+
+    # 1) Direct Warehouse fields (legacy / single-recipient setups)
     row = frappe.db.get_value(
         "Warehouse", warehouse,
         ["email_id", "phone_no", "mobile_no"],
         as_dict=True,
     ) or {}
-    emails = [e for e in _split_contact_values(row.get("email_id")) if "@" in e]
-    mobiles = _split_contact_values(row.get("mobile_no")) + _split_contact_values(row.get("phone_no"))
+    emails.extend(e for e in _split_contact_values(row.get("email_id")) if "@" in e)
+    mobiles.extend(_split_contact_values(row.get("mobile_no")))
+    mobiles.extend(_split_contact_values(row.get("phone_no")))
+
+    # 2) Linked Contact docs (the "Address and Contact" panel pattern).
+    #    Standard ERPNext binding: Dynamic Link rows on Contact pointing
+    #    at link_doctype="Warehouse", link_name=<warehouse>.
+    try:
+        contact_names = frappe.get_all(
+            "Dynamic Link",
+            filters={
+                "link_doctype": "Warehouse",
+                "link_name": warehouse,
+                "parenttype": "Contact",
+            },
+            pluck="parent",
+        )
+        for cname in contact_names:
+            # Use cached doc — Contact is a small doctype and we want every
+            # email_ids / phone_nos row.
+            try:
+                contact = frappe.get_cached_doc("Contact", cname)
+            except Exception:
+                continue
+            for e in (contact.email_ids or []):
+                addr = (e.email_id or "").strip()
+                if addr and "@" in addr:
+                    emails.append(addr)
+            for p in (contact.phone_nos or []):
+                num = (p.phone or "").strip()
+                if num:
+                    mobiles.append(num)
+    except Exception:
+        # Never let a contact-lookup failure block the OTP path — direct
+        # warehouse fields above are still honoured.
+        frappe.log_error(
+            frappe.get_traceback(),
+            f"Manifest OTP — linked Contact lookup failed for warehouse {warehouse!r}",
+        )
+
     return _uniq_keep_order(emails), _uniq_keep_order(mobiles)
 
 
