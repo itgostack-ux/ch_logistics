@@ -452,12 +452,38 @@ def _collect_store_manager_contacts(destination_store: str | None) -> tuple[list
     return users, _uniq_keep_order(emails), _uniq_keep_order(mobiles)
 
 
-def _send_delivery_otp(doc) -> None:
-    """Send delivery OTP to destination store POS Profile + store manager contacts.
+def _collect_warehouse_contacts(warehouse: str | None) -> tuple[list[str], list[str]]:
+    """Return (emails, mobiles) configured on the destination Warehouse.
 
-    Preferred recipients are destination store POS Profile contact email/mobile
-    (including CUG fields where configured). Falls back to CH Store manager
-    users and CH Store.contact_phone.
+    ERPNext's Warehouse doctype carries ``email_id``, ``phone_no`` and
+    ``mobile_no`` for exactly this kind of operational handoff. We honour
+    all three so a warehouse can be notified independently of any POS
+    profile / store manager mapping.
+    """
+    if not warehouse:
+        return [], []
+    row = frappe.db.get_value(
+        "Warehouse", warehouse,
+        ["email_id", "phone_no", "mobile_no"],
+        as_dict=True,
+    ) or {}
+    emails = [e for e in _split_contact_values(row.get("email_id")) if "@" in e]
+    mobiles = _split_contact_values(row.get("mobile_no")) + _split_contact_values(row.get("phone_no"))
+    return _uniq_keep_order(emails), _uniq_keep_order(mobiles)
+
+
+def _send_delivery_otp(doc) -> dict:
+    """Send delivery OTP to the connected destination warehouse + store contacts.
+
+    Recipient order (highest priority first):
+      1. Destination Warehouse contacts (email_id / phone_no / mobile_no)
+         — the canonical \"connected warehouse\" address.
+      2. CH Store manager User mappings.
+      3. Destination POS Profile contacts (including site CUG fields).
+      4. CH Store.contact_phone (SMS fallback).
+
+    Returns the recipient summary so callers can echo it back to the
+    driver app (\"OTP sent to ops@warehouse.com\").
     """
     manager_users = []
     manager_emails = []
@@ -474,17 +500,23 @@ def _send_delivery_otp(doc) -> None:
     pos_profile = _resolve_destination_pos_profile(doc.destination_store)
     profile_emails, profile_mobiles = _collect_pos_profile_contacts(pos_profile)
 
+    warehouse_emails, warehouse_mobiles = _collect_warehouse_contacts(doc.destination_warehouse)
+
     store_phone = frappe.db.get_value("CH Store", doc.destination_store, "contact_phone") if doc.destination_store else None
 
-    email_recipients = _uniq_keep_order(manager_emails + profile_emails)
-    sms_recipients = _uniq_keep_order(manager_mobiles + profile_mobiles + ([store_phone] if store_phone else []))
+    # Warehouse contacts go first — they're the canonical \"connected warehouse\" address
+    # for this manifest and the user's explicit choice for delivery handoff.
+    email_recipients = _uniq_keep_order(warehouse_emails + manager_emails + profile_emails)
+    sms_recipients = _uniq_keep_order(
+        warehouse_mobiles + manager_mobiles + profile_mobiles + ([store_phone] if store_phone else [])
+    )
 
     if not manager_users and not email_recipients and not sms_recipients:
         frappe.log_error(
             f"OTP for manifest {doc.name} could not be sent — no destination store contact.",
             "Manifest OTP Delivery",
         )
-        return
+        return {"emails": [], "mobiles": [], "manager_users": []}
 
     subject = _("Delivery OTP for Manifest {0}").format(doc.name)
     manifest_url = frappe.utils.get_url_to_form("CH Transfer Manifest", doc.name)
@@ -558,6 +590,70 @@ def _send_delivery_otp(doc) -> None:
             )
     except Exception:
         frappe.log_error(frappe.get_traceback(), f"Manifest OTP email failed: {doc.name}")
+
+    return {
+        "emails": email_recipients,
+        "mobiles": sms_recipients,
+        "manager_users": manager_users,
+    }
+
+
+@frappe.whitelist()
+def request_delivery_otp(manifest) -> dict:
+    """Driver-side trigger: 'I'm at the destination, send me the OTP'.
+
+    Wired to the **Complete Delivery** button on the driver app: tapping it
+    regenerates a fresh OTP, emails / SMSes it to the connected destination
+    warehouse (plus store manager + POS profile contacts), then returns the
+    masked recipient list so the driver UI can confirm where the code went.
+
+    This is operationally critical: the OTP generated at assignment time can
+    be hours stale and the warehouse staff who actually open the door are
+    not always copied on the initial dispatch. Carrier apps (Delhivery,
+    BlueDart, Ekart, FedEx) all generate the receiver code on driver
+    arrival rather than dispatch.
+    """
+    _require_stage_role("complete_delivery")
+    doc = frappe.get_doc("CH Transfer Manifest", manifest)
+    doc.check_permission("write")
+    if doc.status != "In Transit":
+        frappe.throw(
+            _("OTP can only be requested while the manifest is In Transit (current: {0}).")
+            .format(doc.status),
+            title=_("API Error"),
+        )
+    doc._generate_delivery_otp()
+    doc.flags.ignore_validate_update_after_submit = True
+    doc.save()
+    frappe.db.commit()
+
+    recipients = _send_delivery_otp(doc) or {}
+
+    # Mask emails so the UI can show "o***@warehouse.com" without leaking
+    # full addresses to whoever happens to look over the driver's shoulder.
+    def _mask_email(addr):
+        if not addr or "@" not in addr:
+            return addr
+        local, _, domain = addr.partition("@")
+        if len(local) <= 1:
+            return f"{local[:1]}***@{domain}"
+        return f"{local[:1]}***{local[-1:]}@{domain}"
+
+    def _mask_mobile(num):
+        if not num:
+            return num
+        s = str(num)
+        if len(s) <= 4:
+            return s
+        return s[:2] + "*" * (len(s) - 4) + s[-2:]
+
+    return {
+        "message": _("OTP sent to the destination warehouse."),
+        "masked_emails": [_mask_email(e) for e in recipients.get("emails", [])],
+        "masked_mobiles": [_mask_mobile(m) for m in recipients.get("mobiles", [])],
+        "email_count": len(recipients.get("emails", [])),
+        "sms_count": len(recipients.get("mobiles", [])),
+    }
 
 
 def _extract_tracking_status(payload):

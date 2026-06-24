@@ -447,9 +447,58 @@ class DeliveryApp {
     }
 
     do_delivery() {
+        // Step 1: request a fresh OTP — server generates a new 6-digit code
+        // and emails / SMSes it to the connected destination warehouse plus
+        // the store manager contacts. Only after the OTP has been dispatched
+        // do we open the dialog that asks the driver to enter it. This
+        // mirrors how Delhivery / BlueDart / Ekart / FedEx driver apps
+        // handle the "I'm at the destination" handshake.
+        frappe.dom.freeze(__("Sending OTP to warehouse…"));
+        frappe.call({
+            method: API + "request_delivery_otp",
+            args: { manifest: this.active_manifest },
+            callback: (r) => {
+                frappe.dom.unfreeze();
+                let info = r.message || {};
+                let recipients_html = "";
+                if ((info.masked_emails || []).length || (info.masked_mobiles || []).length) {
+                    let parts = [];
+                    if ((info.masked_emails || []).length) {
+                        parts.push(__("Email: {0}",
+                            [info.masked_emails.map(frappe.utils.escape_html).join(", ")]));
+                    }
+                    if ((info.masked_mobiles || []).length) {
+                        parts.push(__("SMS: {0}",
+                            [info.masked_mobiles.map(frappe.utils.escape_html).join(", ")]));
+                    }
+                    recipients_html = `<div class="alert alert-success" style="padding:10px;border-radius:6px;margin-bottom:10px;">
+                        <strong>${__("OTP sent")}.</strong> ${parts.join(" • ")}
+                    </div>`;
+                } else {
+                    recipients_html = `<div class="alert alert-warning" style="padding:10px;border-radius:6px;margin-bottom:10px;">
+                        ${__("OTP regenerated, but no warehouse contact is configured. Ask the store directly.")}
+                    </div>`;
+                }
+                this._open_delivery_dialog(recipients_html);
+            },
+            error: () => {
+                frappe.dom.unfreeze();
+                // Even if OTP send failed (e.g. no SMTP), still let the driver
+                // try to complete — server will gate on enforce_delivery_otp.
+                this._open_delivery_dialog(
+                    `<div class="alert alert-danger" style="padding:10px;border-radius:6px;margin-bottom:10px;">
+                        ${__("OTP send failed. Ask the store for the OTP shown on their screen.")}
+                    </div>`
+                );
+            },
+        });
+    }
+
+    _open_delivery_dialog(recipients_html) {
         let d = new frappe.ui.Dialog({
             title: __("Complete Delivery"),
             fields: [
+                { fieldname: "recipients_info", fieldtype: "HTML", options: recipients_html || "" },
                 {
                     fieldname: "scanned_qr",
                     fieldtype: "Data",
@@ -474,7 +523,7 @@ class DeliveryApp {
                     fieldtype: "Data",
                     label: __("Delivery OTP (from store)"),
                     reqd: 1,
-                    description: __("Ask the store staff for the 6-digit OTP"),
+                    description: __("Ask the store staff for the 6-digit OTP just sent to their email."),
                 },
             ],
             primary_action_label: __("Confirm Delivery"),
@@ -500,6 +549,21 @@ class DeliveryApp {
                             this.load_data();
                         },
                     });
+                });
+            },
+            secondary_action_label: __("Resend OTP"),
+            secondary_action: () => {
+                frappe.call({
+                    method: API + "request_delivery_otp",
+                    args: { manifest: this.active_manifest },
+                    callback: (r) => {
+                        let info = r.message || {};
+                        frappe.show_alert({
+                            message: __("OTP resent. Emails: {0}, SMS: {1}.",
+                                [info.email_count || 0, info.sms_count || 0]),
+                            indicator: "blue",
+                        });
+                    },
                 });
             },
         });
