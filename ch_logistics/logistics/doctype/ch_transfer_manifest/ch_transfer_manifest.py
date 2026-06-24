@@ -9,7 +9,7 @@ import secrets
 import frappe
 from frappe import _
 from frappe.model.document import Document
-from frappe.utils import now_datetime, cint, flt
+from frappe.utils import now_datetime, cint, flt, getdate, nowdate
 
 
 class CHTransferManifest(Document):
@@ -138,6 +138,11 @@ class CHTransferManifest(Document):
     def assign_driver(self, driver, courier_partner=None, vehicle_number=None,
                       tracking_number=None, estimated_delivery_date=None,
                       vehicle=None, external_booking_id=None):
+        # Pre-lock input validation — fail fast before touching DB state.
+        if not driver:
+            frappe.throw(_("Driver is mandatory to assign a manifest."),
+                         title=_("Driver Required"))
+
         lock_key = f"manifest_status_{frappe.scrub(self.name)}"
         lock_result = frappe.db.sql("SELECT GET_LOCK(%s, 10)", (lock_key,))[0][0]
         if not lock_result:
@@ -152,6 +157,14 @@ class CHTransferManifest(Document):
             self.driver = driver
             self.driver_name = frappe.db.get_value("Driver", driver, "full_name")
             self.driver_phone = frappe.db.get_value("Driver", driver, "cell_number")
+
+            # GST Rule 138 + transporter SOP: driver phone is mandatory (transporter
+            # contact recorded against EWB Part-B and used by destination for ETA calls).
+            if not self.driver_phone:
+                frappe.throw(
+                    _("Driver {0} has no phone number on record. Update the Driver master before assignment.").format(driver),
+                    title=_("Driver Phone Required"),
+                )
 
             # Auto-pull partner type + courier_partner from driver profile if not supplied
             if not courier_partner:
@@ -168,7 +181,20 @@ class CHTransferManifest(Document):
                 # Capacity warning (non-blocking — Dunzo/3PL drivers may not register vehicles)
                 self._check_vehicle_capacity(vehicle)
 
-            self.vehicle_number = vehicle_number or self.vehicle_number
+            # Normalise: NIC e-Way Bill API rejects spaces and lowercase plates.
+            resolved_vehicle = (vehicle_number or self.vehicle_number or "").strip().upper().replace(" ", "")
+            self.vehicle_number = resolved_vehicle
+
+            # GST Rule 138, Part-B: vehicle number is mandatory before goods move.
+            # Without Part-B, the EWB is not valid for transit and goods are liable to
+            # detention / penalty. Block assignment outright.
+            if not self.vehicle_number:
+                frappe.throw(
+                    _("Vehicle Number is mandatory before assigning a driver. "
+                      "Required for Part-B of the e-Way Bill (GST Rule 138)."),
+                    title=_("Vehicle Number Required"),
+                )
+
             self.tracking_number = tracking_number or self.tracking_number
             self.estimated_delivery_date = estimated_delivery_date
             if external_booking_id:
@@ -194,6 +220,20 @@ class CHTransferManifest(Document):
             self.flags.ignore_validate_update_after_submit = True
             self.save()
 
+            # GST e-Way Bill: now that driver + vehicle are confirmed, generate
+            # (or Part-B-update) the EWB for every Stock Entry on this manifest
+            # so the driver leaves with a fully valid printout in hand.
+            # Wrapped so EWB API failures do NOT block the assignment itself
+            # — the manifest status_change must succeed; EWB issues are logged
+            # for HO Admin to retry via the "Refresh e-Way Bills" button.
+            try:
+                self._sync_ewaybills_for_transfers()
+            except Exception:
+                frappe.log_error(
+                    title=f"EWB sync failed on assign_driver {self.name}",
+                    message=frappe.get_traceback(),
+                )
+
             # Phase 5: stamp SLA target now that the clock is running
             try:
                 from ch_erp15.ch_erp15.sla_engine import set_manifest_sla
@@ -206,6 +246,227 @@ class CHTransferManifest(Document):
                 )
         finally:
             frappe.db.sql("SELECT RELEASE_LOCK(%s)", (lock_key,))
+
+    # ── e-Way Bill orchestration ───────────────────────────────────────
+
+    def _sync_ewaybills_for_transfers(self):
+        """Generate (or Part-B-update) GST e-Way Bills for every Stock Entry
+        on this manifest.
+
+        GST Rule 138 + India Compliance reality:
+          * One e-Way Bill per consignment (= per Stock Entry). India Compliance
+            does not expose the Consolidated EWB (CEWB) API, so the driver
+            carries one printout per Stock Entry — bundled into a single print
+            job by the "Print e-Way Bills" button on this manifest.
+          * Part-A (invoice + parties + items + value) and Part-B (vehicle +
+            transporter) are submitted in a single call here, because both are
+            known the moment the driver is assigned.
+          * If an EWB already exists (e.g. raised earlier as Part-A only),
+            we push the vehicle update instead of regenerating.
+
+        Side effects:
+          * Stamps ``vehicle_no``, ``lr_no``, ``lr_date``, ``mode_of_transport``,
+            ``gst_vehicle_type`` on each linked Stock Entry.
+          * Enqueues ``generate_e_waybill`` or ``update_vehicle_info`` jobs
+            (queue=short, after_commit=True) — failures are logged, not raised.
+          * Sets ``ewaybill_status`` on this manifest to one of
+            Not Required / Generating / Generated / Partial / Failed.
+
+        Safe to re-run (idempotent on Stock Entries that already have an EWB —
+        a Part-B update is the cheapest no-op-ish operation against NIC).
+        """
+        # India Compliance not installed → no EWB anywhere on this stack.
+        try:
+            from india_compliance.gst_india.utils.e_waybill import (  # noqa: F401
+                generate_e_waybill,
+                update_vehicle_info,
+            )
+        except ImportError:
+            self.db_set("ewaybill_status", "Not Required", update_modified=False)
+            return
+
+        settings = frappe.get_cached_doc("GST Settings")
+        if not (settings.enable_e_waybill and settings.enable_api):
+            self.db_set("ewaybill_status", "Not Required", update_modified=False)
+            return
+
+        rows = self.transfers or []
+        if not rows:
+            self.db_set("ewaybill_status", "Not Required", update_modified=False)
+            return
+
+        vehicle_no = (self.vehicle_number or "").strip().upper().replace(" ", "")
+        vehicle_values = {
+            "vehicle_no": vehicle_no,
+            # NIC limits LR no. to 15 chars on some shapes; manifest names fit.
+            "lr_no": self.name[:30],
+            "lr_date": str(getdate(nowdate())),
+            "mode_of_transport": "Road",
+            "gst_vehicle_type": "Regular",
+        }
+
+        enqueued_new = 0
+        enqueued_update = 0
+        skipped = 0
+        skipped_reasons = []
+
+        for row in rows:
+            se_name = getattr(row, "stock_entry", None)
+            if not se_name:
+                continue
+            se = frappe.db.get_value(
+                "Stock Entry",
+                se_name,
+                ["docstatus", "ewaybill", "bill_from_address", "bill_to_address"],
+                as_dict=True,
+            )
+            if not se:
+                skipped += 1
+                continue
+            if se.docstatus != 1:
+                skipped += 1
+                skipped_reasons.append(f"{se_name}: not submitted")
+                continue
+            if not (se.bill_from_address and se.bill_to_address):
+                skipped += 1
+                skipped_reasons.append(f"{se_name}: missing bill_from/bill_to address")
+                continue
+
+            # Stamp Part-B fields onto SE regardless of branch — both
+            # generate_e_waybill and update_vehicle_info read them.
+            frappe.db.set_value(
+                "Stock Entry",
+                se_name,
+                {
+                    "vehicle_no": vehicle_values["vehicle_no"],
+                    "lr_no": vehicle_values["lr_no"],
+                    "lr_date": vehicle_values["lr_date"],
+                    "mode_of_transport": vehicle_values["mode_of_transport"],
+                    "gst_vehicle_type": vehicle_values["gst_vehicle_type"],
+                },
+                update_modified=False,
+            )
+
+            if se.ewaybill:
+                # Existing EWB — push vehicle/driver as a Part-B update.
+                frappe.enqueue(
+                    "india_compliance.gst_india.utils.e_waybill.update_vehicle_info",
+                    enqueue_after_commit=True,
+                    queue="short",
+                    doctype="Stock Entry",
+                    docname=se_name,
+                    values=vehicle_values,
+                )
+                enqueued_update += 1
+            else:
+                # No EWB yet — generate fresh (Part-A + Part-B in one call).
+                frappe.enqueue(
+                    "india_compliance.gst_india.utils.e_waybill.generate_e_waybill",
+                    enqueue_after_commit=True,
+                    queue="short",
+                    doctype="Stock Entry",
+                    docname=se_name,
+                )
+                enqueued_new += 1
+
+        total_enqueued = enqueued_new + enqueued_update
+        if total_enqueued == 0 and skipped == len(rows):
+            status = "Failed"
+        elif total_enqueued and skipped:
+            status = "Generating"  # partial-set; flip to Partial/Generated on refresh
+        elif total_enqueued:
+            status = "Generating"
+        else:
+            status = "Not Generated"
+
+        self.db_set(
+            {
+                "ewaybill_status": status,
+                "ewaybill_count": total_enqueued,
+                "ewaybill_last_synced_at": now_datetime(),
+            },
+            update_modified=False,
+        )
+        if skipped_reasons:
+            frappe.log_error(
+                title=f"EWB sync — skipped Stock Entries on {self.name}",
+                message="\n".join(skipped_reasons),
+            )
+
+    def refresh_ewaybill_summary(self):
+        """Walk each linked Stock Entry, refresh the cached EWB summary +
+        status counter on this manifest, and return a structured list for
+        the client (print modal, dashboards, etc.).
+
+        Returns:
+            list[dict] with keys: stock_entry, ewaybill, ewaybill_validity, status
+        """
+        rows = self.transfers or []
+        if not rows:
+            return []
+
+        results = []
+        generated = 0
+        for row in rows:
+            se_name = getattr(row, "stock_entry", None)
+            if not se_name:
+                continue
+            data = frappe.db.get_value(
+                "Stock Entry",
+                se_name,
+                ["ewaybill", "vehicle_no"],
+                as_dict=True,
+            ) or {}
+            ewb_no = data.get("ewaybill")
+            validity = None
+            ewb_status = "Pending"
+            if ewb_no:
+                generated += 1
+                ewb_status = "Generated"
+                ewb_doc = frappe.db.get_value(
+                    "e-Waybill Log",
+                    {"name": ewb_no},
+                    ["valid_upto", "status"],
+                    as_dict=True,
+                ) or {}
+                validity = ewb_doc.get("valid_upto")
+                if ewb_doc.get("status"):
+                    ewb_status = ewb_doc["status"]
+            results.append({
+                "stock_entry": se_name,
+                "ewaybill": ewb_no,
+                "ewaybill_validity": validity,
+                "status": ewb_status,
+                "vehicle_no": data.get("vehicle_no"),
+            })
+
+        total = len(results)
+        if generated == 0:
+            status = "Not Generated"
+        elif generated == total:
+            status = "Generated"
+        else:
+            status = "Partial"
+
+        # Human-readable cached summary for the form field.
+        lines = []
+        for r in results:
+            if r["ewaybill"]:
+                v = f" (valid till {r['ewaybill_validity']})" if r["ewaybill_validity"] else ""
+                lines.append(f"{r['stock_entry']} → EWB {r['ewaybill']}{v}")
+            else:
+                lines.append(f"{r['stock_entry']} → (pending)")
+
+        self.db_set(
+            {
+                "ewaybill_status": status,
+                "ewaybill_count": generated,
+                "ewaybill_summary": "\n".join(lines),
+                "ewaybill_last_synced_at": now_datetime(),
+            },
+            update_modified=False,
+        )
+        return results
 
     def _check_vehicle_capacity(self, vehicle):
         """Emit non-blocking warning if planned package weight exceeds vehicle capacity."""
@@ -1037,3 +1298,39 @@ class CHTransferManifest(Document):
                     reference_name=self.name,
                     delayed=False,
                 )
+
+
+# ────────────────────────────────────────────────────────────────────────
+# Whitelisted helpers (e-Way Bill orchestration from the manifest form)
+# ────────────────────────────────────────────────────────────────────────
+
+@frappe.whitelist()
+def refresh_ewaybill_summary(manifest):
+    """Pull the latest EWB numbers / validity off each linked Stock Entry,
+    update the cached summary on the manifest, and return the structured list.
+
+    Called by the manifest form's "Refresh e-Way Bills" button and by the
+    background poller after enqueueing generations.
+    """
+    if not manifest:
+        frappe.throw(_("Manifest name is required."))
+    doc = frappe.get_doc("CH Transfer Manifest", manifest)
+    doc.check_permission("read")
+    return doc.refresh_ewaybill_summary()
+
+
+@frappe.whitelist()
+def resync_ewaybills(manifest):
+    """Manually re-run EWB sync for a manifest (e.g. after addresses are
+    corrected, or a failed job is retried). Restricted to users who can
+    write to the manifest."""
+    if not manifest:
+        frappe.throw(_("Manifest name is required."))
+    doc = frappe.get_doc("CH Transfer Manifest", manifest)
+    doc.check_permission("write")
+    if doc.status not in ("Assigned", "Pickup Started", "In Transit"):
+        frappe.throw(_("e-Way Bills can only be (re)synced once the driver is Assigned."))
+    if not doc.vehicle_number:
+        frappe.throw(_("Vehicle Number is missing — cannot sync e-Way Bills."))
+    doc._sync_ewaybills_for_transfers()
+    return doc.refresh_ewaybill_summary()

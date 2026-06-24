@@ -30,6 +30,12 @@
   "driver_name",
   "driver_phone",
   "estimated_delivery_date",
+  "sec_ewaybill",
+  "ewaybill_status",
+  "ewaybill_count",
+  "col_break_ewaybill",
+  "ewaybill_last_synced_at",
+  "ewaybill_summary",
   "sec_transfers",
   "transfers",
   "sec_packages",
@@ -227,6 +233,52 @@
    "fieldname": "estimated_delivery_date",
    "fieldtype": "Datetime",
    "label": "Estimated Delivery"
+  },
+  {
+   "fieldname": "sec_ewaybill",
+   "fieldtype": "Section Break",
+   "label": "e-Way Bills",
+   "collapsible": 1,
+   "description": "GST e-Way Bills auto-generated for each Stock Entry when this manifest is Assigned a driver + vehicle. One EWB per consignment per Rule 138 (Consolidated EWB not exposed by India Compliance — driver prints all via the 'Print e-Way Bills' button)."
+  },
+  {
+   "fieldname": "ewaybill_status",
+   "fieldtype": "Select",
+   "label": "e-Way Bill Status",
+   "options": "Not Required\nNot Generated\nGenerating\nPartial\nGenerated\nFailed",
+   "default": "Not Generated",
+   "read_only": 1,
+   "in_list_view": 0,
+   "in_standard_filter": 1,
+   "allow_on_submit": 1
+  },
+  {
+   "fieldname": "ewaybill_count",
+   "fieldtype": "Int",
+   "label": "e-Way Bills Issued",
+   "read_only": 1,
+   "default": "0",
+   "allow_on_submit": 1,
+   "description": "Number of Stock Entries on this manifest with an EWB number issued."
+  },
+  {
+   "fieldname": "col_break_ewaybill",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "ewaybill_last_synced_at",
+   "fieldtype": "Datetime",
+   "label": "Last Synced",
+   "read_only": 1,
+   "allow_on_submit": 1
+  },
+  {
+   "fieldname": "ewaybill_summary",
+   "fieldtype": "Long Text",
+   "label": "Summary",
+   "read_only": 1,
+   "allow_on_submit": 1,
+   "description": "Cached display: SE -> EWB number + validity. Refreshed by the Refresh button or by the daily scheduler."
   },
   {
    "fieldname": "sec_transfers",

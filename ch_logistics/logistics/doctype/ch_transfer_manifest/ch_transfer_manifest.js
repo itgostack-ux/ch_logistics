@@ -162,6 +162,122 @@ function add_action_buttons(frm) {
             });
         }, __("Actions"));
     }
+
+    // ── e-Way Bills ───────────────────────────────────────────────────
+    // GST Rule 138: one EWB per Stock Entry, generated atomically with the
+    // driver+vehicle assignment. The driver carries one printout per
+    // consignment — bundled into a single print job here.
+    const ewbStates = ["Assigned", "Pickup Started", "In Transit", "Delivered", "Received", "Closed"];
+    if (ewbStates.includes(frm.doc.status)) {
+        const ewb_api = "ch_logistics.ch_logistics.logistics.doctype.ch_transfer_manifest.ch_transfer_manifest.";
+
+        frm.add_custom_button(__("Print e-Way Bills"), () => {
+            show_ewaybill_print_dialog(frm, ewb_api);
+        }, __("e-Way Bill"));
+
+        frm.add_custom_button(__("Refresh Status"), () => {
+            frappe.call({
+                method: ewb_api + "refresh_ewaybill_summary",
+                args: { manifest: frm.doc.name },
+                freeze: true,
+                freeze_message: __("Refreshing e-Way Bill status..."),
+                callback: () => frm.reload_doc(),
+            });
+        }, __("e-Way Bill"));
+
+        // Resync (re-enqueue generation/Part-B update) — visible only when
+        // status is not yet Generated, so HO Admin can retry partial/failed.
+        if (frm.doc.ewaybill_status && frm.doc.ewaybill_status !== "Generated"
+            && frm.doc.ewaybill_status !== "Not Required") {
+            frm.add_custom_button(__("Re-sync e-Way Bills"), () => {
+                frappe.confirm(
+                    __("Re-enqueue e-Way Bill generation / Part-B update for every Stock Entry on this manifest?"),
+                    () => {
+                        frappe.call({
+                            method: ewb_api + "resync_ewaybills",
+                            args: { manifest: frm.doc.name },
+                            freeze: true,
+                            freeze_message: __("Submitting to NIC..."),
+                            callback: () => {
+                                frappe.show_alert({
+                                    message: __("e-Way Bill jobs queued. Check status in 30s."),
+                                    indicator: "blue",
+                                });
+                                frm.reload_doc();
+                            },
+                        });
+                    }
+                );
+            }, __("e-Way Bill"));
+        }
+    }
+}
+
+function show_ewaybill_print_dialog(frm, ewb_api) {
+    frappe.call({
+        method: ewb_api + "refresh_ewaybill_summary",
+        args: { manifest: frm.doc.name },
+        freeze: true,
+        freeze_message: __("Fetching e-Way Bills..."),
+        callback: (r) => {
+            const rows = r.message || [];
+            if (!rows.length) {
+                frappe.msgprint(__("No Stock Entries on this manifest."));
+                return;
+            }
+            const html = `
+                <table class="table table-bordered" style="margin-top:8px">
+                    <thead>
+                        <tr>
+                            <th>${__("Stock Entry")}</th>
+                            <th>${__("e-Way Bill")}</th>
+                            <th>${__("Status")}</th>
+                            <th>${__("Valid Till")}</th>
+                            <th>${__("Vehicle")}</th>
+                            <th>${__("Print")}</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        ${rows.map(r => `
+                            <tr>
+                                <td><a href="/app/stock-entry/${encodeURIComponent(r.stock_entry)}" target="_blank">${frappe.utils.escape_html(r.stock_entry)}</a></td>
+                                <td>${r.ewaybill ? `<code>${frappe.utils.escape_html(r.ewaybill)}</code>` : `<span class="text-muted">—</span>`}</td>
+                                <td>${r.status ? `<span class="indicator-pill ${r.ewaybill ? "green" : "orange"}">${frappe.utils.escape_html(r.status)}</span>` : ""}</td>
+                                <td>${r.ewaybill_validity || ""}</td>
+                                <td>${r.vehicle_no ? `<code>${frappe.utils.escape_html(r.vehicle_no)}</code>` : ""}</td>
+                                <td>
+                                    ${r.ewaybill
+                                        ? `<a class="btn btn-xs btn-default" href="/app/stock-entry/${encodeURIComponent(r.stock_entry)}?print=1" target="_blank">${__("Print")}</a>`
+                                        : ""}
+                                </td>
+                            </tr>
+                        `).join("")}
+                    </tbody>
+                </table>
+                <div class="text-muted" style="margin-top:8px">
+                    ${__("Driver must carry one printout per Stock Entry. Click 'Print All' to open all in new tabs (allow pop-ups).")}
+                </div>
+            `;
+            const d = new frappe.ui.Dialog({
+                title: __("e-Way Bills — {0}", [frm.doc.name]),
+                size: "large",
+                fields: [{ fieldtype: "HTML", fieldname: "ewb_table", options: html }],
+                primary_action_label: __("Print All"),
+                primary_action: () => {
+                    rows.forEach(r => {
+                        if (r.ewaybill) {
+                            window.open(
+                                `/app/stock-entry/${encodeURIComponent(r.stock_entry)}?print=1`,
+                                "_blank"
+                            );
+                        }
+                    });
+                    d.hide();
+                },
+            });
+            d.show();
+        },
+    });
 }
 
 function show_pickup_dialog(frm, api) {
