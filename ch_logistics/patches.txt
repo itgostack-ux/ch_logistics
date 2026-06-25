@@ -7,3 +7,4 @@ ch_logistics.patches.v0_0_5.install_tracking_token
 ch_logistics.patches.v0_0_5.extend_rejection_reasons
 ch_logistics.patches.v0_0_6.add_arrival_location_fields
 ch_logistics.patches.v0_0_7.install_store_geo_fields
+ch_logistics.patches.v0_0_8.seed_gogizmo_stores
