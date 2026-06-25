@@ -37,12 +37,20 @@ def _single_device_enforced() -> bool:
 
 
 def _profile(driver: str) -> dict:
-    d = frappe.db.get_value(
-        "Driver", driver,
-        ["name", "full_name", "cell_number", "availability_status",
-         "current_trip", "last_active"],
-        as_dict=True,
-    ) or {}
+    # Some environments may not have logistics custom fields yet; keep the
+    # profile API resilient and return sane defaults instead of SQL errors.
+    meta = frappe.get_meta("Driver")
+    fields = ["name", "full_name", "cell_number"]
+    optional = ["availability_status", "current_trip", "last_active"]
+    fields.extend([f for f in optional if meta.has_field(f)])
+
+    d = frappe.db.get_value("Driver", driver, fields, as_dict=True) or {}
+    if "availability_status" not in d:
+        d["availability_status"] = ds.get_status(driver) or ds.OFFLINE
+    if "current_trip" not in d:
+        d["current_trip"] = None
+    if "last_active" not in d:
+        d["last_active"] = None
     return d
 
 
