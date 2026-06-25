@@ -23,11 +23,36 @@ STATUS_REMAP = {
 
 CUSTOM_FIELDS = {
     "Driver": [
+        # ── Operational status + trip pointer ──────────────────────────
+        # These were historically expected to already exist (created via
+        # Customize Form on early benches). On a freshly installed bench
+        # they were never materialised, so the driver app crashed with
+        # `Unknown column 'availability_status' in SELECT`. Create them
+        # idempotently here so every install gets them on migrate.
+        {
+            "fieldname": "availability_status",
+            "fieldtype": "Select",
+            "label": "Availability Status",
+            "options": NEW_STATUS_OPTIONS,
+            "default": "Offline",
+            "insert_after": "transporter",
+            "in_list_view": 1,
+            "in_standard_filter": 1,
+            "read_only": 1,
+        },
+        {
+            "fieldname": "current_trip",
+            "fieldtype": "Link",
+            "label": "Current Trip",
+            "options": "CH Logistics Trip",
+            "insert_after": "availability_status",
+            "read_only": 1,
+        },
         {
             "fieldname": "last_active",
             "fieldtype": "Datetime",
             "label": "Last Active",
-            "insert_after": "availability_status",
+            "insert_after": "current_trip",
             "read_only": 1,
             "description": "Heartbeat timestamp driving idle auto-detection.",
         },
