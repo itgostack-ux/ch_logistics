@@ -188,10 +188,34 @@
     border-radius: 10px;
     background: #f8f9fc;
 }
+.da-trip-map-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 8px;
+    gap: 8px;
+}
 .da-trip-map-wrap h5 {
     font-size: 14px;
     font-weight: 600;
-    margin: 0 0 8px 0;
+    margin: 0;
+}
+.da-map-nav-btn {
+    font-size: 12px;
+    text-decoration: none;
+    background: #1e293b;
+    color: #fff !important;
+    border-radius: 999px;
+    padding: 4px 12px;
+    font-weight: 600;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    white-space: nowrap;
+}
+.da-map-nav-btn:hover {
+    background: #0f172a;
+    color: #fff;
 }
 .da-trip-map-frame {
     border-radius: 8px;
@@ -201,9 +225,45 @@
 }
 .da-trip-map-frame iframe {
     width: 100%;
-    height: 220px;
+    height: 240px;
     border: 0;
 }
+.da-trip-leaflet {
+    width: 100%;
+    height: 260px;
+    background: #e5e7eb;
+}
+/* Numbered Leaflet stop markers — green=Pickup, red=Drop, gray=other.
+   Style matches SAP TM Geo Map / Oracle OTM stop legend. */
+.da-stop-marker { background: transparent !important; border: 0 !important; }
+.da-stop-marker-pin {
+    position: relative;
+    width: 28px;
+    height: 36px;
+    color: #fff;
+    font-weight: 700;
+    font-size: 12px;
+    line-height: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--marker-color, #475569);
+    border: 2px solid #fff;
+    border-radius: 50% 50% 50% 0;
+    transform: rotate(-45deg);
+    box-shadow: 0 2px 6px rgba(0,0,0,.35);
+}
+.da-stop-marker-pin > span {
+    transform: rotate(45deg);
+    display: inline-block;
+}
+.da-stop-marker-status-completed,
+.da-stop-marker-status-skipped {
+    opacity: 0.55;
+}
+.da-stop-popup-title { font-weight: 700; font-size: 13px; margin-bottom: 2px; }
+.da-stop-popup-where { font-size: 12px; color: #334155; }
+.da-stop-popup-status { font-size: 11px; color: #64748b; margin-top: 2px; text-transform: uppercase; letter-spacing: .04em; }
 .da-map-links {
     display: flex;
     flex-wrap: wrap;
@@ -225,6 +285,27 @@
     border: 1px dashed var(--border-color);
     border-radius: 8px;
 }
+.da-trip-direction-row {
+    display: flex;
+    justify-content: flex-start;
+    margin: 0 0 10px 0;
+}
+.da-trip-direction-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: .06em;
+    text-transform: uppercase;
+    padding: 4px 10px;
+    border-radius: 999px;
+    background: #eef2ff;
+    color: #4338ca;
+    border: 1px solid #c7d2fe;
+}
+.da-dir-reverse { background: #fef3c7; color: #92400e; border-color: #fde68a; }
+.da-dir-inter-store, .da-dir-interstore { background: #ecfeff; color: #155e75; border-color: #a5f3fc; }
 .da-stat {
     flex: 1;
     text-align: center;

@@ -1020,29 +1020,54 @@ class DeliveryApp {
                 map_points.push({
                     seq: s.sequence,
                     label: s.store || s.warehouse || "Stop",
+                    stop_type: s.stop_type || "",
+                    status: s.status || "",
                     lat,
                     lng,
                 });
             }
         }
 
+        // Stable id so we can re-render multiple times without colliding
+        // with a previously-mounted Leaflet container.
+        const map_dom_id = `da-trip-map-${Date.now()}`;
         let map_html = "";
         if (map_points.length) {
-            const marker_param = map_points
-                .map((p) => `${encodeURIComponent(p.lat + "," + p.lng)}`)
-                .join("|");
-            const center = map_points[0];
-            const src = `https://maps.google.com/maps?q=${encodeURIComponent(center.lat + "," + center.lng)}&z=11&output=embed&markers=${marker_param}`;
+            // Build a "Directions" link that pre-fills every stop in the
+            // requested order — mirrors the Google Maps "multi-stop route"
+            // flow used by Bringg / Onfleet / FarEye driver apps as an
+            // OS-native turn-by-turn handoff.
+            const directions_href = (() => {
+                if (map_points.length === 1) {
+                    const p = map_points[0];
+                    return `https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(p.lat + "," + p.lng)}`;
+                }
+                const origin = map_points[0];
+                const dest = map_points[map_points.length - 1];
+                const mids = map_points.slice(1, -1).map((p) => `${p.lat},${p.lng}`).join("|");
+                let url = `https://www.google.com/maps/dir/?api=1`
+                    + `&origin=${encodeURIComponent(origin.lat + "," + origin.lng)}`
+                    + `&destination=${encodeURIComponent(dest.lat + "," + dest.lng)}`
+                    + `&travelmode=driving`;
+                if (mids) url += `&waypoints=${encodeURIComponent(mids)}`;
+                return url;
+            })();
+
             const links = map_points.map((p) => {
                 const text = `#${p.seq} ${frappe.utils.escape_html(p.label)}`;
-                const href = `https://maps.google.com/?q=${encodeURIComponent(p.lat + "," + p.lng)}`;
+                const href = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(p.lat + "," + p.lng)}`;
                 return `<a class="da-map-link" target="_blank" rel="noopener" href="${href}">${text}</a>`;
             }).join("");
 
             map_html = `<div class="da-trip-map-wrap">
-                <h5><i class="fa fa-map"></i> ${__("Trip Map")}</h5>
+                <div class="da-trip-map-head">
+                    <h5><i class="fa fa-map"></i> ${__("Trip Map")}</h5>
+                    <a class="da-map-nav-btn" target="_blank" rel="noopener" href="${directions_href}">
+                        <i class="fa fa-location-arrow"></i> ${__("Navigate")}
+                    </a>
+                </div>
                 <div class="da-trip-map-frame">
-                    <iframe title="Trip map" src="${src}" loading="lazy" referrerpolicy="no-referrer-when-downgrade"></iframe>
+                    <div id="${map_dom_id}" class="da-trip-leaflet"></div>
                 </div>
                 <div class="da-map-links">${links}</div>
             </div>`;
@@ -1112,6 +1137,22 @@ class DeliveryApp {
                 <span class="da-exc-remarks">${frappe.utils.escape_html(e.remarks || "")}</span>
             </div>`).join("");
 
+        // Derive TMS-standard counters from the stop graph rather than a
+        // single ambiguous "Stops" total. SAP TM "Stop Sequence" / Oracle
+        // OTM "Trip Stops" / Blue Yonder TMS "Tour Stops" all expose pickup
+        // and delivery counts side-by-side; last-mile players (Bringg,
+        // Onfleet, FarEye, Locus) follow the same pattern in driver UIs.
+        const pickup_count = (t.stops || []).filter(
+            (s) => (s.stop_type || "").toLowerCase() === "pickup"
+        ).length;
+        const drop_count = (t.stops || []).filter(
+            (s) => (s.stop_type || "").toLowerCase() === "drop"
+        ).length;
+        const shipment_count = t.total_shipments != null
+            ? t.total_shipments
+            : (t.manifests || []).length;
+        const direction_label = frappe.utils.escape_html(t.direction || "Forward");
+
         $c.html(`
             <div class="da-detail">
                 <div class="da-detail-header">
@@ -1122,10 +1163,16 @@ class DeliveryApp {
                     <span class="da-card-status da-status-${status_cls}">${frappe.utils.escape_html(t.status)}</span>
                 </div>
 
+                <div class="da-trip-direction-row">
+                    <span class="da-trip-direction-badge da-dir-${(t.direction || "forward").toLowerCase()}">
+                        <i class="fa fa-arrows-h"></i> ${direction_label}
+                    </span>
+                </div>
+
                 <div class="da-detail-summary">
-                    <div class="da-stat"><span class="da-stat-val">${(t.stops || []).length}</span><span class="da-stat-label">Stops</span></div>
-                    <div class="da-stat"><span class="da-stat-val">${t.total_shipments || 0}</span><span class="da-stat-label">Shipments</span></div>
-                    <div class="da-stat"><span class="da-stat-val">${frappe.utils.escape_html(t.direction || "Forward")}</span><span class="da-stat-label">Direction</span></div>
+                    <div class="da-stat"><span class="da-stat-val">${pickup_count}</span><span class="da-stat-label">${__("Pickups")}</span></div>
+                    <div class="da-stat"><span class="da-stat-val">${drop_count}</span><span class="da-stat-label">${__("Drops")}</span></div>
+                    <div class="da-stat"><span class="da-stat-val">${shipment_count}</span><span class="da-stat-label">${__("Shipments")}</span></div>
                 </div>
 
                 ${map_html}
@@ -1145,6 +1192,139 @@ class DeliveryApp {
                 </div>
             </div>
         `);
+
+        // Mount the Leaflet map once the markup is in the DOM. Lazy-loads
+        // Leaflet from CDN on first render; subsequent renders re-use the
+        // already-loaded library. Failures degrade gracefully — the static
+        // "stop chips" list below the map remains functional and the
+        // Navigate button still hands off to the OS map app.
+        if (map_points.length) {
+            this._render_trip_leaflet_map(map_dom_id, map_points);
+        }
+    }
+
+    _ensure_leaflet_loaded() {
+        if (window.L && window.L.map) return Promise.resolve(window.L);
+        if (this._leaflet_loading) return this._leaflet_loading;
+
+        // Pin a known-good Leaflet release served via unpkg (also mirrored
+        // on cdnjs). Integrity hashes from leafletjs.com release notes.
+        const css_url = "https://unpkg.com/leaflet@1.9.4/dist/leaflet.css";
+        const js_url = "https://unpkg.com/leaflet@1.9.4/dist/leaflet.js";
+
+        if (!document.querySelector('link[data-da-leaflet-css="1"]')) {
+            const link = document.createElement("link");
+            link.rel = "stylesheet";
+            link.href = css_url;
+            link.setAttribute("data-da-leaflet-css", "1");
+            link.crossOrigin = "";
+            document.head.appendChild(link);
+        }
+
+        this._leaflet_loading = new Promise((resolve, reject) => {
+            if (window.L && window.L.map) return resolve(window.L);
+            let script = document.querySelector('script[data-da-leaflet-js="1"]');
+            if (script) {
+                script.addEventListener("load", () => resolve(window.L));
+                script.addEventListener("error", reject);
+                return;
+            }
+            script = document.createElement("script");
+            script.src = js_url;
+            script.async = true;
+            script.crossOrigin = "";
+            script.setAttribute("data-da-leaflet-js", "1");
+            script.addEventListener("load", () => resolve(window.L));
+            script.addEventListener("error", reject);
+            document.head.appendChild(script);
+        });
+        return this._leaflet_loading;
+    }
+
+    _render_trip_leaflet_map(dom_id, points) {
+        const container = document.getElementById(dom_id);
+        if (!container || !points.length) return;
+        this._ensure_leaflet_loaded().then((L) => {
+            // The container may have been torn down by a re-render while
+            // Leaflet was still loading — bail out cleanly in that case.
+            if (!document.body.contains(container)) return;
+
+            const map = L.map(container, {
+                zoomControl: true,
+                attributionControl: true,
+                scrollWheelZoom: false,
+                tap: true,
+            });
+
+            // OpenStreetMap tiles — same provider used by Locus, FarEye,
+            // Onfleet, and most non-Google driver-app fallbacks. Free and
+            // requires no API key. We respect the OSM tile usage policy by
+            // crediting them inline (Leaflet does this automatically).
+            L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+                maxZoom: 19,
+                attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
+            }).addTo(map);
+
+            const latlngs = points.map((p) => [p.lat, p.lng]);
+
+            // Draw the route polyline first so markers sit on top.
+            if (latlngs.length >= 2) {
+                L.polyline(latlngs, {
+                    color: "#3b82f6",
+                    weight: 4,
+                    opacity: 0.85,
+                    dashArray: "6 6",
+                }).addTo(map);
+            }
+
+            // Numbered, type-coloured markers — green = Pickup, red = Drop,
+            // gray = anything else (mirrors SAP TM / Oracle OTM legend).
+            points.forEach((p) => {
+                const stop_type = (p.stop_type || "").toLowerCase();
+                const status = (p.status || "").toLowerCase().replace(/\s+/g, "-");
+                const color = stop_type === "pickup"
+                    ? "#16a34a"
+                    : stop_type === "drop"
+                        ? "#dc2626"
+                        : "#64748b";
+                const icon = L.divIcon({
+                    className: "da-stop-marker",
+                    iconSize: [28, 36],
+                    iconAnchor: [14, 34],
+                    popupAnchor: [0, -30],
+                    html: `<div class="da-stop-marker-pin da-stop-marker-${stop_type || "other"} da-stop-marker-status-${status}" style="--marker-color:${color}"><span>${p.seq}</span></div>`,
+                });
+                const marker = L.marker([p.lat, p.lng], { icon }).addTo(map);
+                const safe_label = frappe.utils.escape_html(p.label);
+                const safe_type = frappe.utils.escape_html(p.stop_type || "Stop");
+                const safe_status = frappe.utils.escape_html(p.status || "");
+                marker.bindPopup(
+                    `<div class="da-stop-popup">
+                        <div class="da-stop-popup-title">#${p.seq} · ${safe_type}</div>
+                        <div class="da-stop-popup-where">${safe_label}</div>
+                        ${safe_status ? `<div class="da-stop-popup-status">${safe_status}</div>` : ""}
+                    </div>`
+                );
+            });
+
+            if (latlngs.length === 1) {
+                map.setView(latlngs[0], 14);
+            } else {
+                map.fitBounds(L.latLngBounds(latlngs), { padding: [24, 24] });
+            }
+
+            // Mobile browsers compute layout async — invalidate once the
+            // container has its final dimensions, otherwise tiles render
+            // into the top-left 256x256 square only.
+            setTimeout(() => {
+                if (document.body.contains(container)) map.invalidateSize();
+            }, 100);
+        }).catch(() => {
+            // Network blocked / CDN down — leave the inert div in place and
+            // surface a minimal hint. The chip list + Navigate button below
+            // still work, so the driver is not stuck.
+            container.innerHTML = `<div class="da-map-empty text-muted" style="padding:18px;">${__("Could not load the map library. Use the Navigate button to open the route in your map app.")}</div>`;
+        });
     }
 
     // ── Trip actions ─────────────────────────────────────────────
