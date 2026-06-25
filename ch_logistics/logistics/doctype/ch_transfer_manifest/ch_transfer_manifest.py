@@ -1267,11 +1267,74 @@ class CHTransferManifest(Document):
         self.delivery_otp = str(secrets.randbelow(900000) + 100000)
 
     def _sync_logistics_status_to_entries(self, logistics_status):
-        """Push logistics status change to all child Stock Entries."""
+        """Push logistics status change to all child Stock Entries.
+
+        Two parallel fields on Stock Entry drive the receiving-side UX:
+
+        * ``custom_logistics_status``  — courier-leg state machine
+          (Pending Pickup / In Transit / Delivered / Revert Requested …).
+          Used by tracking widgets and the logistics badge in the POS
+          Stock Transfer workspace.
+        * ``custom_status``            — receiving-side workflow state
+          (Pending With Goods / Ready For Pickup / In Transit /
+           Ready For Receive / Receive At Transit / Transferred). The POS
+          Stock Transfer workspace gates its "Scan & Receive" CTA on
+          ``custom_status in ("Ready For Receive", "Receive At Transit")``,
+          so the receiving store cannot acknowledge goods until this
+          field advances.
+
+        The SE-level legacy APIs (``ch_erp15.custom.stock_entry.logistics_pickup``
+        and ``logistics_deliver``) used to be the only path that advanced
+        ``custom_status`` — but the driver app now runs the manifest's
+        ``start_pickup`` / ``complete_delivery`` instead, which left
+        ``custom_status`` stuck at the pre-pickup value (typically
+        "Ready For Pickup") even though the goods had already been
+        delivered. As a result the receiving store's "Scan & Receive"
+        button never appeared.
+
+        We now advance ``custom_status`` in lockstep with every
+        ``custom_logistics_status`` transition, and stamp
+        ``custom_pickup_datetime`` / ``custom_delivery_datetime`` so the
+        SE-level audit trail matches what the SE-level API would have
+        recorded.
+        """
+        # logistics_status → custom_status (receiving-side workflow)
+        custom_status_map = {
+            "In Transit":       "In Transit",
+            "Delivered":        "Ready For Receive",
+            "Return to Source": "Pending With Goods",
+            "Pending Pickup":   "Ready For Pickup",
+        }
+        target_custom_status = custom_status_map.get(logistics_status)
+
+        # Only set columns that actually exist on this tenant's Stock Entry
+        # meta — keeps the patch idempotent across upgrades.
+        meta = frappe.get_meta("Stock Entry")
+        now = now_datetime()
+
         for row in self.transfers:
+            update = {}
+            if meta.has_field("custom_logistics_status"):
+                update["custom_logistics_status"] = logistics_status
+            if target_custom_status and meta.has_field("custom_status"):
+                update["custom_status"] = target_custom_status
+            if logistics_status == "In Transit" and meta.has_field("custom_pickup_datetime"):
+                # Don't overwrite a previously-stamped pickup — only fill if blank.
+                existing = frappe.db.get_value(
+                    "Stock Entry", row.stock_entry, "custom_pickup_datetime"
+                )
+                if not existing:
+                    update["custom_pickup_datetime"] = now
+            if logistics_status == "Delivered" and meta.has_field("custom_delivery_datetime"):
+                existing = frappe.db.get_value(
+                    "Stock Entry", row.stock_entry, "custom_delivery_datetime"
+                )
+                if not existing:
+                    update["custom_delivery_datetime"] = now
+            if not update:
+                continue
             frappe.db.set_value(
-                "Stock Entry", row.stock_entry,
-                "custom_logistics_status", logistics_status,
+                "Stock Entry", row.stock_entry, update,
                 update_modified=False,
             )
 
