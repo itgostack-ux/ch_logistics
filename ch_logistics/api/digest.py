@@ -38,38 +38,51 @@ def _recipients():
     return sorted(valid)
 
 
-def _metrics():
+def _metrics(company=None):
+    """Logistics metrics, scoped to ``company`` when given. Manifests & trips
+    carry company directly; rejections/exceptions are scoped through their
+    parent manifest/trip."""
     today = nowdate()
     now = now_datetime()
-    M = "`tabCH Transfer Manifest`"
+    base = {"d": today, "n": now}
+    co = ""
+    if company:
+        co = " AND m.company = %(co)s"
+        base["co"] = company
+    M = "`tabCH Transfer Manifest` m"
 
-    def c(where, vals=None):
-        return frappe.db.sql(f"SELECT COUNT(*) FROM {M} WHERE {where}", vals or {})[0][0]
+    def c(where, extra=None):
+        v = dict(base, **(extra or {}))
+        return frappe.db.sql(f"SELECT COUNT(*) FROM {M} WHERE {where}{co}", v)[0][0]
 
     settled = "('Delivered','Partially Received','Received','Closed')"
     dead = "('Cancelled','Rejected','Returned')"
+    rej_co = (" JOIN `tabCH Transfer Manifest` m ON m.name = r.manifest" + co) if company else ""
+    exc_co = (" JOIN `tabCH Logistics Trip` m ON m.name = e.parent" + co) if company else ""
+    trip_co = {"status": ["in", ["Assigned", "Started"]]}
+    if company:
+        trip_co["company"] = company
     m = {
-        "created_today": c("manifest_date = %(d)s", {"d": today}),
-        "delivered_today": c("DATE(delivery_datetime) = %(d)s", {"d": today}),
-        "in_transit": c("status = 'In Transit'"),
-        "pending_pickup": c("status IN ('Packed','Assigned')"),
-        "awaiting_receipt": c("status = 'Delivered'"),
-        "overdue": c(f"status NOT IN {settled} AND status NOT IN {dead} "
-                     "AND estimated_delivery_date IS NOT NULL AND estimated_delivery_date < %(n)s",
-                     {"n": now}),
+        "created_today": c("m.manifest_date = %(d)s"),
+        "delivered_today": c("DATE(m.delivery_datetime) = %(d)s"),
+        "in_transit": c("m.status = 'In Transit'"),
+        "pending_pickup": c("m.status IN ('Packed','Assigned')"),
+        "awaiting_receipt": c("m.status = 'Delivered'"),
+        "overdue": c(f"m.status NOT IN {settled} AND m.status NOT IN {dead} "
+                     "AND m.estimated_delivery_date IS NOT NULL AND m.estimated_delivery_date < %(n)s"),
         "rejected_today": frappe.db.sql(
-            "SELECT COUNT(*) FROM `tabCH Manifest Rejection` WHERE DATE(rejected_on) = %(d)s",
-            {"d": today})[0][0],
+            f"SELECT COUNT(*) FROM `tabCH Manifest Rejection` r{rej_co} "
+            "WHERE DATE(r.rejected_on) = %(d)s", base)[0][0],
         "open_exceptions": frappe.db.sql(
-            "SELECT COUNT(*) FROM `tabCH Logistics Exception` "
-            "WHERE IFNULL(resolution_status,'Open') NOT IN ('Resolved','Closed')")[0][0],
-        "trips_active": frappe.db.count("CH Logistics Trip", {"status": ["in", ["Assigned", "Started"]]}),
+            f"SELECT COUNT(*) FROM `tabCH Logistics Exception` e{exc_co} "
+            "WHERE IFNULL(e.resolution_status,'Open') NOT IN ('Resolved','Closed')", base)[0][0],
+        "trips_active": frappe.db.count("CH Logistics Trip", trip_co),
     }
-    m["fleet"] = ds.status_counts()
+    m["fleet"] = ds.status_counts()  # drivers are a shared fleet resource
     return m
 
 
-def _html(m):
+def _html(m, company=None):
     f = m["fleet"]
 
     def tile(label, value, warn=False):
@@ -100,34 +113,52 @@ def _html(m):
                f'text-decoration:none">{_("Open Delivery & SLA Report")}</a></p>')
     except Exception:
         cta = ""
+    subtitle = (company or _("All Companies")) + " · " + nowdate()
     return (f'<div style="font-family:Arial,sans-serif;color:#111827">'
             f'<h2 style="margin-bottom:2px">{_("Daily Logistics Digest")}</h2>'
-            f'<div style="color:#6b7280;font-size:13px;margin-bottom:12px">{nowdate()}</div>'
+            f'<div style="color:#6b7280;font-size:13px;margin-bottom:12px">{subtitle}</div>'
             f'<table style="border-collapse:collapse;width:100%">{grid}</table>'
             f'{cta}'
             f'<p style="color:#9ca3af;font-size:11px;margin-top:18px">'
             f'{_("Automated by CH Logistics. Manage in CH Logistics Settings.")}</p></div>')
 
 
+def _active_companies():
+    """Companies that actually have logistics activity (manifests)."""
+    rows = frappe.db.sql(
+        "SELECT DISTINCT company FROM `tabCH Transfer Manifest` WHERE IFNULL(company,'') != ''",
+        as_dict=True)
+    return [r.company for r in rows] or [c.name for c in frappe.get_all("Company", fields=["name"])]
+
+
 def send_logistics_daily_digest():
-    """Scheduled entry point — compose and email the digest to managers."""
+    """Scheduled entry point — one company-scoped digest per company.
+
+    Each company's managers get a digest covering only that company's logistics,
+    honouring the single active-company model end-to-end."""
     if not _enabled():
         return {"sent": False, "reason": "disabled"}
     recipients = _recipients()
     if not recipients:
         return {"sent": False, "reason": "no-recipients"}
-    m = _metrics()
-    frappe.sendmail(
-        recipients=recipients,
-        subject=_("Daily Logistics Digest — {0}").format(nowdate()),
-        message=_html(m),
-        now=False,
-    )
-    return {"sent": True, "recipients": recipients, "metrics": {k: v for k, v in m.items() if k != "fleet"}}
+
+    sent = []
+    for company in _active_companies():
+        m = _metrics(company)
+        frappe.sendmail(
+            recipients=recipients,
+            subject=_("Daily Logistics Digest — {0} — {1}").format(company, nowdate()),
+            message=_html(m, company=company),
+            now=False,
+        )
+        sent.append(company)
+    return {"sent": bool(sent), "companies": sent, "recipients": recipients}
 
 
 @frappe.whitelist()
-def preview_digest():
+def preview_digest(company=None):
     """Render the digest HTML without sending — for a quick admin preview."""
     frappe.only_for(["System Manager", "Delivery Manager"])
-    return {"recipients": _recipients(), "enabled": _enabled(), "html": _html(_metrics())}
+    company = company or frappe.defaults.get_user_default("Company")
+    return {"recipients": _recipients(), "enabled": _enabled(),
+            "company": company, "html": _html(_metrics(company), company=company)}
