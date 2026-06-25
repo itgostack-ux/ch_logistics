@@ -35,6 +35,15 @@ after_install = "ch_logistics.setup.after_install"
 after_migrate = "ch_logistics.setup.after_migrate"
 
 # --------------------------------------------------------------------------
+# Session hooks — keep the operational driver-status machine
+# (ch_logistics.api.driver_status) aligned with Frappe's own session
+# lifecycle. on_login Offline → Available, on_logout → Offline (force).
+# Both are no-ops for users with no linked Driver record.
+# --------------------------------------------------------------------------
+on_login = "ch_logistics.api.driver_status.handle_user_login"
+on_logout = "ch_logistics.api.driver_status.handle_user_logout"
+
+# --------------------------------------------------------------------------
 # Scheduler
 # --------------------------------------------------------------------------
 scheduler_events = {

@@ -170,3 +170,60 @@ def status_counts() -> dict:
             counts[r.state] = cint(r.n)
     counts["total"] = sum(counts[s] for s in ALL_STATES)
     return counts
+
+
+# --------------------------------------------------------------------------
+# Frappe session hooks (hooks.py: on_login / on_logout)
+# --------------------------------------------------------------------------
+def _driver_for_user(user: str | None) -> str | None:
+    """Resolve the Driver doc whose ``user`` link matches the given User name."""
+    if not user or user in ("Administrator", "Guest"):
+        return None
+    try:
+        return frappe.db.get_value("Driver", {"user": user}, "name")
+    except Exception:
+        return None
+
+
+def handle_user_login(login_manager=None):
+    """Hooked on Frappe's ``on_login`` event.
+
+    Brings any Driver linked to the logged-in User out of Offline. We only
+    promote Offline → Available; any other state (e.g. a driver who
+    refreshed their session mid-trip and is still IN_TRANSIT) is left
+    untouched so an active duty status is never accidentally reset by a
+    plain web login.
+    """
+    user = getattr(login_manager, "user", None) or frappe.session.user
+    driver = _driver_for_user(user)
+    if not driver:
+        return
+    try:
+        current = get_status(driver)
+        if current in (None, OFFLINE):
+            set_status(driver, AVAILABLE, force=True)
+            frappe.db.commit()
+    except Exception:
+        frappe.log_error(frappe.get_traceback(),
+                         f"on_login driver-status sync failed for {user}")
+
+
+def handle_user_logout(login_manager=None):
+    """Hooked on Frappe's ``on_logout`` event.
+
+    Forces the Driver linked to the logging-out User to Offline regardless
+    of current state — mid-trip logouts happen and the duty machine has to
+    reflect that the driver is no longer reachable on the app. Heartbeat is
+    intentionally NOT refreshed so the idle sweeper doesn't see this driver
+    as recently active.
+    """
+    user = getattr(login_manager, "user", None) or frappe.session.user
+    driver = _driver_for_user(user)
+    if not driver:
+        return
+    try:
+        set_status(driver, OFFLINE, force=True, touch_activity=False)
+        frappe.db.commit()
+    except Exception:
+        frappe.log_error(frappe.get_traceback(),
+                         f"on_logout driver-status sync failed for {user}")

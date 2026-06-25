@@ -519,6 +519,12 @@ class CHTransferManifest(Document):
             self.flags.ignore_validate_update_after_submit = True
             self.save()
             self._sync_logistics_status_to_entries("In Transit")
+            # Lifecycle: this manifest is now physically being moved, so the
+            # driver must show as IN_TRANSIT regardless of whether the parent
+            # trip's trip_start API was called explicitly. Carrier driver apps
+            # (Delhivery / BlueDart / Ekart) all drive duty status from the
+            # first manifest pickup, not from a separate "trip start" button.
+            self._sync_driver_state_after_action(target_hint="In Transit")
             # Proactive "out for delivery" to the destination store + track link.
             from ch_logistics.api.customer_tracking import notify_destination
             notify_destination(self.name, "out_for_delivery")
@@ -589,6 +595,73 @@ class CHTransferManifest(Document):
                          title=_("Location Required"))
         return lat_f, lng_f
 
+    def _sync_driver_state_after_action(self, target_hint: str | None = None):
+        """Reconcile the driver's operational status after a manifest action.
+
+        Called from ``start_pickup`` (target_hint='In Transit'),
+        ``complete_delivery`` and ``reject_manifest`` so the duty-status
+        machine in ``ch_logistics.api.driver_status`` always reflects what
+        the driver is actually doing right now, even when the trip-level
+        ``trip_start`` / ``trip_complete`` APIs are bypassed.
+
+        Logic mirrors the dispatch model used by Delhivery / BlueDart /
+        Ekart driver apps:
+
+        * Pickup-start  → drop the driver to IN_TRANSIT immediately.
+        * Delivered / Rejected → if any other manifest is still Assigned /
+          Pickup Started / In Transit on this driver, stay IN_TRANSIT;
+          otherwise reset to AVAILABLE so dispatch can pick them up for
+          the next trip. The trip-level ``current_trip`` link is cleared
+          only when the driver fully unloads.
+
+        Best-effort and silent if the driver-status fields aren't installed
+        or the manifest carries no driver — the delivery flow must never
+        break because the duty machine has a problem.
+        """
+        driver = self.get("driver")
+        if not driver:
+            return
+        try:
+            from ch_logistics.api import driver_status as ds
+        except Exception:
+            return
+        try:
+            if target_hint == "In Transit":
+                ds.set_status(driver, ds.IN_TRANSIT,
+                              current_trip=self.get("trip") or None,
+                              force=True)
+                return
+
+            # Delivered / Rejected: look at every other manifest this driver
+            # is still carrying. A driver who still has Assigned / Pickup
+            # Started / In Transit work stays busy; a driver with no
+            # outstanding work drops to AVAILABLE.
+            still_busy = frappe.db.count(
+                "CH Transfer Manifest",
+                filters={
+                    "driver": driver,
+                    "status": ["in", ["Assigned", "Pickup Started", "In Transit"]],
+                    "docstatus": ["<", 2],
+                    "name": ["!=", self.name],
+                },
+            )
+            if still_busy:
+                # Don't downgrade an already-IN_TRANSIT driver to ASSIGNED.
+                current = ds.get_status(driver)
+                if current != ds.IN_TRANSIT:
+                    ds.set_status(driver, ds.ASSIGNED,
+                                  current_trip=self.get("trip") or None,
+                                  force=True)
+            else:
+                # Clear current_trip too — driver is fully unloaded.
+                ds.set_status(driver, ds.AVAILABLE,
+                              current_trip=None, force=True)
+        except Exception:
+            frappe.log_error(
+                frappe.get_traceback(),
+                f"driver-state sync failed after action on {self.name}",
+            )
+
     def reject_manifest(self, rejection_reason, rejection_photo, rejection_notes=None):
         """Driver rejects a manifest that cannot be completed.
 
@@ -652,6 +725,11 @@ class CHTransferManifest(Document):
             else:
                 # Nothing was picked up — child entries go back to the queue.
                 self._sync_logistics_status_to_entries("Pending Pickup")
+            # Lifecycle: a rejection releases this manifest from the driver's
+            # workload exactly like a Delivered does. Recompute residual state
+            # so a driver who rejected their last Assigned manifest goes back
+            # to AVAILABLE and is eligible for the next dispatch.
+            self._sync_driver_state_after_action()
             self._notify_dispatcher_rejection()
         finally:
             frappe.db.sql("SELECT RELEASE_LOCK(%s)", (lock_key,))
@@ -823,6 +901,11 @@ class CHTransferManifest(Document):
             self.flags.ignore_validate_update_after_submit = True
             self.save()
             self._sync_logistics_status_to_entries("Delivered")
+            # Lifecycle: this manifest is done. If the driver has no other
+            # Assigned / Pickup Started / In Transit manifests, recomputer
+            # drops them back to AVAILABLE so dispatch can re-assign them.
+            # If they're still carrying other loads, IN_TRANSIT is preserved.
+            self._sync_driver_state_after_action()
             from ch_logistics.api.customer_tracking import notify_destination
             notify_destination(self.name, "delivered")
         finally:

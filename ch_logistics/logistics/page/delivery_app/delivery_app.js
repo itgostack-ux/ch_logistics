@@ -81,9 +81,23 @@ class DeliveryApp {
         let toggle = on_break
             ? `<button id="da-resume-btn" class="btn btn-success btn-xs"><i class="fa fa-play"></i> ${__("Resume")}</button>`
             : `<button id="da-break-btn" class="btn btn-default btn-xs"><i class="fa fa-coffee"></i> ${__("Break")}</button>`;
+        // Sign-out button drops the driver to Offline (mirrors carrier driver
+        // apps: an explicit end-of-shift action that releases their slot from
+        // dispatch). Available while NOT actively in transit so a driver
+        // doesn't accidentally sign out mid-delivery.
+        let signout = (status === "In Transit" || status === "Assigned")
+            ? `<button id="da-signout-btn" class="btn btn-default btn-xs" disabled
+                       style="opacity:0.45;cursor:not-allowed;"
+                       title="${__("Finish or reject your current manifests before signing out")}">
+                  <i class="fa fa-sign-out"></i> ${__("Sign Out")}
+               </button>`
+            : `<button id="da-signout-btn" class="btn btn-danger btn-xs">
+                  <i class="fa fa-sign-out"></i> ${__("Sign Out")}
+               </button>`;
         this.$body.find("#da-statusbar").html(`
             <span class="da-status-pill ${cls}">${__(status)}</span>
             ${toggle}
+            ${signout}
         `);
     }
 
@@ -122,6 +136,7 @@ class DeliveryApp {
 
         this.$body.on("click", "#da-break-btn", () => this.do_break("set_break"));
         this.$body.on("click", "#da-resume-btn", () => this.do_break("end_break"));
+        this.$body.on("click", "#da-signout-btn", () => this.do_signout());
 
         this.$body.on("click", "#da-trip-start-btn", () => this.do_trip_start());
         this.$body.on("click", "#da-trip-complete-btn", () => this.do_trip_complete());
@@ -868,6 +883,26 @@ class DeliveryApp {
                 this.load_status();
             },
         });
+    }
+
+    do_signout() {
+        // End-of-shift hand-off. Driver explicitly takes themselves out of
+        // dispatch rotation — mirrors Delhivery / BlueDart / Uber Freight
+        // 'End Shift' actions. The on_logout hook in ch_logistics.hooks
+        // flips the duty machine to OFFLINE automatically when the Frappe
+        // session ends, so we just need to drop the browser session.
+        frappe.confirm(
+            __("Sign out for the day? You will be marked Offline and need to log back in to receive new manifests."),
+            () => {
+                frappe.show_alert({
+                    message: __("Signing out…"),
+                    indicator: "blue",
+                });
+                // Frappe's standard web logout — fires on_logout hook which
+                // drops Driver.availability_status to Offline server-side.
+                window.location.href = "/?cmd=web_logout";
+            },
+        );
     }
 
     _capture_gps(callback) {
