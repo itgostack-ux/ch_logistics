@@ -7,14 +7,12 @@ from frappe.utils import flt, now_datetime
 
 
 def _current_driver() -> str:
-	user = frappe.session.user
-	driver = (
-		frappe.db.get_value("Driver", {"user": user}, "name")
-		or frappe.db.get_value("Driver", {"employee": user}, "name")
-	)
-	if not driver:
-		frappe.throw(_("Your user is not linked to any Driver record."))
-	return driver
+	"""Resolve the logged-in user's Driver — throws "Not a Driver" if absent.
+
+	Thin shim over :func:`ch_logistics.api.driver_resolver.resolve_current_driver`.
+	"""
+	from ch_logistics.api.driver_resolver import resolve_current_driver
+	return resolve_current_driver(throw=True)
 
 
 @frappe.whitelist(methods=["POST"])

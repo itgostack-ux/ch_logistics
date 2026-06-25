@@ -71,10 +71,13 @@ def trip_conditions(filters, alias="t"):
 
 
 def current_driver():
-    """Driver linked to the logged-in user, or None for ops/admin."""
-    user = frappe.session.user
-    return (frappe.db.get_value("Driver", {"user": user}, "name")
-            or frappe.db.get_value("Driver", {"employee": user}, "name"))
+    """Driver linked to the logged-in user, or None for ops/admin.
+
+    Read-only callers (reports) skip the Administrator auto-provision
+    side-effect so opening a report never silently mints a Driver record.
+    """
+    from ch_logistics.api.driver_resolver import resolve_current_driver
+    return resolve_current_driver(throw=False, auto_provision_admin=False)
 
 
 def is_ops_user():

@@ -1110,10 +1110,34 @@ class DeliveryApp {
 
             let can_arrive = (t.status === "Started" && s.status === "Pending");
             let can_complete = (t.status === "Started" && s.status === "Arrived");
+            // Per-stop CTA label reflects what the combined flow actually
+            // does: pickup stops capture goods + per-manifest QR; drop stops
+            // capture delivery photo + receiver + per-manifest OTP/QR. We
+            // still call it "Arrive ..." so the action remains discoverable.
+            const st_type = (s.stop_type || "").toLowerCase();
+            let arrive_label = __("Arrive");
+            let arrive_icon = "fa-location-arrow";
+            if (st_type === "pickup" && active_manifest_rows.length) {
+                arrive_label = __("Arrive & Pick Up");
+                arrive_icon = "fa-camera";
+            } else if (st_type === "drop" && active_manifest_rows.length) {
+                arrive_label = __("Arrive & Deliver");
+                arrive_icon = "fa-check-circle";
+            }
             let completion_hint = "";
-            if (can_complete && active_manifest_rows.length) {
+            if (can_arrive && active_manifest_rows.length) {
+                const verb = st_type === "pickup"
+                    ? __("photo + QR scan for each manifest")
+                    : __("delivery photo, receiver name + per-manifest OTP/QR");
                 completion_hint = `<div class="text-muted" style="font-size:11px;margin-bottom:6px;">
-                    ${__("To finish delivery, tap manifest and complete OTP/photo flow.")}
+                    ${__("One tap arrives, captures {0}, and closes the stop.", [verb])}
+                </div>`;
+            } else if (can_complete && active_manifest_rows.length) {
+                // Stop is already Arrived but manifests are still open — that
+                // means the driver finished pickup/delivery on individual
+                // manifest cards. Direct them to the manifest to wrap up.
+                completion_hint = `<div class="text-muted" style="font-size:11px;margin-bottom:6px;">
+                    ${__("Open the manifest below to finish OTP/photo, then tap Complete.")}
                 </div>`;
             }
 
@@ -1131,7 +1155,7 @@ class DeliveryApp {
                     ${completion_hint}
                     ${manifests_html ? `<div class="da-stop-manifests">${manifests_html}</div>` : ""}
                     <div class="da-stop-actions">
-                        ${can_arrive ? `<button class="btn btn-primary btn-sm da-stop-arrive-btn" data-seq="${s.sequence}"><i class="fa fa-location-arrow"></i> ${__("Arrive")}</button>` : ""}
+                        ${can_arrive ? `<button class="btn btn-primary btn-sm da-stop-arrive-btn" data-seq="${s.sequence}"><i class="fa ${arrive_icon}"></i> ${arrive_label}</button>` : ""}
                         ${can_complete ? `<button class="btn btn-success btn-sm da-stop-complete-btn" data-seq="${s.sequence}"><i class="fa fa-check"></i> ${__("Complete")}</button>` : ""}
                     </div>
                 </div>`;
@@ -1140,7 +1164,7 @@ class DeliveryApp {
         // Trip-level action buttons
         let action_html = "";
         if (t.status === "Assigned") {
-            action_html += `<button id="da-trip-accept-btn" class="btn btn-primary btn-lg btn-block da-action-btn"><i class="fa fa-check-circle"></i> ${__("Accept Trip")}</button>`;
+            action_html += `<button id="da-trip-accept-btn" class="btn btn-primary btn-lg btn-block da-action-btn"><i class="fa fa-check-circle"></i> ${__("Accept &amp; Start Trip")}</button>`;
             action_html += `<button id="da-trip-reject-btn" class="btn btn-danger btn-sm btn-block da-action-btn"><i class="fa fa-ban"></i> ${__("Reject Trip")}</button>`;
         } else if (t.status === "Started") {
             let all_done = (t.stops || []).every((s) => s.status === "Completed" || s.status === "Skipped");
@@ -1365,17 +1389,166 @@ class DeliveryApp {
     }
 
     do_trip_accept() {
+        // Carrier-grade trip-start gate (Delhivery / BlueDart / Ekart / Bringg
+        // / FarEye dock-out flow): the driver must verify that every shipment
+        // for this trip is physically in the vehicle BEFORE the trip flips to
+        // Started. We force one load photo + one QR scan per source-stop
+        // manifest, capture GPS, then run accept → start_pickup → stop_arrive
+        // → stop_complete in a single atomic chain.
+        //
+        // For a standard forward trip (1 Pickup stop, N Drop stops) "all
+        // manifests at the first Pickup" == "all manifests on the trip".
+        // For multi-pickup milk-runs the gate covers just the first pickup
+        // stop; later pickup stops keep using the per-stop "Arrive & Pick Up"
+        // dialog.
+        const t = this._trip_detail || {};
+        const first_pickup = (t.stops || []).find(
+            (s) => (s.stop_type || "").toLowerCase() === "pickup"
+        );
+        const source_manifests = first_pickup
+            ? this._gather_stop_manifests(first_pickup.sequence, ["Assigned"])
+            : [];
+
+        if (!first_pickup || !source_manifests.length) {
+            // Nothing to scan at the source (delivery-only trip, or all
+            // manifests at the source already picked up). Fall back to the
+            // legacy quick-accept flow so the driver isn't blocked.
+            this._do_trip_accept_quick();
+            return;
+        }
+        this._open_trip_start_dialog(first_pickup, source_manifests);
+    }
+
+    _do_trip_accept_quick() {
         frappe.confirm(__("Accept this trip and start now?"), () => {
-            frappe.call({
-                method: TRIP_API + "driver_accept_trip",
-                args: { trip: this.active_trip },
-                callback: () => {
-                    frappe.show_alert({ message: __("Trip accepted"), indicator: "green" });
-                    this.show_trip_detail(this.active_trip);
-                    this.load_data();
-                },
+            this._call_promise(TRIP_API + "driver_accept_trip", {
+                trip: this.active_trip,
+            }).then(() => {
+                frappe.show_alert({ message: __("Trip accepted"), indicator: "green" });
+                this.show_trip_detail(this.active_trip);
+                this.load_data();
             });
         });
+    }
+
+    _open_trip_start_dialog(pickup_stop, source_manifests) {
+        const t = this._trip_detail || {};
+        const manifest_rows_html = source_manifests.map((m) => `
+            <div class="da-stop-batch-row" style="border:1px solid #eee;border-radius:6px;padding:6px 8px;margin-bottom:6px;">
+                <div style="font-weight:600;font-size:12px;">${frappe.utils.escape_html(m.name)}</div>
+                <div class="text-muted" style="font-size:11px;">${frappe.utils.escape_html(m.destination_store || m.destination_warehouse || "—")}</div>
+            </div>`).join("");
+
+        const qr_fields = source_manifests.map((m) => ({
+            fieldname: `qr__${m.name.replace(/[^A-Za-z0-9_]/g, "_")}`,
+            fieldtype: "Data",
+            label: __("Scan QR for {0}", [m.name]),
+            reqd: 1,
+        }));
+
+        const fields = [
+            {
+                fieldname: "summary", fieldtype: "HTML",
+                options: `<div class="alert alert-info" style="padding:8px 10px;border-radius:6px;margin-bottom:8px;">
+                    <strong><i class="fa fa-truck"></i> ${__("Verify load before trip starts")}</strong>
+                    <div style="font-size:12px;margin-top:4px;">
+                        ${__("Pickup at {0}", [frappe.utils.escape_html(pickup_stop.store || pickup_stop.warehouse || "—")])}
+                        &middot; ${__("{0} manifest(s)", [source_manifests.length])}
+                    </div>
+                </div>
+                <div class="da-stop-batch-list">${manifest_rows_html}</div>`,
+            },
+            {
+                fieldname: "pickup_photo",
+                fieldtype: "Attach Image",
+                label: __("Photo of Loaded Vehicle / Goods"),
+                reqd: 1,
+                description: __("One photo of the loaded vehicle or dock — covers the whole load."),
+            },
+            {
+                fieldname: "notes",
+                fieldtype: "Small Text",
+                label: __("Notes (optional)"),
+            },
+            { fieldtype: "Section Break", label: __("Scan each manifest QR") },
+            ...qr_fields,
+        ];
+
+        const d = new frappe.ui.Dialog({
+            title: __("Accept & Start Trip {0}", [t.name || ""]),
+            size: "small",
+            fields,
+            primary_action_label: __("Confirm & Start Trip"),
+            primary_action: (values) => {
+                d.hide();
+                this._submit_trip_start(pickup_stop, source_manifests, values);
+            },
+        });
+        d.show();
+    }
+
+    _submit_trip_start(pickup_stop, source_manifests, values) {
+        frappe.dom.freeze(__("Accepting trip & loading manifests…"));
+        let captured_gps = null;
+        return this._capture_gps_promise()
+            .then(({ lat, lng }) => {
+                captured_gps = { lat, lng };
+                // Step 1: flip Assigned → Started so subsequent stop_arrive /
+                // stop_complete calls are allowed by the server.
+                return this._call_promise(TRIP_API + "driver_accept_trip", {
+                    trip: this.active_trip,
+                });
+            })
+            .then(() => {
+                // Step 2: start_pickup for every Assigned manifest at the
+                // source stop, with the shared load photo + per-manifest QR.
+                return this._run_sequential(source_manifests, (m) => {
+                    const qr_key = `qr__${m.name.replace(/[^A-Za-z0-9_]/g, "_")}`;
+                    return this._call_promise(API + "start_pickup", {
+                        manifest: m.name,
+                        pickup_photo: values.pickup_photo,
+                        scanned_qr: values[qr_key],
+                        lat: captured_gps.lat, lng: captured_gps.lng,
+                        notes: values.notes,
+                    });
+                });
+            })
+            .then((results) => {
+                const { ok, fail } = this._summarise_batch(results);
+                // Step 3: only close out the source stop if every manifest
+                // was picked up cleanly. Otherwise leave it Pending so the
+                // driver can retry the failing manifest individually.
+                if (ok.length && !fail.length) {
+                    return this._call_promise(TRIP_API + "stop_arrive", {
+                        trip: this.active_trip,
+                        sequence: pickup_stop.sequence,
+                        gps_lat: captured_gps.lat,
+                        gps_lng: captured_gps.lng,
+                    }).then(() =>
+                        this._call_promise(TRIP_API + "stop_complete", {
+                            trip: this.active_trip,
+                            sequence: pickup_stop.sequence,
+                            scan_compliance_pct: 100,
+                        })
+                    ).then(() => ({ ok, fail }));
+                }
+                return { ok, fail };
+            })
+            .then(({ ok, fail }) => {
+                frappe.dom.unfreeze();
+                this._show_batch_result(__("Trip start pickup"), ok, fail);
+                this.show_trip_detail(this.active_trip);
+                this.load_data();
+            })
+            .catch((err) => {
+                frappe.dom.unfreeze();
+                // driver_accept_trip / start_pickup errors already surface a
+                // toast from Frappe's default ajax error handler. Refresh so
+                // the driver sees the latest server-truth state — the trip
+                // may already be Started even if a later step failed.
+                this.show_trip_detail(this.active_trip);
+                console.error("trip start gate failed", err);
+            });
     }
 
     do_trip_reject() {
@@ -1445,34 +1618,51 @@ class DeliveryApp {
         });
     }
 
+    // ── Stop-level "Arrive" smart dispatcher ─────────────────────
+    //
+    // Carrier driver apps (Delhivery, Ekart, BlueDart, Bringg, FarEye, Onfleet)
+    // collapse the per-shipment POD UI into a single per-stop CTA. The driver
+    // arrives at the door, taps one button, photographs the load once,
+    // collects the OTP(s) from the receiver, and the app fans the action out
+    // across every manifest the route attached to that stop. We mirror that
+    // here so the driver does not have to drill into each manifest card.
     do_stop_arrive(seq) {
-        this._capture_gps((lat, lng) => {
-            frappe.call({
-                method: TRIP_API + "stop_arrive",
-                args: { trip: this.active_trip, sequence: seq, gps_lat: lat, gps_lng: lng },
-                callback: () => {
-                    frappe.show_alert({ message: __("Stop arrival recorded"), indicator: "green" });
-                    this.show_trip_detail(this.active_trip);
-                },
+        const stop = this._find_stop(seq);
+        if (!stop) {
+            frappe.show_alert({ message: __("Stop not found"), indicator: "red" });
+            return;
+        }
+        const stop_type = (stop.stop_type || "").toLowerCase();
+        if (stop_type === "pickup") {
+            this._do_stop_pickup_flow(seq);
+        } else if (stop_type === "drop") {
+            this._do_stop_drop_flow(seq);
+        } else {
+            // Unknown stop type — fall back to a plain GPS arrival ping so we
+            // never block the driver if a custom stop type slips through.
+            this._record_stop_arrival(seq).then(() => {
+                frappe.show_alert({ message: __("Stop arrival recorded"), indicator: "green" });
+                this.show_trip_detail(this.active_trip);
             });
-        });
+        }
     }
 
     do_stop_complete(seq) {
-        // Guard against a common UX confusion: "Complete Stop" records
-        // stop-level compliance only. Delivery OTP/photo happens on the
-        // manifest card (Complete Delivery) and must run first.
+        // The combined "Arrive" flows already auto-fire stop_complete when all
+        // manifests at the stop are handled. This manual CTA remains as a
+        // fallback for legacy/partial cases where the driver finished a stop
+        // through the per-manifest flow. Keep the original guard: refuse to
+        // mark the stop complete while any manifest on it is still mid-flight.
         if (this._trip_detail && (this._trip_detail.manifests || []).length) {
             const open_rows = (this._trip_detail.manifests || []).filter((m) =>
                 m.stop_sequence === seq && ["Assigned", "Pickup Started", "In Transit"].includes(m.status)
             );
             if (open_rows.length) {
                 frappe.msgprint({
-                    title: __("Complete Delivery First"),
+                    title: __("Finish Manifest Actions First"),
                     indicator: "orange",
-                    message: __("Open manifest <b>{0}</b> from this stop and finish OTP/photo delivery flow first.", [open_rows[0].name]),
+                    message: __("Manifest <b>{0}</b> on this stop is still open. Use the stop's <b>Arrive</b> button to run pickup/delivery for all manifests at once, or open the manifest to finish it individually.", [open_rows[0].name]),
                 });
-                this.show_manifest_detail(open_rows[0].name);
                 return;
             }
         }
@@ -1485,22 +1675,491 @@ class DeliveryApp {
                 reqd: 1,
             }],
             (values) => {
-                frappe.call({
-                    method: TRIP_API + "stop_complete",
-                    args: {
-                        trip: this.active_trip,
-                        sequence: seq,
-                        scan_compliance_pct: values.scan_compliance_pct,
-                    },
-                    callback: () => {
-                        frappe.show_alert({ message: __("Stop completed"), indicator: "green" });
-                        this.show_trip_detail(this.active_trip);
-                    },
+                this._call_promise(TRIP_API + "stop_complete", {
+                    trip: this.active_trip,
+                    sequence: seq,
+                    scan_compliance_pct: values.scan_compliance_pct,
+                }).then(() => {
+                    frappe.show_alert({ message: __("Stop completed"), indicator: "green" });
+                    this.show_trip_detail(this.active_trip);
                 });
             },
             __("Complete Stop"),
             __("Confirm")
         );
+    }
+
+    // ── Stop-level combined flows ────────────────────────────────
+
+    _find_stop(seq) {
+        const t = this._trip_detail || {};
+        return (t.stops || []).find((s) => cint(s.sequence) === cint(seq));
+    }
+
+    _gather_stop_manifests(seq, statuses) {
+        // ``stop_sequence`` on a manifest is set by ``_assign_stop_sequence``
+        // to the manifest's DESTINATION stop (for forward trips) or SOURCE
+        // stop (for reverse trips). So filtering purely by stop_sequence
+        // works for the delivery side but never matches at the pickup stop.
+        //
+        // To make the combined Arrive & Pick Up flow work on multi-pickup
+        // trips, we additionally match a pickup stop against the manifest's
+        // source warehouse/store. Drop stops keep the strict stop_sequence
+        // match so a manifest only appears under the stop it's actually
+        // being delivered to.
+        const t = this._trip_detail || {};
+        const stop = (t.stops || []).find((s) => cint(s.sequence) === cint(seq));
+        const stop_type = ((stop && stop.stop_type) || "").toLowerCase();
+        const allowed = new Set((statuses || []).map((x) => x.toLowerCase()));
+        return (t.manifests || []).filter((m) => {
+            let matches = false;
+            if (stop_type === "pickup" || stop_type === "pickup+drop") {
+                // Forward trips: pickup is the manifest's source.
+                if (stop && stop.warehouse && m.source_warehouse === stop.warehouse) matches = true;
+                if (stop && stop.store && m.source_store === stop.store) matches = true;
+            }
+            if (!matches && (stop_type === "drop" || stop_type === "pickup+drop")) {
+                if (cint(m.stop_sequence) === cint(seq)) matches = true;
+                // Fallback for trips that pre-date stop_sequence assignment.
+                if (!matches) {
+                    if (stop && stop.warehouse && m.destination_warehouse === stop.warehouse) matches = true;
+                    if (stop && stop.store && m.destination_store === stop.store) matches = true;
+                }
+            }
+            if (!matches) return false;
+            if (!allowed.size) return true;
+            return allowed.has((m.status || "").toLowerCase());
+        });
+    }
+
+    _call_promise(method, args) {
+        // Promisified frappe.call so we can chain the multi-manifest sequence
+        // without nesting callbacks five levels deep. Server-side messages
+        // (frappe.throw) still surface as red toasts via Frappe's default
+        // ajax error handler, so we resolve only on success and reject on
+        // network / server errors with the response payload.
+        return new Promise((resolve, reject) => {
+            frappe.call({
+                method,
+                args: args || {},
+                callback: (r) => resolve(r && r.message),
+                error: (err) => reject(err),
+            });
+        });
+    }
+
+    _capture_gps_promise() {
+        // Self-contained GPS capture that rejects on denial/timeout so chained
+        // ``frappe.dom.freeze`` calls in the combined-stop flows can always be
+        // released. ``_capture_gps`` never invokes its callback on error
+        // (it only shows a msgprint), which would leave the freeze overlay
+        // stuck if we wrapped it directly.
+        return new Promise((resolve, reject) => {
+            if (!navigator.geolocation) {
+                frappe.msgprint({
+                    title: __("Location Required"),
+                    indicator: "red",
+                    message: __("This device does not support geolocation. Pickup / delivery cannot be confirmed without driver location."),
+                });
+                reject(new Error("geolocation unsupported"));
+                return;
+            }
+            navigator.geolocation.getCurrentPosition(
+                (pos) => resolve({ lat: pos.coords.latitude, lng: pos.coords.longitude }),
+                (err) => {
+                    frappe.msgprint({
+                        title: __("Location Required"),
+                        indicator: "red",
+                        message: __("Could not capture driver location ({0}). Enable Location on the device and retry.",
+                            [(err && err.message) || __("permission denied")]),
+                    });
+                    reject(err || new Error("geolocation denied"));
+                },
+                { enableHighAccuracy: true, timeout: 8000, maximumAge: 0 }
+            );
+        });
+    }
+
+    _record_stop_arrival(seq) {
+        return this._capture_gps_promise().then(({ lat, lng }) => {
+            return this._call_promise(TRIP_API + "stop_arrive", {
+                trip: this.active_trip,
+                sequence: seq,
+                gps_lat: lat,
+                gps_lng: lng,
+            }).then(() => ({ lat, lng }));
+        });
+    }
+
+    _run_sequential(items, fn) {
+        // Run an async fn(item) over items one-at-a-time. We collect per-row
+        // outcomes so the dialog can show the driver exactly which manifests
+        // failed and which succeeded (carrier apps never silently swallow a
+        // failed shipment in a batched POD).
+        const results = [];
+        let chain = Promise.resolve();
+        items.forEach((item) => {
+            chain = chain.then(() => {
+                return fn(item)
+                    .then((res) => results.push({ item, ok: true, res }))
+                    .catch((err) => results.push({ item, ok: false, err }));
+            });
+        });
+        return chain.then(() => results);
+    }
+
+    _summarise_batch(results) {
+        const ok = results.filter((r) => r.ok).map((r) => r.item.name);
+        const fail = results.filter((r) => !r.ok).map((r) => r.item.name);
+        return { ok, fail };
+    }
+
+    // ---------- Pickup stop combined flow ------------------------
+    _do_stop_pickup_flow(seq) {
+        const candidates = this._gather_stop_manifests(seq, ["Assigned"]);
+        const stop = this._find_stop(seq) || {};
+        if (!candidates.length) {
+            // Nothing to pick up here — just record arrival and let the
+            // driver use Complete Stop. Likely the stop is already partly
+            // worked through the manifest flow.
+            return this._record_stop_arrival(seq).then(() => {
+                frappe.show_alert({ message: __("Stop arrival recorded"), indicator: "green" });
+                this.show_trip_detail(this.active_trip);
+            });
+        }
+
+        // Build per-manifest QR fields. One pickup photo (the goods on the
+        // dock) is shared across the load — that mirrors Ekart / Delhivery
+        // handover scans where one rack photo covers all bundles in the lot.
+        const manifest_rows_html = candidates.map((m) => `
+            <div class="da-stop-batch-row" style="border:1px solid #eee;border-radius:6px;padding:6px 8px;margin-bottom:6px;">
+                <div style="font-weight:600;font-size:12px;">${frappe.utils.escape_html(m.name)}</div>
+                <div class="text-muted" style="font-size:11px;">${frappe.utils.escape_html(m.destination_store || m.destination_warehouse || "—")}</div>
+            </div>`).join("");
+
+        const qr_fields = candidates.map((m) => ({
+            fieldname: `qr__${m.name.replace(/[^A-Za-z0-9_]/g, "_")}`,
+            fieldtype: "Data",
+            label: __("QR for {0}", [m.name]),
+            reqd: 1,
+        }));
+
+        const fields = [
+            {
+                fieldname: "summary", fieldtype: "HTML",
+                options: `<div class="alert alert-info" style="padding:8px 10px;border-radius:6px;margin-bottom:8px;">
+                    <strong><i class="fa fa-map-marker"></i> ${frappe.utils.escape_html(stop.store || stop.warehouse || "—")}</strong>
+                    <div style="font-size:12px;">${__("Picking up {0} manifest(s) at this stop.", [candidates.length])}</div>
+                </div>
+                <div class="da-stop-batch-list">${manifest_rows_html}</div>`,
+            },
+            {
+                fieldname: "pickup_photo",
+                fieldtype: "Attach Image",
+                label: __("Photo of Goods (single photo covers this load)"),
+                reqd: 1,
+            },
+            {
+                fieldname: "notes",
+                fieldtype: "Small Text",
+                label: __("Notes (optional)"),
+            },
+            { fieldtype: "Section Break", label: __("Scan each manifest QR") },
+            ...qr_fields,
+        ];
+
+        const d = new frappe.ui.Dialog({
+            title: __("Arrive & Pick Up — Stop #{0}", [seq]),
+            size: "small",
+            fields,
+            primary_action_label: __("Confirm Pickup"),
+            primary_action: (values) => {
+                d.hide();
+                this._submit_stop_pickup(seq, candidates, values);
+            },
+        });
+        d.show();
+    }
+
+    _submit_stop_pickup(seq, candidates, values) {
+        frappe.dom.freeze(__("Recording arrival & pickup…"));
+        return this._record_stop_arrival(seq)
+            .then(({ lat, lng }) => {
+                return this._run_sequential(candidates, (m) => {
+                    const qr_key = `qr__${m.name.replace(/[^A-Za-z0-9_]/g, "_")}`;
+                    return this._call_promise(API + "start_pickup", {
+                        manifest: m.name,
+                        pickup_photo: values.pickup_photo,
+                        scanned_qr: values[qr_key],
+                        lat, lng,
+                        notes: values.notes,
+                    });
+                });
+            })
+            .then((results) => {
+                const { ok, fail } = this._summarise_batch(results);
+                // If every manifest at this pickup stop succeeded, auto-mark
+                // the stop Completed so the driver doesn't need a second tap.
+                if (ok.length && !fail.length) {
+                    return this._call_promise(TRIP_API + "stop_complete", {
+                        trip: this.active_trip,
+                        sequence: seq,
+                        scan_compliance_pct: 100,
+                    }).then(() => ({ ok, fail }));
+                }
+                return { ok, fail };
+            })
+            .then(({ ok, fail }) => {
+                frappe.dom.unfreeze();
+                this._show_batch_result(__("Pickup"), ok, fail);
+                this.show_trip_detail(this.active_trip);
+                this.load_data();
+            })
+            .catch((err) => {
+                frappe.dom.unfreeze();
+                // Errors from frappe.call already show a toast/dialog. Refresh
+                // anyway so the driver sees the latest server state.
+                this.show_trip_detail(this.active_trip);
+                console.error("stop pickup flow failed", err);
+            });
+    }
+
+    // ---------- Drop stop combined flow --------------------------
+    _do_stop_drop_flow(seq) {
+        const deliverable = this._gather_stop_manifests(seq, ["In Transit"]);
+        const not_yet = this._gather_stop_manifests(seq, ["Assigned", "Pickup Started"]);
+        const stop = this._find_stop(seq) || {};
+
+        if (!deliverable.length) {
+            // No In-Transit manifest at this drop. Either everything was
+            // already delivered (just ping GPS), or pickup at the source
+            // never happened (block and tell the driver).
+            if (not_yet.length) {
+                frappe.msgprint({
+                    title: __("Pickup Not Done Yet"),
+                    indicator: "orange",
+                    message: __(
+                        "These manifest(s) at this drop are not In Transit yet: <b>{0}</b>.<br>" +
+                        "Go back to the pickup stop and run <b>Arrive &amp; Pick Up</b> first, " +
+                        "or open the manifest to complete pickup individually.",
+                        [not_yet.map((m) => m.name).join(", ")]
+                    ),
+                });
+                return;
+            }
+            return this._record_stop_arrival(seq).then(() => {
+                frappe.show_alert({ message: __("Stop arrival recorded"), indicator: "green" });
+                this.show_trip_detail(this.active_trip);
+            });
+        }
+
+        // Two-stage POD: record stop arrival + per-manifest geofence ping +
+        // generate OTPs BEFORE opening the dialog, so the driver sees fresh
+        // OTPs land at the store before they ask for them.
+        frappe.dom.freeze(__("Recording arrival & sending OTPs…"));
+        this._record_stop_arrival(seq)
+            .then(({ lat, lng }) => {
+                this._stop_drop_gps = { lat, lng };
+                return this._run_sequential(deliverable, (m) => {
+                    // Per-manifest: mark reached (sets arrival_datetime so
+                    // complete_delivery is unlocked) then request fresh OTP.
+                    return this._call_promise(API + "mark_reached_destination", {
+                        manifest: m.name, lat, lng,
+                    }).then(() => {
+                        return this._call_promise(API + "request_delivery_otp", {
+                            manifest: m.name,
+                        }).then((info) => ({ manifest: m, otp_info: info || {} }));
+                    });
+                });
+            })
+            .then((results) => {
+                frappe.dom.unfreeze();
+                // Manifests that failed reached/OTP — surface but still allow
+                // the driver to deliver the ones that succeeded.
+                const ready = results.filter((r) => r.ok).map((r) => r.res);
+                const skipped = results.filter((r) => !r.ok).map((r) => r.item);
+                if (!ready.length) {
+                    frappe.msgprint({
+                        title: __("Could Not Prepare Delivery"),
+                        indicator: "red",
+                        message: __("None of the manifests at this stop accepted the arrival ping. Check the manifest cards for details."),
+                    });
+                    this.show_trip_detail(this.active_trip);
+                    return;
+                }
+                this._open_stop_delivery_dialog(seq, ready, skipped, stop);
+            })
+            .catch((err) => {
+                frappe.dom.unfreeze();
+                this.show_trip_detail(this.active_trip);
+                console.error("stop drop prepare failed", err);
+            });
+    }
+
+    _open_stop_delivery_dialog(seq, ready, skipped, stop) {
+        // ``ready`` = [{ manifest, otp_info }] (mark_reached + OTP succeeded)
+        const recipients_block = (info) => {
+            if (!info) return "";
+            const parts = [];
+            if ((info.masked_emails || []).length) {
+                parts.push(__("Email: {0}", [info.masked_emails.map(frappe.utils.escape_html).join(", ")]));
+            }
+            if ((info.masked_mobiles || []).length) {
+                parts.push(__("SMS: {0}", [info.masked_mobiles.map(frappe.utils.escape_html).join(", ")]));
+            }
+            return parts.length
+                ? `<div class="text-muted" style="font-size:11px;">${__("OTP sent")} — ${parts.join(" • ")}</div>`
+                : `<div class="text-muted" style="font-size:11px;">${__("OTP regenerated. Ask the store directly.")}</div>`;
+        };
+
+        const ready_rows_html = ready.map((r) => `
+            <div class="da-stop-batch-row" style="border:1px solid #eee;border-radius:6px;padding:6px 8px;margin-bottom:6px;">
+                <div style="font-weight:600;font-size:12px;">${frappe.utils.escape_html(r.manifest.name)}</div>
+                ${recipients_block(r.otp_info)}
+            </div>`).join("");
+
+        const skipped_html = skipped.length
+            ? `<div class="alert alert-warning" style="padding:8px 10px;border-radius:6px;margin:8px 0;font-size:12px;">
+                ${__("Skipped (not ready)")}: <b>${skipped.map((m) => frappe.utils.escape_html(m.name)).join(", ")}</b>
+              </div>` : "";
+
+        const per_manifest_fields = [];
+        ready.forEach((r, idx) => {
+            const safe = r.manifest.name.replace(/[^A-Za-z0-9_]/g, "_");
+            per_manifest_fields.push({ fieldtype: "Section Break", label: r.manifest.name });
+            per_manifest_fields.push({
+                fieldname: `otp__${safe}`,
+                fieldtype: "Data",
+                label: __("OTP for {0}", [r.manifest.name]),
+                reqd: 1,
+            });
+            per_manifest_fields.push({
+                fieldname: `qr__${safe}`,
+                fieldtype: "Data",
+                label: __("Scan QR for {0}", [r.manifest.name]),
+                reqd: 1,
+            });
+            if (idx < ready.length - 1) {
+                per_manifest_fields.push({ fieldtype: "Column Break" });
+            }
+        });
+
+        const fields = [
+            {
+                fieldname: "summary", fieldtype: "HTML",
+                options: `<div class="alert alert-info" style="padding:8px 10px;border-radius:6px;margin-bottom:8px;">
+                    <strong><i class="fa fa-map-marker"></i> ${frappe.utils.escape_html(stop.store || stop.warehouse || "—")}</strong>
+                    <div style="font-size:12px;">${__("Delivering {0} manifest(s) at this stop.", [ready.length])}</div>
+                </div>
+                <div class="da-stop-batch-list">${ready_rows_html}</div>
+                ${skipped_html}`,
+            },
+            {
+                fieldname: "delivery_photo",
+                fieldtype: "Attach Image",
+                label: __("Photo of Delivery (single photo covers this drop)"),
+                reqd: 1,
+            },
+            {
+                fieldname: "receiver_name",
+                fieldtype: "Data",
+                label: __("Receiver Name (delivered to)"),
+                reqd: 1,
+            },
+            { fieldtype: "Section Break", label: __("Per-manifest OTP & QR") },
+            ...per_manifest_fields,
+        ];
+
+        const d = new frappe.ui.Dialog({
+            title: __("Arrive & Deliver — Stop #{0}", [seq]),
+            size: "large",
+            fields,
+            primary_action_label: __("Confirm Delivery"),
+            primary_action: (values) => {
+                d.hide();
+                this._submit_stop_delivery(seq, ready, skipped, values);
+            },
+            secondary_action_label: __("Resend OTPs"),
+            secondary_action: () => {
+                this._run_sequential(ready, (r) =>
+                    this._call_promise(API + "request_delivery_otp", { manifest: r.manifest.name })
+                ).then(() => {
+                    frappe.show_alert({ message: __("OTPs resent"), indicator: "blue" });
+                });
+            },
+        });
+        d.show();
+    }
+
+    _submit_stop_delivery(seq, ready, skipped, values) {
+        const gps = this._stop_drop_gps || {};
+        frappe.dom.freeze(__("Completing delivery…"));
+        return this._run_sequential(ready, (r) => {
+            const safe = r.manifest.name.replace(/[^A-Za-z0-9_]/g, "_");
+            return this._call_promise(API + "complete_delivery", {
+                manifest: r.manifest.name,
+                delivery_photo: values.delivery_photo,
+                receiver_name: values.receiver_name,
+                scanned_qr: values[`qr__${safe}`],
+                otp: values[`otp__${safe}`],
+                lat: gps.lat, lng: gps.lng,
+            });
+        })
+            .then((results) => {
+                const { ok, fail } = this._summarise_batch(
+                    results.map((r) => ({ item: r.item.manifest, ok: r.ok, err: r.err }))
+                );
+                // Auto-complete the stop only when every deliverable manifest
+                // succeeded AND we didn't pre-skip any (i.e. no pickup-debt
+                // left). Otherwise leave the stop open so the driver can
+                // resolve the stragglers individually.
+                if (ok.length && !fail.length && !skipped.length) {
+                    return this._call_promise(TRIP_API + "stop_complete", {
+                        trip: this.active_trip,
+                        sequence: seq,
+                        scan_compliance_pct: 100,
+                    }).then(() => ({ ok, fail }));
+                }
+                return { ok, fail };
+            })
+            .then(({ ok, fail }) => {
+                frappe.dom.unfreeze();
+                this._show_batch_result(__("Delivery"), ok, fail);
+                this.show_trip_detail(this.active_trip);
+                this.load_data();
+            })
+            .catch((err) => {
+                frappe.dom.unfreeze();
+                this.show_trip_detail(this.active_trip);
+                console.error("stop drop submit failed", err);
+            });
+    }
+
+    _show_batch_result(label, ok, fail) {
+        if (ok.length && !fail.length) {
+            frappe.show_alert({
+                message: __("{0} completed for {1} manifest(s).", [label, ok.length]),
+                indicator: "green",
+            });
+            return;
+        }
+        if (ok.length && fail.length) {
+            frappe.msgprint({
+                title: __("{0} partly completed", [label]),
+                indicator: "orange",
+                message: __("Succeeded: <b>{0}</b><br>Failed: <b>{1}</b><br>Open the failed manifest(s) to retry.",
+                    [ok.join(", ") || "—", fail.join(", ")]),
+            });
+            return;
+        }
+        if (fail.length) {
+            frappe.msgprint({
+                title: __("{0} failed", [label]),
+                indicator: "red",
+                message: __("None of the manifests completed: <b>{0}</b>. Open them individually to see the server error.",
+                    [fail.join(", ")]),
+            });
+        }
     }
 
     do_trip_exception() {

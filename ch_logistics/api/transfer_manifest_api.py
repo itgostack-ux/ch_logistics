@@ -296,10 +296,8 @@ def driver_close_manifest(manifest, close_note=None) -> dict:
     doc = frappe.get_doc("CH Transfer Manifest", manifest)
     doc.check_permission("write")
 
-    current_driver = (
-        frappe.db.get_value("Driver", {"user": frappe.session.user}, "name")
-        or frappe.db.get_value("Driver", {"employee": frappe.session.user}, "name")
-    )
+    from ch_logistics.api.driver_resolver import resolve_current_driver
+    current_driver = resolve_current_driver(throw=False, auto_provision_admin=False)
     if current_driver and doc.driver and doc.driver != current_driver:
         frappe.throw(_("You can only close manifests assigned to your driver profile."))
 
@@ -933,11 +931,10 @@ def get_driver_assignments() -> list:
     user_roles = frappe.get_roles(user)
     is_ops = bool({"System Manager", "Delivery Manager", "Delivery User"} & set(user_roles))
 
-    # Find Driver record: match on `user` field (Frappe native) then on linked Employee
-    driver = (
-        frappe.db.get_value("Driver", {"user": user}, "name")
-        or frappe.db.get_value("Driver", {"employee": user}, "name")
-    )
+    # Resolve current user → Driver via the shared chain (User.user, then
+    # Employee.user_id → Driver.employee, then Administrator auto-provision).
+    from ch_logistics.api.driver_resolver import resolve_current_driver
+    driver = resolve_current_driver(throw=False)
 
     filters = {"docstatus": 1}
     if driver:
@@ -991,10 +988,8 @@ def get_delivery_history() -> list:
     user_roles = frappe.get_roles(user)
     is_ops = bool({"System Manager", "Delivery Manager", "Delivery User"} & set(user_roles))
 
-    driver = (
-        frappe.db.get_value("Driver", {"user": user}, "name")
-        or frappe.db.get_value("Driver", {"employee": user}, "name")
-    )
+    from ch_logistics.api.driver_resolver import resolve_current_driver
+    driver = resolve_current_driver(throw=False)
 
     filters = {
         "docstatus": 1,

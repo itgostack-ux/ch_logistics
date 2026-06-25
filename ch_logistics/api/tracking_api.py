@@ -31,16 +31,12 @@ from ch_logistics.logistics.doctype.ch_tracking_settings.ch_tracking_settings im
 # ----- Driver resolution ---------------------------------------------------
 
 def _current_driver(throw: bool = True) -> str | None:
-	"""Resolve the logged-in user to a Driver record."""
-	user = frappe.session.user
-	driver = (
-		frappe.db.get_value("Driver", {"user": user}, "name")
-		or frappe.db.get_value("Driver", {"employee": user}, "name")
-	)
-	if not driver and throw:
-		frappe.throw(_("Your user is not linked to any Driver record."),
-					 title=_("Not a Driver"))
-	return driver
+	"""Resolve the logged-in user to a Driver record.
+
+	Thin shim over :func:`ch_logistics.api.driver_resolver.resolve_current_driver`.
+	"""
+	from ch_logistics.api.driver_resolver import resolve_current_driver
+	return resolve_current_driver(throw=throw)
 
 
 def _driver_has_field(field: str) -> bool:

@@ -14,6 +14,7 @@ import frappe
 from frappe import _
 
 from ch_logistics.api import driver_status as ds
+from ch_logistics.api.driver_resolver import resolve_current_driver
 from ch_logistics.logistics.doctype.ch_driver_device.ch_driver_device import (
     deactivate_devices,
     register_device,
@@ -24,15 +25,10 @@ from ch_logistics.logistics.doctype.ch_driver_device.ch_driver_device import (
 # Helpers
 # --------------------------------------------------------------------------
 def _current_driver(throw=True) -> str | None:
-    user = frappe.session.user
-    driver = (
-        frappe.db.get_value("Driver", {"user": user}, "name")
-        or frappe.db.get_value("Driver", {"employee": user}, "name")
-    )
-    if not driver and throw:
-        frappe.throw(_("No Driver record is linked to your user account."),
-                     title=_("Not a Driver"))
-    return driver
+    """Thin shim over the shared resolver (kept for backward compatibility
+    with existing call sites in this module). See
+    :func:`ch_logistics.api.driver_resolver.resolve_current_driver`."""
+    return resolve_current_driver(throw=throw)
 
 
 def _single_device_enforced() -> bool:

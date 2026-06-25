@@ -559,12 +559,14 @@ def _set_driver_availability(driver, status, current_trip):
 
 
 def _resolve_current_driver():
-    """Resolve the Driver doc for the logged-in user, mirroring transfer_manifest_api."""
-    user = frappe.session.user
-    return (
-        frappe.db.get_value("Driver", {"user": user}, "name")
-        or frappe.db.get_value("Driver", {"employee": user}, "name")
-    )
+    """Resolve the Driver doc for the logged-in user.
+
+    Delegates to :func:`ch_logistics.api.driver_resolver.resolve_current_driver`
+    so every API surface uses the same lookup chain (User → Driver.user;
+    User → Employee.user_id → Driver.employee; Administrator auto-provision).
+    """
+    from ch_logistics.api.driver_resolver import resolve_current_driver
+    return resolve_current_driver(throw=False)
 
 
 # ---------------------------------------------------------------------------
