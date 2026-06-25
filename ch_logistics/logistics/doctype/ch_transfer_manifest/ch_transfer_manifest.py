@@ -40,6 +40,7 @@ class CHTransferManifest(Document):
             )
         self.db_set("status", "Cancelled")
         self._clear_stock_entries_manifest()
+        self._maybe_auto_close_parent_trip()
 
     # ── Helpers ─────────────────────────────────────────────────────────
 
@@ -906,6 +907,7 @@ class CHTransferManifest(Document):
             # drops them back to AVAILABLE so dispatch can re-assign them.
             # If they're still carrying other loads, IN_TRANSIT is preserved.
             self._sync_driver_state_after_action()
+            self._maybe_auto_close_parent_trip()
             from ch_logistics.api.customer_tracking import notify_destination
             notify_destination(self.name, "delivered")
         finally:
@@ -1000,6 +1002,7 @@ class CHTransferManifest(Document):
         self.status = "Closed"
         self.flags.ignore_validate_update_after_submit = True
         self.save()
+        self._maybe_auto_close_parent_trip()
         if flt(self.freight_amount) > 0 and not self.freight_journal_entry:
             self._post_freight_gl()
         # GAP-8: distribute freight to item valuation via Landed Cost Voucher
@@ -1336,6 +1339,47 @@ class CHTransferManifest(Document):
             frappe.db.set_value(
                 "Stock Entry", row.stock_entry, update,
                 update_modified=False,
+            )
+
+    def _maybe_auto_close_parent_trip(self):
+        """Auto-close parent trip when every attached manifest is terminal.
+
+        Terminal set for trip auto-close: Delivered / Closed / Cancelled.
+        If the trip is still Started, this helper first marks it Completed,
+        then closes it.
+        """
+        trip_name = self.get("trip")
+        if not trip_name:
+            return
+        try:
+            trip = frappe.get_doc("CH Logistics Trip", trip_name)
+            if trip.status in ("Closed", "Cancelled"):
+                return
+
+            rows = frappe.get_all(
+                "CH Transfer Manifest",
+                filters={"trip": trip_name, "docstatus": ["<", 2]},
+                fields=["name", "status"],
+            )
+            if not rows:
+                return
+
+            terminal = {"Closed", "Delivered", "Cancelled"}
+            blocking = [r.name for r in rows if (r.status or "Draft") not in terminal]
+            if blocking:
+                return
+
+            if trip.status == "Started":
+                trip.mark_completed()
+                trip.save(ignore_permissions=True)
+
+            if trip.status == "Completed":
+                trip.mark_closed()
+                trip.save(ignore_permissions=True)
+        except Exception:
+            frappe.log_error(
+                frappe.get_traceback(),
+                f"trip auto-close check failed from manifest {self.name}",
             )
 
     # ── Recall / Reversal ───────────────────────────────────────────────

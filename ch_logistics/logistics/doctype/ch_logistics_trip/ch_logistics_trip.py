@@ -19,14 +19,12 @@ _ALLOWED_STATUS_TRANSITIONS = {
 # Manifest statuses that block trip lifecycle transitions -------------------
 # A trip carries multiple shipments (one per request/manifest). The driver can
 # only mark the trip Completed once every shipment has at least been Delivered,
-# and the trip can only be Closed once every shipment is settled at the
-# receiving store (Received / Partially Received / Closed / Cancelled /
-# Returned). Each manifest is therefore closed individually first, then the
-# trip is closed.
+# and the trip can be Closed once every shipment is in a terminal logistics
+# state (Delivered / Closed / Cancelled).
 _MANIFEST_PREDELIVERY = {
     "Draft", "Packed", "Assigned", "Pickup Started", "In Transit", "Recall Initiated",
 }
-_MANIFEST_UNSETTLED = _MANIFEST_PREDELIVERY | {"Delivered"}
+_MANIFEST_UNSETTLED = _MANIFEST_PREDELIVERY
 
 
 class CHLogisticsTrip(Document):
@@ -178,8 +176,8 @@ class CHLogisticsTrip(Document):
             unsettled = self._blocking_manifests(_MANIFEST_UNSETTLED)
             if unsettled:
                 frappe.throw(_(
-                    "Cannot close trip {0}. These shipments are not yet received/closed: {1}. "
-                    "Close each shipment individually, then close the trip."
+                    "Cannot close trip {0}. These shipments are not yet delivered/closed/cancelled: {1}. "
+                    "Settle each shipment first, then close the trip."
                 ).format(self.name, ", ".join(unsettled)))
             self.status = "Closed"
         finally:

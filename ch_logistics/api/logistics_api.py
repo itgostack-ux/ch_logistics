@@ -13,6 +13,10 @@ import json
 from ch_logistics.api import driver_status as ds
 
 
+_TRIP_CLOSE_TERMINAL_MANIFEST_STATUSES = {"Closed", "Delivered", "Cancelled"}
+_LOGISTICS_HEAD_ROLES = {"System Manager", "Logistics Head", "Logistic Head"}
+
+
 # ---------------------------------------------------------------------------
 # Trip lifecycle
 # ---------------------------------------------------------------------------
@@ -181,11 +185,61 @@ def trip_complete(trip):
 
 
 @frappe.whitelist()
-def trip_close(trip):
+def trip_close(trip, close_as_head=0):
     doc = frappe.get_doc("CH Logistics Trip", trip)
+    roles = set(frappe.get_roles(frappe.session.user))
+    allow_head_override = cint(close_as_head) and bool(roles & _LOGISTICS_HEAD_ROLES)
+
+    if allow_head_override:
+        _close_trip_as_logistics_head(doc)
+        return doc.name
+
     doc.mark_closed()
     doc.save()
     return doc.name
+
+
+def _blocking_manifests_for_trip_close(trip_name: str) -> list[str]:
+    rows = frappe.get_all(
+        "CH Transfer Manifest",
+        filters={"trip": trip_name, "docstatus": ["<", 2]},
+        fields=["name", "status"],
+    )
+    return [
+        f"{r.name} ({r.status or 'Draft'})"
+        for r in rows
+        if (r.status or "Draft") not in _TRIP_CLOSE_TERMINAL_MANIFEST_STATUSES
+    ]
+
+
+def _close_trip_as_logistics_head(doc):
+    """Logistics Head close path.
+
+    Allows closing from Started or Completed only when every attached
+    manifest is terminal (Closed / Delivered / Cancelled).
+    """
+    if doc.status in ("Closed", "Cancelled"):
+        return
+
+    if doc.status not in ("Started", "Completed"):
+        frappe.throw(
+            _("Logistics Head close is allowed only from Started or Completed (current: {0}).").format(doc.status)
+        )
+
+    blocking = _blocking_manifests_for_trip_close(doc.name)
+    if blocking:
+        frappe.throw(
+            _("Cannot close trip {0}. Non-terminal manifests: {1}").format(doc.name, ", ".join(blocking))
+        )
+
+    if doc.status == "Started":
+        doc.mark_completed()
+        doc.save(ignore_permissions=True)
+        if doc.driver:
+            _set_driver_availability(doc.driver, "Available", None)
+
+    doc.mark_closed()
+    doc.save(ignore_permissions=True)
 
 
 @frappe.whitelist()
@@ -539,7 +593,13 @@ def get_trip_detail(trip):
 # ---------------------------------------------------------------------------
 # Ops Control Tower endpoints (consumed by /app/logistics-control-tower)
 # ---------------------------------------------------------------------------
-_OPS_ROLES = {"System Manager", "Operations Manager", "Delivery Manager"}
+_OPS_ROLES = {
+    "System Manager",
+    "Operations Manager",
+    "Delivery Manager",
+    "Logistics Head",
+    "Logistic Head",
+}
 
 
 def _require_ops():

@@ -12,6 +12,7 @@ frappe.ui.form.on("CH Logistics Trip", {
 		if (frm.is_new()) return;
 
 		const status = frm.doc.status;
+		const is_logistics_head = frappe.user.has_role("Logistics Head") || frappe.user.has_role("Logistic Head");
 
 		// Route optimization — only before the driver starts executing.
 		if ((status === "Draft" || status === "Assigned") && (frm.doc.stops || []).length > 1) {
@@ -91,6 +92,20 @@ frappe.ui.form.on("CH Logistics Trip", {
 					}
 				);
 			});
+
+			if (is_logistics_head) {
+				frm.add_custom_button(__("Close Trip (Logistics Head)"), () => {
+					frappe.confirm(
+						__("Close this trip now? Allowed only when all manifests are Closed/Delivered/Cancelled."),
+						() => {
+							frappe.xcall("ch_logistics.api.logistics_api.trip_close", {
+								trip: frm.doc.name,
+								close_as_head: 1,
+							}).then(() => frm.reload_doc());
+						}
+					);
+				}, __("Actions"));
+			}
 		}
 
 		// Completed → Closed
