@@ -1097,6 +1097,7 @@ class DeliveryApp {
         let stops_html = (t.stops || []).map((s) => {
             let st_cls = (s.status || "").toLowerCase().replace(/\s+/g, "-");
             let manifests = manifests_by_stop[s.sequence] || [];
+            let active_manifest_rows = manifests.filter((m) => ["Assigned", "Pickup Started", "In Transit"].includes(m.status));
             let manifests_html = manifests.map((m) => `
                 <div class="da-stop-manifest da-stop-manifest-link"
                      data-name="${frappe.utils.escape_html(m.name)}">
@@ -1109,6 +1110,12 @@ class DeliveryApp {
 
             let can_arrive = (t.status === "Started" && s.status === "Pending");
             let can_complete = (t.status === "Started" && s.status === "Arrived");
+            let completion_hint = "";
+            if (can_complete && active_manifest_rows.length) {
+                completion_hint = `<div class="text-muted" style="font-size:11px;margin-bottom:6px;">
+                    ${__("To finish delivery, tap manifest and complete OTP/photo flow.")}
+                </div>`;
+            }
 
             return `
                 <div class="da-stop-card">
@@ -1121,6 +1128,7 @@ class DeliveryApp {
                         <i class="fa fa-map-marker"></i>
                         ${frappe.utils.escape_html(s.store || s.warehouse || "—")}
                     </div>
+                    ${completion_hint}
                     ${manifests_html ? `<div class="da-stop-manifests">${manifests_html}</div>` : ""}
                     <div class="da-stop-actions">
                         ${can_arrive ? `<button class="btn btn-primary btn-sm da-stop-arrive-btn" data-seq="${s.sequence}"><i class="fa fa-location-arrow"></i> ${__("Arrive")}</button>` : ""}
@@ -1451,6 +1459,23 @@ class DeliveryApp {
     }
 
     do_stop_complete(seq) {
+        // Guard against a common UX confusion: "Complete Stop" records
+        // stop-level compliance only. Delivery OTP/photo happens on the
+        // manifest card (Complete Delivery) and must run first.
+        if (this._trip_detail && (this._trip_detail.manifests || []).length) {
+            const open_rows = (this._trip_detail.manifests || []).filter((m) =>
+                m.stop_sequence === seq && ["Assigned", "Pickup Started", "In Transit"].includes(m.status)
+            );
+            if (open_rows.length) {
+                frappe.msgprint({
+                    title: __("Complete Delivery First"),
+                    indicator: "orange",
+                    message: __("Open manifest <b>{0}</b> from this stop and finish OTP/photo delivery flow first.", [open_rows[0].name]),
+                });
+                this.show_manifest_detail(open_rows[0].name);
+                return;
+            }
+        }
         frappe.prompt(
             [{
                 fieldname: "scan_compliance_pct",
