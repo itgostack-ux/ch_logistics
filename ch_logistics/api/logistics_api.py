@@ -509,8 +509,42 @@ def get_trip_detail(trip):
     """Return a Trip with stops, attached manifests, and open exceptions."""
     doc = frappe.get_doc("CH Logistics Trip", trip)
 
+    # Pre-resolve geocodes for any store / warehouse referenced by the stops
+    # so the Delivery App trip map can plot points even before stop GPS or
+    # manifest pickup/delivery coords are captured.
+    store_meta = frappe.get_meta("CH Store") if frappe.db.exists("DocType", "CH Store") else None
+    store_has_lat = bool(store_meta and store_meta.has_field("latitude"))
+    store_has_lng = bool(store_meta and store_meta.has_field("longitude"))
+    warehouse_meta = frappe.get_meta("Warehouse")
+    wh_has_lat = warehouse_meta.has_field("custom_latitude")
+    wh_has_lng = warehouse_meta.has_field("custom_longitude")
+
+    store_geo: dict[str, dict[str, float]] = {}
+    warehouse_geo: dict[str, dict[str, float]] = {}
+    if store_has_lat and store_has_lng:
+        store_keys = {s.store for s in doc.stops if s.store}
+        for sname in store_keys:
+            row = frappe.db.get_value(
+                "CH Store", sname, ["latitude", "longitude"], as_dict=True
+            ) or {}
+            if row.get("latitude") and row.get("longitude"):
+                store_geo[sname] = {"lat": row.get("latitude"), "lng": row.get("longitude")}
+    if wh_has_lat and wh_has_lng:
+        wh_keys = {s.warehouse for s in doc.stops if s.warehouse}
+        for wname in wh_keys:
+            row = frappe.db.get_value(
+                "Warehouse", wname, ["custom_latitude", "custom_longitude"], as_dict=True
+            ) or {}
+            if row.get("custom_latitude") and row.get("custom_longitude"):
+                warehouse_geo[wname] = {
+                    "lat": row.get("custom_latitude"),
+                    "lng": row.get("custom_longitude"),
+                }
+
     stops = []
     for s in doc.stops:
+        sg = store_geo.get(s.store) if s.store else None
+        wg = warehouse_geo.get(s.warehouse) if s.warehouse else None
         stops.append({
             "sequence": s.sequence,
             "warehouse": s.warehouse,
@@ -521,6 +555,10 @@ def get_trip_detail(trip):
             "ata": s.ata,
             "gps_lat": s.gps_lat,
             "gps_lng": s.gps_lng,
+            "store_lat": sg["lat"] if sg else None,
+            "store_lng": sg["lng"] if sg else None,
+            "warehouse_lat": wg["lat"] if wg else None,
+            "warehouse_lng": wg["lng"] if wg else None,
             "manifest_count": s.manifest_count,
             "scan_compliance_pct": s.scan_compliance_pct,
             "notes": s.notes,

@@ -1000,6 +1000,22 @@ class DeliveryApp {
                     lng = fallback.lng;
                 }
             }
+            if (!valid_latlng(lat, lng)) {
+                // Last-resort fallback: the store / warehouse master geocode.
+                let s_lat = to_num(s.store_lat);
+                let s_lng = to_num(s.store_lng);
+                if (valid_latlng(s_lat, s_lng)) {
+                    lat = s_lat;
+                    lng = s_lng;
+                } else {
+                    let w_lat = to_num(s.warehouse_lat);
+                    let w_lng = to_num(s.warehouse_lng);
+                    if (valid_latlng(w_lat, w_lng)) {
+                        lat = w_lat;
+                        lng = w_lng;
+                    }
+                }
+            }
             if (valid_latlng(lat, lng)) {
                 map_points.push({
                     seq: s.sequence,
