@@ -24,6 +24,7 @@ _STAGE_ROLES = {
     "mark_reached_destination": {"Delivery Manager", "Delivery User", "Stock Manager"},
     "reject_manifest":   {"Delivery Manager", "Delivery User", "Stock Manager"},
     "complete_delivery": {"Delivery User", "Delivery Manager"},
+    "driver_close_manifest": {"Delivery User", "Delivery Manager"},
     # Inward stages — destination-store receipt lane
     "accept_delivery":   {"Store Manager", "Stock Manager"},
     "close_manifest":    {"Store Manager", "Stock Manager"},
@@ -280,6 +281,51 @@ def close_manifest(manifest) -> dict:
     doc.check_permission("write")
     doc.close_manifest()
     return {"status": doc.status}
+
+
+@frappe.whitelist()
+def driver_close_manifest(manifest, close_note=None) -> dict:
+    """Driver-friendly manifest closure.
+
+    Allows the assigned driver to close a manifest from Delivered state to
+    keep the mobile workflow concise. When closing from Delivered we preserve
+    the side-effects of ``close_manifest`` (trip auto-close, freight posting,
+    LCV creation) without forcing destination receipt actions on the driver.
+    """
+    _require_stage_role("driver_close_manifest")
+    doc = frappe.get_doc("CH Transfer Manifest", manifest)
+    doc.check_permission("write")
+
+    current_driver = (
+        frappe.db.get_value("Driver", {"user": frappe.session.user}, "name")
+        or frappe.db.get_value("Driver", {"employee": frappe.session.user}, "name")
+    )
+    if current_driver and doc.driver and doc.driver != current_driver:
+        frappe.throw(_("You can only close manifests assigned to your driver profile."))
+
+    if doc.status == "Closed":
+        return {"status": doc.status, "trip": doc.trip}
+
+    if doc.status in ("Received", "Partially Received"):
+        doc.close_manifest()
+        return {"status": doc.status, "trip": doc.trip}
+
+    if doc.status != "Delivered":
+        frappe.throw(
+            _("Manifest can be closed from Delivered/Received states only (current: {0}).").format(doc.status)
+        )
+
+    doc.status = "Closed"
+    doc.flags.ignore_validate_update_after_submit = True
+    doc.save()
+    if close_note:
+        doc.add_comment("Comment", _("Driver close note: {0}").format(close_note))
+    doc._maybe_auto_close_parent_trip()
+    if flt(doc.freight_amount) > 0 and not doc.freight_journal_entry:
+        doc._post_freight_gl()
+    if flt(doc.freight_amount) > 0:
+        doc._create_landed_cost_voucher()
+    return {"status": doc.status, "trip": doc.trip}
 
 
 # ── Recall / Reversal ────────────────────────────────────────────────────────

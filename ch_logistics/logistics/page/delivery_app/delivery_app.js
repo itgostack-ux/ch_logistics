@@ -51,9 +51,6 @@ class DeliveryApp {
                 <button class="da-tab active" data-tab="trips">
                     <i class="fa fa-truck"></i> My Trips
                 </button>
-                <button class="da-tab" data-tab="assignments">
-                    <i class="fa fa-list"></i> Manifests
-                </button>
                 <button class="da-tab" data-tab="history">
                     <i class="fa fa-history"></i> History
                 </button>
@@ -139,8 +136,16 @@ class DeliveryApp {
         this.$body.on("click", "#da-signout-btn", () => this.do_signout());
 
         this.$body.on("click", "#da-trip-start-btn", () => this.do_trip_start());
+        this.$body.on("click", "#da-trip-accept-btn", () => this.do_trip_accept());
+        this.$body.on("click", "#da-trip-reject-btn", () => this.do_trip_reject());
         this.$body.on("click", "#da-trip-complete-btn", () => this.do_trip_complete());
         this.$body.on("click", "#da-trip-exception-btn", () => this.do_trip_exception());
+        this.$body.on("click", "#da-manifest-close-btn", () => this.do_manifest_close(this.active_manifest));
+        this.$body.on("click", ".da-stop-manifest-close-btn", (e) => {
+            e.stopPropagation();
+            let name = $(e.currentTarget).data("name");
+            this.do_manifest_close(name);
+        });
 
         this.$body.on("click", ".da-stop-arrive-btn", (e) => {
             let seq = $(e.currentTarget).data("seq");
@@ -170,7 +175,7 @@ class DeliveryApp {
             method: API + "get_driver_assignments",
             callback: (r) => {
                 this.manifests = r.message || [];
-                if (this.active_tab === "assignments" && !this.active_manifest)
+                if (this.active_tab === "trips" && !this.active_trip && !this.active_manifest)
                     this.render_content();
             },
         });
@@ -197,11 +202,11 @@ class DeliveryApp {
             this.render_trips_list($c);
             return;
         }
-        let list = this.active_tab === "assignments" ? this.manifests : this.history;
+        let list = this.history;
         if (!list.length) {
             $c.html(`<div class="da-empty">
                 <i class="fa fa-inbox fa-3x"></i>
-                <p>${this.active_tab === "assignments" ? __("No manifests assigned") : __("No delivery history")}</p>
+                <p>${__("No delivery history")}</p>
             </div>`);
             return;
         }
@@ -372,6 +377,10 @@ class DeliveryApp {
                     <i class="fa fa-exclamation-triangle"></i> ${__("Failed Delivery (mid-trip)")}
                 </button>`;
             }
+        } else if (d.status === "Delivered" || d.status === "Received" || d.status === "Partially Received") {
+            action_html = `<button id="da-manifest-close-btn" class="btn btn-success btn-lg btn-block da-action-btn">
+                <i class="fa fa-archive"></i> ${__("Close Manifest")}
+            </button>`;
         }
 
         $c.html(`
@@ -1093,6 +1102,9 @@ class DeliveryApp {
                      data-name="${frappe.utils.escape_html(m.name)}">
                     <span><i class="fa fa-file-text-o"></i> ${frappe.utils.escape_html(m.name)}</span>
                     <span class="da-card-status da-status-${(m.status || "").toLowerCase().replace(/\s+/g, "-")}">${frappe.utils.escape_html(m.status)}</span>
+                    ${["Delivered", "Received", "Partially Received"].includes(m.status)
+                        ? `<button class="btn btn-xs btn-success da-stop-manifest-close-btn" data-name="${frappe.utils.escape_html(m.name)}"><i class="fa fa-archive"></i> ${__("Close")}</button>`
+                        : ""}
                 </div>`).join("");
 
             let can_arrive = (t.status === "Started" && s.status === "Pending");
@@ -1120,7 +1132,8 @@ class DeliveryApp {
         // Trip-level action buttons
         let action_html = "";
         if (t.status === "Assigned") {
-            action_html += `<button id="da-trip-start-btn" class="btn btn-primary btn-lg btn-block da-action-btn"><i class="fa fa-play"></i> ${__("Start Trip")}</button>`;
+            action_html += `<button id="da-trip-accept-btn" class="btn btn-primary btn-lg btn-block da-action-btn"><i class="fa fa-check-circle"></i> ${__("Accept Trip")}</button>`;
+            action_html += `<button id="da-trip-reject-btn" class="btn btn-danger btn-sm btn-block da-action-btn"><i class="fa fa-ban"></i> ${__("Reject Trip")}</button>`;
         } else if (t.status === "Started") {
             let all_done = (t.stops || []).every((s) => s.status === "Completed" || s.status === "Skipped");
             action_html += `<button id="da-trip-complete-btn" class="btn btn-success btn-lg btn-block da-action-btn" ${all_done ? "" : "disabled"}><i class="fa fa-flag-checkered"></i> ${__("Complete Trip")}</button>`;
@@ -1343,6 +1356,57 @@ class DeliveryApp {
         });
     }
 
+    do_trip_accept() {
+        frappe.confirm(__("Accept this trip and start now?"), () => {
+            frappe.call({
+                method: TRIP_API + "driver_accept_trip",
+                args: { trip: this.active_trip },
+                callback: () => {
+                    frappe.show_alert({ message: __("Trip accepted"), indicator: "green" });
+                    this.show_trip_detail(this.active_trip);
+                    this.load_data();
+                },
+            });
+        });
+    }
+
+    do_trip_reject() {
+        frappe.prompt(
+            [
+                {
+                    fieldname: "reason",
+                    fieldtype: "Select",
+                    label: __("Reason"),
+                    options: "Vehicle Issue\nCapacity Full\nRoute Constraint\nPersonal Emergency\nOther",
+                    reqd: 1,
+                },
+                {
+                    fieldname: "notes",
+                    fieldtype: "Small Text",
+                    label: __("Notes"),
+                },
+            ],
+            (values) => {
+                frappe.call({
+                    method: TRIP_API + "driver_reject_trip",
+                    args: {
+                        trip: this.active_trip,
+                        reason: values.reason,
+                        notes: values.notes,
+                    },
+                    callback: () => {
+                        frappe.show_alert({ message: __("Trip rejected"), indicator: "orange" });
+                        this.active_trip = null;
+                        this.render_content();
+                        this.load_data();
+                    },
+                });
+            },
+            __("Reject Trip"),
+            __("Confirm")
+        );
+    }
+
     do_trip_complete() {
         frappe.confirm(__("Complete this trip?"), () => {
             frappe.call({
@@ -1351,6 +1415,22 @@ class DeliveryApp {
                 callback: () => {
                     frappe.show_alert({ message: __("Trip completed"), indicator: "green" });
                     this.show_trip_detail(this.active_trip);
+                    this.load_data();
+                },
+            });
+        });
+    }
+
+    do_manifest_close(manifest_name) {
+        if (!manifest_name) return;
+        frappe.confirm(__("Close manifest {0}?", [manifest_name]), () => {
+            frappe.call({
+                method: API + "driver_close_manifest",
+                args: { manifest: manifest_name },
+                callback: () => {
+                    frappe.show_alert({ message: __("Manifest closed"), indicator: "green" });
+                    if (this.active_trip) this.show_trip_detail(this.active_trip);
+                    if (this.active_manifest === manifest_name) this.show_manifest_detail(manifest_name);
                     this.load_data();
                 },
             });

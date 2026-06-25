@@ -482,6 +482,10 @@
     cursor: pointer;
 }
 .da-stop-manifest:hover { background: var(--bg-gray, #eee); }
+.da-stop-manifest .da-stop-manifest-close-btn {
+    margin-left: 8px;
+    flex-shrink: 0;
+}
 .da-stop-actions { display: flex; gap: 8px; flex-wrap: wrap; }
 .da-stop-actions .btn { flex: 1; min-width: 110px; }
 

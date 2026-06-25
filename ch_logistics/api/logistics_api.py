@@ -53,6 +53,7 @@ def trip_create(trip_date, company, route=None, driver=None, vehicle=None,
     if route:
         doc.route = route
     if driver:
+        _ensure_single_active_trip_for_driver(driver)
         doc.driver = driver
         doc.status = "Assigned"
     if vehicle:
@@ -76,6 +77,7 @@ def trip_assign_driver(trip, driver, vehicle=None):
     doc = frappe.get_doc("CH Logistics Trip", trip)
     if doc.status not in ("Draft", "Assigned"):
         frappe.throw(_("Can only assign driver while trip is Draft or Assigned"))
+    _ensure_single_active_trip_for_driver(driver, target_trip=doc.name)
     doc.driver = driver
     if vehicle:
         doc.vehicle = vehicle
@@ -148,12 +150,75 @@ def _propagate_trip_driver_to_manifests(trip, driver, vehicle=None):
     return updated
 
 
+def _clear_trip_driver_from_manifests(trip, driver=None):
+    """Detach driver attribution from pre-pickup manifests on a trip.
+
+    Used when a trip assignment is rejected/unassigned before execution.
+    """
+    if not _has_manifest_trip_field():
+        return []
+    filters = {
+        "trip": trip,
+        "status": ["in", ["Draft", "Packed", "Assigned", "Pickup Started"]],
+    }
+    if driver:
+        filters["driver"] = driver
+    rows = frappe.get_all(
+        "CH Transfer Manifest",
+        filters=filters,
+        fields=["name", "status"],
+    )
+    updated = []
+    for r in rows:
+        payload = {
+            "driver": None,
+            "driver_name": None,
+            "driver_phone": None,
+        }
+        # Keep manifest discoverable to dispatch as pre-pickup work.
+        if r.get("status") in ("Assigned", "Pickup Started"):
+            payload["status"] = "Packed"
+        frappe.db.set_value("CH Transfer Manifest", r.name, payload, update_modified=False)
+        updated.append(r.name)
+    if updated:
+        frappe.db.commit()
+    return updated
+
+
+def _ensure_single_active_trip_for_driver(driver: str, target_trip: str | None = None):
+    """Enforce one active trip per driver at any point in time."""
+    if not driver:
+        return
+    rows = frappe.get_all(
+        "CH Logistics Trip",
+        filters={
+            "driver": driver,
+            "status": ["in", ["Assigned", "Started", "Completed"]],
+        },
+        fields=["name", "status"],
+        order_by="modified desc",
+        limit=5,
+    )
+    blocking = [
+        f"{r.name} ({r.status})"
+        for r in rows
+        if not target_trip or r.name != target_trip
+    ]
+    if blocking:
+        frappe.throw(
+            _("Driver already has an active trip: {0}. Close it before assigning a new one.").format(
+                ", ".join(blocking)
+            )
+        )
+
+
 @frappe.whitelist()
 def trip_unassign(trip):
     doc = frappe.get_doc("CH Logistics Trip", trip)
     if doc.status not in ("Assigned",):
         frappe.throw(_("Can only unassign while trip is Assigned"))
     prev_driver = doc.driver
+    _clear_trip_driver_from_manifests(doc.name, driver=prev_driver)
     doc.driver = None
     doc.vehicle = None
     doc.status = "Draft"
@@ -161,6 +226,57 @@ def trip_unassign(trip):
     if prev_driver:
         _set_driver_availability(prev_driver, "Available", None)
     return doc.name
+
+
+@frappe.whitelist()
+def driver_accept_trip(trip):
+    """Driver acceptance of an assigned trip.
+
+    Keep UX explicit: driver acknowledges assignment, then trip moves to Started.
+    """
+    doc = frappe.get_doc("CH Logistics Trip", trip)
+    if doc.status != "Assigned":
+        frappe.throw(_("Trip must be Assigned before accepting."))
+    current_driver = _resolve_current_driver()
+    if not current_driver or doc.driver != current_driver:
+        frappe.throw(_("You can only accept a trip assigned to your driver profile."))
+
+    doc.add_comment("Comment", _("Trip accepted by driver {0}.").format(current_driver))
+    doc.mark_started()
+    doc.save()
+    _set_driver_availability(current_driver, "In Transit", doc.name)
+    return {"trip": doc.name, "status": doc.status, "started_at": doc.actual_start}
+
+
+@frappe.whitelist()
+def driver_reject_trip(trip, reason, notes=None):
+    """Driver rejection of an assigned trip with mandatory reason."""
+    reason = (reason or "").strip()
+    if not reason:
+        frappe.throw(_("Reason is mandatory to reject a trip."))
+
+    doc = frappe.get_doc("CH Logistics Trip", trip)
+    if doc.status != "Assigned":
+        frappe.throw(_("Trip can be rejected only while Assigned."))
+    current_driver = _resolve_current_driver()
+    if not current_driver or doc.driver != current_driver:
+        frappe.throw(_("You can only reject a trip assigned to your driver profile."))
+
+    _clear_trip_driver_from_manifests(doc.name, driver=current_driver)
+    doc.add_comment(
+        "Comment",
+        _("Trip rejected by driver {0}. Reason: {1}{2}").format(
+            current_driver,
+            reason,
+            (f" | Notes: {notes}" if notes else ""),
+        ),
+    )
+    doc.driver = None
+    doc.vehicle = None
+    doc.status = "Draft"
+    doc.save(ignore_permissions=True)
+    _set_driver_availability(current_driver, "Available", None)
+    return {"trip": doc.name, "status": doc.status}
 
 
 @frappe.whitelist()
