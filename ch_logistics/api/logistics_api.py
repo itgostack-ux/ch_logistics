@@ -529,6 +529,11 @@ def get_trip_detail(trip):
     _has_stop_seq = _has_manifest_stop_seq_field()
     _has_shipment_priority = _has_manifest_shipment_priority_field()
     _has_box_count = _has_manifest_box_count_field()
+    manifest_meta = frappe.get_meta("CH Transfer Manifest")
+    has_pickup_lat = manifest_meta.has_field("pickup_latitude")
+    has_pickup_lng = manifest_meta.has_field("pickup_longitude")
+    has_delivery_lat = manifest_meta.has_field("delivery_latitude")
+    has_delivery_lng = manifest_meta.has_field("delivery_longitude")
     manifest_fields = [
         "name", "status",
         "source_warehouse", "destination_warehouse",
@@ -543,6 +548,14 @@ def get_trip_detail(trip):
         manifest_fields.insert(2, "stop_sequence")
     if _has_manifest_direction_field():
         manifest_fields.insert(2, "direction")
+    if has_pickup_lat:
+        manifest_fields.append("pickup_latitude")
+    if has_pickup_lng:
+        manifest_fields.append("pickup_longitude")
+    if has_delivery_lat:
+        manifest_fields.append("delivery_latitude")
+    if has_delivery_lng:
+        manifest_fields.append("delivery_longitude")
 
     manifests = frappe.get_all(
         "CH Transfer Manifest",

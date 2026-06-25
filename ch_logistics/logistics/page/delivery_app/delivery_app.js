@@ -957,6 +957,86 @@ class DeliveryApp {
         if (!t) return;
         let status_cls = (t.status || "").toLowerCase().replace(/\s+/g, "-");
 
+        const to_num = (v) => {
+            let n = parseFloat(v);
+            return Number.isFinite(n) ? n : null;
+        };
+        const valid_latlng = (lat, lng) => (
+            lat !== null && lng !== null
+            && Math.abs(lat) <= 90 && Math.abs(lng) <= 180
+            && !(lat === 0 && lng === 0)
+        );
+
+        const manifest_pickup_by_stop = {};
+        const manifest_drop_by_stop = {};
+        for (let m of (t.manifests || [])) {
+            let key = m.stop_sequence || 0;
+            if (!key) continue;
+            let p_lat = to_num(m.pickup_latitude);
+            let p_lng = to_num(m.pickup_longitude);
+            let d_lat = to_num(m.delivery_latitude);
+            let d_lng = to_num(m.delivery_longitude);
+            if (!manifest_pickup_by_stop[key] && valid_latlng(p_lat, p_lng)) {
+                manifest_pickup_by_stop[key] = { lat: p_lat, lng: p_lng };
+            }
+            if (!manifest_drop_by_stop[key] && valid_latlng(d_lat, d_lng)) {
+                manifest_drop_by_stop[key] = { lat: d_lat, lng: d_lng };
+            }
+        }
+
+        const map_points = [];
+        for (let s of (t.stops || [])) {
+            let lat = to_num(s.gps_lat);
+            let lng = to_num(s.gps_lng);
+            if (!valid_latlng(lat, lng)) {
+                let fallback = null;
+                if ((s.stop_type || "").toLowerCase() === "pickup") {
+                    fallback = manifest_pickup_by_stop[s.sequence] || manifest_drop_by_stop[s.sequence];
+                } else {
+                    fallback = manifest_drop_by_stop[s.sequence] || manifest_pickup_by_stop[s.sequence];
+                }
+                if (fallback) {
+                    lat = fallback.lat;
+                    lng = fallback.lng;
+                }
+            }
+            if (valid_latlng(lat, lng)) {
+                map_points.push({
+                    seq: s.sequence,
+                    label: s.store || s.warehouse || "Stop",
+                    lat,
+                    lng,
+                });
+            }
+        }
+
+        let map_html = "";
+        if (map_points.length) {
+            const marker_param = map_points
+                .map((p) => `${encodeURIComponent(p.lat + "," + p.lng)}`)
+                .join("|");
+            const center = map_points[0];
+            const src = `https://maps.google.com/maps?q=${encodeURIComponent(center.lat + "," + center.lng)}&z=11&output=embed&markers=${marker_param}`;
+            const links = map_points.map((p) => {
+                const text = `#${p.seq} ${frappe.utils.escape_html(p.label)}`;
+                const href = `https://maps.google.com/?q=${encodeURIComponent(p.lat + "," + p.lng)}`;
+                return `<a class="da-map-link" target="_blank" rel="noopener" href="${href}">${text}</a>`;
+            }).join("");
+
+            map_html = `<div class="da-trip-map-wrap">
+                <h5><i class="fa fa-map"></i> ${__("Trip Map")}</h5>
+                <div class="da-trip-map-frame">
+                    <iframe title="Trip map" src="${src}" loading="lazy" referrerpolicy="no-referrer-when-downgrade"></iframe>
+                </div>
+                <div class="da-map-links">${links}</div>
+            </div>`;
+        } else {
+            map_html = `<div class="da-trip-map-wrap">
+                <h5><i class="fa fa-map"></i> ${__("Trip Map")}</h5>
+                <div class="da-map-empty text-muted">${__("Map preview will appear after stop GPS is captured or manifests include coordinates.")}</div>
+            </div>`;
+        }
+
         // Group manifests by stop_sequence for the stop cards.
         let manifests_by_stop = {};
         for (let m of t.manifests || []) {
@@ -1031,6 +1111,8 @@ class DeliveryApp {
                     <div class="da-stat"><span class="da-stat-val">${t.total_shipments || 0}</span><span class="da-stat-label">Shipments</span></div>
                     <div class="da-stat"><span class="da-stat-val">${frappe.utils.escape_html(t.direction || "Forward")}</span><span class="da-stat-label">Direction</span></div>
                 </div>
+
+                ${map_html}
 
                 <div class="da-detail-items">
                     <h5>${__("Stops")}</h5>
