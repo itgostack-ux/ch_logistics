@@ -821,13 +821,22 @@ class LogisticsCommandCenter {
 		frappe.confirm(
 			__("Submit manifest <b>{0}</b>? This marks it Packed and removes it from the pack queue.", [manifest]),
 			() => {
+				let target_trip = null;
 				frappe.db.get_doc("CH Transfer Manifest", manifest).then((doc) => {
+					// Set status to Packed so it moves into Operations unassigned manifests queue
+					doc.status = "Packed";
+					target_trip = doc.trip || null;
 					return frappe.call({
 						method: "frappe.client.submit",
 						args: { doc },
 					});
 				}).then(() => {
-					frappe.show_alert({ message: __("Manifest {0} marked Packed", [manifest]), indicator: "green" }, 5);
+					// Tell the user where the manifest landed so they can find
+					// it in Operations (unassigned queue vs. existing trip).
+					const msg = target_trip
+						? __("Manifest {0} marked Packed. Visible under trip {1} in Operations.", [manifest, target_trip])
+						: __("Manifest {0} marked Packed. Available in Operations → Unassigned Manifests.", [manifest]);
+					frappe.show_alert({ message: msg, indicator: "green" }, 7);
 					this._pack_load();
 				}).catch((err) => {
 					frappe.show_alert({ message: __("Submit failed: {0}", [err && err.message ? err.message : __("see log")]), indicator: "red" }, 7);

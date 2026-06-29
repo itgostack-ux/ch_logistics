@@ -785,23 +785,59 @@ def _require_ops():
 
 @frappe.whitelist()
 def ops_board(trip_date=None, include_days=1):
-    """Trips for the day grouped by status, with light KPI summary."""
+    """Trips for the day grouped by status, with light KPI summary.
+
+    In addition to date-windowed trips, always surface every Draft
+    trip (the dispatcher's backlog) regardless of trip_date.  Draft
+    trips with stale or missing planned dates are precisely the ones
+    that need scheduling — hiding them behind the date filter created
+    the bug where freshly Packed manifests attached to a stale-dated
+    Draft trip "vanished" from Operations.  Mirrors SAP TM Freight
+    Order Cockpit / Oracle TM Transportation Cockpit behaviour where
+    every un-dispatched freight order stays in the cockpit until it is
+    either scheduled + assigned or cancelled.
+    """
     _require_ops()
     trip_date = trip_date or frappe.utils.today()
     end_date = frappe.utils.add_days(trip_date, max(cint(include_days) - 1, 0))
 
-    rows = frappe.get_all(
+    fields = [
+        "name", "trip_date", "status", "direction", "route",
+        "hub_warehouse", "driver", "driver_name", "vehicle_number",
+        "planned_start", "planned_end", "actual_start", "actual_end",
+        "total_shipments",
+    ]
+
+    dated_rows = frappe.get_all(
         "CH Logistics Trip",
         filters={"trip_date": ["between", [trip_date, end_date]]},
-        fields=[
-            "name", "trip_date", "status", "direction", "route",
-            "hub_warehouse", "driver", "driver_name", "vehicle_number",
-            "planned_start", "planned_end", "actual_start", "actual_end",
-            "total_shipments",
-        ],
+        fields=fields,
         order_by="trip_date asc, planned_start asc, name asc",
         limit=200,
     )
+
+    # Backlog: Draft trips outside the date window (un-scheduled or
+    # carrying a stale planned date).  Returned regardless of the date
+    # filter so the dispatcher can schedule + assign drivers.  Cap
+    # separately so a huge backlog can't crowd out today's view.
+    dated_names = {r.name for r in dated_rows}
+    backlog_rows = frappe.get_all(
+        "CH Logistics Trip",
+        filters={"status": "Draft", "name": ["not in", list(dated_names) or [""]]},
+        fields=fields,
+        order_by="creation desc, name asc",
+        limit=50,
+    )
+
+    # Merge while keeping order: dated first, then backlog.  Dedupe by
+    # name in case a trip qualifies for both.
+    seen = set()
+    rows = []
+    for r in dated_rows + backlog_rows:
+        if r.name in seen:
+            continue
+        seen.add(r.name)
+        rows.append(r)
 
     # Count open exceptions per trip in one query
     exc_rows = frappe.db.sql(
