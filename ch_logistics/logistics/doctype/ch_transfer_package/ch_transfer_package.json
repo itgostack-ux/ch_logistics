@@ -6,8 +6,15 @@
  "engine": "InnoDB",
  "field_order": [
   "package_label",
+  "packed_qty",
   "col_break_1",
   "weight_kg",
+  "dimensions_cm",
+  "seal_number",
+  "sec_break_meta",
+  "packed_by",
+  "col_break_meta",
+  "packed_at",
   "sec_break_photo",
   "packing_photo",
   "notes"
@@ -17,8 +24,16 @@
    "fieldname": "package_label",
    "fieldtype": "Data",
    "in_list_view": 1,
-   "label": "Package Label",
+   "label": "Package Label / LPN",
+   "description": "License Plate Number — auto-generated per box (e.g. TM-NNN-B01).",
    "reqd": 1
+  },
+  {
+   "fieldname": "packed_qty",
+   "fieldtype": "Int",
+   "in_list_view": 1,
+   "label": "Packed Qty",
+   "description": "Number of item units physically packed into this box."
   },
   {
    "fieldname": "col_break_1",
@@ -31,8 +46,44 @@
    "label": "Weight (kg)"
   },
   {
+   "fieldname": "dimensions_cm",
+   "fieldtype": "Data",
+   "label": "Dimensions (LxWxH cm)",
+   "description": "For courier dimensional weight, e.g. 30x20x15."
+  },
+  {
+   "fieldname": "seal_number",
+   "fieldtype": "Data",
+   "label": "Seal / Tamper Tag"
+  },
+  {
+   "fieldname": "sec_break_meta",
+   "fieldtype": "Section Break",
+   "label": "Pack Audit",
+   "collapsible": 1
+  },
+  {
+   "fieldname": "packed_by",
+   "fieldtype": "Link",
+   "options": "User",
+   "label": "Packed By",
+   "read_only": 1
+  },
+  {
+   "fieldname": "col_break_meta",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "packed_at",
+   "fieldtype": "Datetime",
+   "label": "Packed At",
+   "read_only": 1
+  },
+  {
    "fieldname": "sec_break_photo",
-   "fieldtype": "Section Break"
+   "fieldtype": "Section Break",
+   "label": "Packing Photo",
+   "collapsible": 1
   },
   {
    "fieldname": "packing_photo",

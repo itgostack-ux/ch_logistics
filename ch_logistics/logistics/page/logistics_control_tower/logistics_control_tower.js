@@ -43,6 +43,7 @@ class LogisticsCommandCenter {
 		this.unassigned = [];
 		this.exceptions = [];
 		this.drivers = [];
+		this.recalls = [];
 		this.selected_manifests = new Set();
 		this.active_trip = null;
 		this._leaflet_loading = null;
@@ -85,6 +86,9 @@ class LogisticsCommandCenter {
 					<button class="lcc-mode-btn" data-mode="overview">
 						<i class="fa fa-tachometer"></i> ${__("Overview")}
 					</button>
+					<button class="lcc-mode-btn" data-mode="packing">
+						<i class="fa fa-cube"></i> ${__("Packing")}
+					</button>
 					<button class="lcc-mode-btn" data-mode="ops">
 						<i class="fa fa-sitemap"></i> ${__("Operations")}
 					</button>
@@ -110,6 +114,10 @@ class LogisticsCommandCenter {
 		if (mode === "overview") {
 			$("#lcc-live-badge").show();
 			this._ov_init();
+		} else if (mode === "packing") {
+			$("#lcc-live-badge").hide();
+			this._stop_auto_refresh();
+			this._pack_init();
 		} else {
 			$("#lcc-live-badge").hide();
 			this._stop_auto_refresh();
@@ -119,6 +127,7 @@ class LogisticsCommandCenter {
 
 	refresh() {
 		if (this.mode === "overview") this._ov_load();
+		else if (this.mode === "packing") this._pack_load();
 		else this._ops_load();
 	}
 
@@ -602,6 +611,232 @@ class LogisticsCommandCenter {
 	}
 
 	// ══════════════════════════════════════════════════════════════
+	// PACKING MODE
+	// Oracle WMS Cloud / Manhattan Active WMS-style "Pack Station Work
+	// Queue".  Lists every Draft manifest with running packing progress
+	// (cartons, packed qty, total weight, last packer) and lets the
+	// packer mint cartons or hand the manifest off to dispatch without
+	// opening the form.
+	// ══════════════════════════════════════════════════════════════
+
+	_pack_init() {
+		$("#lcc-content").html(`
+			<div class="lcc-pack" id="lcc-pack">
+				<div class="lcc-pack-howto">
+					<div class="lcc-pack-howto-title">
+						<i class="fa fa-cube"></i> ${__("Pack Station")}
+					</div>
+					<ol class="lcc-pack-steps">
+						<li><b>${__("Create manifest")}</b> — ${__("draft a CH Transfer Manifest and attach the Stock Entries for this load.")}</li>
+						<li><b>${__("Move to pack station")}</b> — ${__("stage the SKUs at the carton table; print the manifest's Box Label sheet if needed.")}</li>
+						<li><b>${__("Click Pack Box for each carton")}</b> — ${__("enter qty, weight, dimensions, seal & photo. The system mints a unique LPN like TM-2026-00025-B01.")}</li>
+						<li><b>${__("Box count auto-updates")}</b> — ${__("the manifest, list view, and command-tower KPIs all reflect the running carton count in real time.")}</li>
+					</ol>
+				</div>
+				<div class="lcc-ops-bar">
+					<div class="lcc-ops-bar-actions">
+						<button class="btn btn-xs btn-default lcc-pack-refresh-btn">
+							<i class="fa fa-refresh"></i> ${__("Refresh")}
+						</button>
+						<button class="btn btn-xs btn-primary lcc-pack-new-manifest-btn">
+							<i class="fa fa-plus"></i> ${__("New Manifest")}
+						</button>
+					</div>
+					<span class="lcc-muted lcc-ops-bar-hint">
+						<i class="fa fa-info-circle"></i>
+						${__("Showing all Draft manifests awaiting carton-level packing. Submit moves them to Packed and out of this queue.")}
+					</span>
+				</div>
+				<div class="lcc-pack-body" id="lcc-pack-body">
+					<div class="lcc-loading"><i class="fa fa-spinner fa-spin"></i> ${__("Loading pack queue…")}</div>
+				</div>
+			</div>
+		`);
+		if (!this._pack_events_bound) {
+			const $r = this.$root;
+			$r.on("click", ".lcc-pack-refresh-btn",      () => this._pack_load());
+			$r.on("click", ".lcc-pack-new-manifest-btn", () => frappe.new_doc("CH Transfer Manifest"));
+			$r.on("click", ".lcc-pack-add-box",          (e) => { e.preventDefault(); this._pack_open_dialog($(e.currentTarget).data("name")); });
+			$r.on("click", ".lcc-pack-submit",           (e) => { e.preventDefault(); this._pack_submit_manifest($(e.currentTarget).data("name")); });
+			$r.on("click", ".lcc-pack-open",             (e) => { e.preventDefault(); frappe.set_route("Form", "CH Transfer Manifest", $(e.currentTarget).data("name")); });
+			this._pack_events_bound = true;
+		}
+		this._pack_load();
+	}
+
+	async _pack_load() {
+		const $b = $("#lcc-pack-body");
+		$b.html(`<div class="lcc-loading"><i class="fa fa-spinner fa-spin"></i> ${__("Loading pack queue…")}</div>`);
+		try {
+			const r = await frappe.call({ method: _LCC + "ops_packing_queue", args: { limit: 100 } });
+			this.pack_queue = r.message || [];
+			this._pack_render();
+		} catch (e) {
+			$b.html(`<div class="lcc-empty"><i class="fa fa-exclamation-triangle"></i> ${__("Failed to load pack queue.")}</div>`);
+		}
+	}
+
+	_pack_render() {
+		const $b = $("#lcc-pack-body");
+		if (!(this.pack_queue || []).length) {
+			$b.html(`<div class="lcc-empty"><i class="fa fa-check-circle"></i> ${__("No Draft manifests in the pack queue. Create one to get started.")}</div>`);
+			return;
+		}
+		const rows = this.pack_queue.map((m) => {
+			const nm = frappe.utils.escape_html(m.name);
+			const total_qty   = Number(m.total_qty || 0);
+			const packed_qty  = Number(m.pkg_packed_qty || 0);
+			const remaining   = Number(m.pkg_remaining_qty || 0);
+			const box_count   = Number(m.pkg_box_count || m.box_count || 0);
+			const weight      = Number(m.pkg_total_weight_kg || 0);
+			const pct         = total_qty > 0 ? Math.min(100, Math.round((packed_qty / total_qty) * 100)) : 0;
+
+			let prog_cls = "lcc-pack-prog-low";
+			if (pct >= 100) prog_cls = "lcc-pack-prog-done";
+			else if (pct >= 50) prog_cls = "lcc-pack-prog-mid";
+
+			let age_cls = "lcc-sev-low";
+			if (m.age_hours != null) {
+				if (m.age_hours >= 48) age_cls = "lcc-sev-critical";
+				else if (m.age_hours >= 24) age_cls = "lcc-sev-high";
+				else if (m.age_hours >= 8) age_cls = "lcc-sev-medium";
+			}
+			const age = (m.age_hours == null) ? "—" : `${m.age_hours}h`;
+
+			const can_submit  = (pct >= 100 && box_count > 0);
+			const submit_btn  = `<button class="btn btn-xs btn-success lcc-pack-submit" data-name="${nm}" ${can_submit ? "" : "disabled"}
+				title="${can_submit ? __("Mark Packed & submit") : __("Pack remaining qty to enable submit")}">
+				<i class="fa fa-check"></i> ${__("Mark Packed")}
+			</button>`;
+
+			return `<tr>
+				<td>
+					<a href="#" class="lcc-pack-open" data-name="${nm}">${nm}</a>
+					<div class="lcc-muted">${m.manifest_date ? frappe.datetime.str_to_user(m.manifest_date) : ""}</div>
+				</td>
+				<td>
+					${frappe.utils.escape_html(m.source_warehouse || "—")}
+					<div class="lcc-muted">→ ${frappe.utils.escape_html(m.destination_warehouse || "—")}</div>
+				</td>
+				<td class="tr">${m.total_stock_entries || 0}</td>
+				<td class="tr">${total_qty}</td>
+				<td class="tr"><b>${packed_qty}</b> <span class="lcc-muted">/ ${total_qty}</span></td>
+				<td class="tr"><b>${remaining}</b></td>
+				<td class="tr">${box_count}</td>
+				<td class="tr">${weight ? weight.toFixed(1) + " kg" : "—"}</td>
+				<td>
+					<div class="lcc-pack-prog-wrap"><div class="lcc-pack-prog ${prog_cls}" style="width:${pct}%"></div></div>
+					<div class="lcc-muted lcc-pack-pct">${pct}%</div>
+				</td>
+				<td><span class="lcc-sev ${age_cls}">${age}</span></td>
+				<td>
+					<button class="btn btn-xs btn-primary lcc-pack-add-box" data-name="${nm}">
+						<i class="fa fa-plus"></i> ${__("Pack Box")}
+					</button>
+					${submit_btn}
+				</td>
+			</tr>`;
+		}).join("");
+
+		$b.html(`
+			<div class="lcc-table-wrap"><table class="lcc-table lcc-pack-table">
+				<thead><tr>
+					<th>${__("Manifest")}</th>
+					<th>${__("Lane")}</th>
+					<th class="tr">${__("SE")}</th>
+					<th class="tr">${__("Total Qty")}</th>
+					<th class="tr">${__("Packed")}</th>
+					<th class="tr">${__("Remaining")}</th>
+					<th class="tr">${__("Boxes")}</th>
+					<th class="tr">${__("Weight")}</th>
+					<th style="width:140px">${__("Progress")}</th>
+					<th>${__("Age")}</th>
+					<th style="width:220px">${__("Action")}</th>
+				</tr></thead>
+				<tbody>${rows}</tbody>
+			</table></div>
+		`);
+	}
+
+	_pack_open_dialog(manifest) {
+		const row = (this.pack_queue || []).find((m) => m.name === manifest) || {};
+		const next_seq = (Number(row.pkg_box_count || row.box_count || 0)) + 1;
+		const suggested_label = `${manifest}-B${String(next_seq).padStart(2, "0")}`;
+		const total_qty = Number(row.total_qty || 0);
+		const packed_so_far = Number(row.pkg_packed_qty || 0);
+		const remaining = Math.max(0, total_qty - packed_so_far);
+
+		const d = new frappe.ui.Dialog({
+			title: __("Pack Box — {0}", [suggested_label]),
+			fields: [
+				{
+					fieldname: "summary_html",
+					fieldtype: "HTML",
+					options: `<div class="alert alert-info" style="padding:8px 12px;border-radius:6px;background:#d1ecf1;border:1px solid #bee5eb;font-size:13px">
+						<b>${__("Manifest")}:</b> ${frappe.utils.escape_html(manifest)} &middot;
+						<b>${__("Total qty")}:</b> ${total_qty} &middot;
+						<b>${__("Packed")}:</b> ${packed_so_far} &middot;
+						<b>${__("Remaining")}:</b> ${remaining}
+					</div>`,
+				},
+				{ fieldname: "packed_qty", fieldtype: "Int", label: __("Packed Qty"), reqd: 1,
+				  default: remaining || null,
+				  description: __("How many item units are physically in this box?") },
+				{ fieldname: "weight_kg", fieldtype: "Float", label: __("Weight (kg)") },
+				{ fieldname: "dimensions_cm", fieldtype: "Data", label: __("Dimensions (LxWxH cm)"),
+				  description: __("Optional — used for courier dimensional weight, e.g. 30x20x15") },
+				{ fieldname: "col_break", fieldtype: "Column Break" },
+				{ fieldname: "seal_number", fieldtype: "Data", label: __("Seal / Tamper Tag") },
+				{ fieldname: "packing_photo", fieldtype: "Attach Image", label: __("Packing Photo") },
+				{ fieldname: "notes", fieldtype: "Small Text", label: __("Notes") },
+			],
+			primary_action_label: __("Add Box"),
+			primary_action: (values) => {
+				frappe.call({
+					method: "ch_logistics.api.transfer_manifest_api.pack_box",
+					args: {
+						manifest,
+						packed_qty: values.packed_qty,
+						weight_kg: values.weight_kg,
+						dimensions_cm: values.dimensions_cm,
+						seal_number: values.seal_number,
+						packing_photo: values.packing_photo,
+						notes: values.notes,
+					},
+				}).then((r) => {
+					d.hide();
+					const m = r.message || {};
+					frappe.show_alert({
+						message: __("Box {0} packed ({1} units).", [m.package_label || suggested_label, values.packed_qty || 0]),
+						indicator: "green",
+					}, 5);
+					this._pack_load();
+				});
+			},
+		});
+		d.show();
+	}
+
+	_pack_submit_manifest(manifest) {
+		frappe.confirm(
+			__("Submit manifest <b>{0}</b>? This marks it Packed and removes it from the pack queue.", [manifest]),
+			() => {
+				frappe.db.get_doc("CH Transfer Manifest", manifest).then((doc) => {
+					return frappe.call({
+						method: "frappe.client.submit",
+						args: { doc },
+					});
+				}).then(() => {
+					frappe.show_alert({ message: __("Manifest {0} marked Packed", [manifest]), indicator: "green" }, 5);
+					this._pack_load();
+				}).catch((err) => {
+					frappe.show_alert({ message: __("Submit failed: {0}", [err && err.message ? err.message : __("see log")]), indicator: "red" }, 7);
+				});
+			}
+		);
+	}
+
+	// ══════════════════════════════════════════════════════════════
 	// OPERATIONS MODE
 	// ══════════════════════════════════════════════════════════════
 
@@ -625,6 +860,13 @@ class LogisticsCommandCenter {
 						<button class="btn btn-sm btn-default lcc-ops-map-btn">
 							<i class="fa fa-map-marker"></i> ${__("Map")}
 						</button>
+						<span class="lcc-ops-toolbar-divider"></span>
+						<button class="btn btn-sm btn-primary lcc-ops-new-trip-btn" title="${__("Create a new trip manually")}">
+							<i class="fa fa-plus"></i> ${__("New Trip")}
+						</button>
+						<button class="btn btn-sm btn-default lcc-ops-autoplan-btn" title="${__("Auto-plan trips from unassigned manifests")}">
+							<i class="fa fa-magic"></i> ${__("Auto-plan")}
+						</button>
 					</div>
 					<div class="lcc-ops-kpi-bar" id="lcc-ops-kpi-bar"></div>
 				</div>
@@ -642,6 +884,10 @@ class LogisticsCommandCenter {
 					<button class="lcc-tab active" data-tab="manifests">
 						<i class="fa fa-inbox"></i> ${__("Unassigned Manifests")}
 						<span class="lcc-tab-badge" id="lcc-cnt-mf">0</span>
+					</button>
+					<button class="lcc-tab" data-tab="recalls">
+						<i class="fa fa-undo"></i> ${__("Recalls")}
+						<span class="lcc-tab-badge lcc-tab-badge-warn" id="lcc-cnt-rec">0</span>
 					</button>
 					<button class="lcc-tab" data-tab="exceptions">
 						<i class="fa fa-exclamation-triangle"></i> ${__("Exception Inbox")}
@@ -665,6 +911,19 @@ class LogisticsCommandCenter {
 		$r.on("change", ".lcc-ops-days",    (e) => { this.include_days = parseInt($(e.currentTarget).val()) || 1; this._ops_load(); });
 		$r.on("click",  ".lcc-ops-refresh-btn", () => this._ops_load());
 		$r.on("click",  ".lcc-ops-map-btn", () => this._ops_map_toggle());
+		$r.on("click",  ".lcc-ops-new-trip-btn", () => this._dlg_new_trip());
+		$r.on("click",  ".lcc-ops-autoplan-btn", () => this._dlg_auto_plan());
+		$r.on("click",  ".lcc-empty-new-trip", () => this._dlg_new_trip());
+		$r.on("click",  ".lcc-empty-autoplan", () => this._dlg_auto_plan());
+		$r.on("click",  ".lcc-empty-show-manifests", () => {
+			this.bottom_tab = "manifests";
+			this.$root.find(".lcc-ops-tabs .lcc-tab").removeClass("active");
+			this.$root.find('.lcc-ops-tabs .lcc-tab[data-tab="manifests"]').addClass("active");
+			this._ops_render_bottom();
+			const el = document.getElementById("lcc-ops-bottom");
+			if (el && el.scrollIntoView) el.scrollIntoView({ behavior: "smooth", block: "start" });
+		});
+		$r.on("click",  ".lcc-new-trip-from-sel", () => this._ops_new_trip_from_selection());
 
 		$r.on("click", ".lcc-ops-tabs .lcc-tab", (e) => {
 			this.bottom_tab = $(e.currentTarget).data("tab");
@@ -685,6 +944,14 @@ class LogisticsCommandCenter {
 		$r.on("click",  "#lcc-side-cancel",   () => this._ops_trip_action("trip_unassign"));
 		$r.on("click",  ".lcc-side-detach",   (e) => this._ops_detach_manifest($(e.currentTarget).data("name")));
 		$r.on("click",  ".lcc-trip-link",     (e) => { e.preventDefault(); this._ops_open_trip($(e.currentTarget).data("name")); });
+
+		// Per-row print actions for the Operations → Manifests panel.
+		$r.on("click", ".lcc-mf-print-box",     (e) => { e.preventDefault(); this._ops_print_manifest($(e.currentTarget).data("name"), "CH Transfer Manifest Label"); });
+		$r.on("click", ".lcc-mf-print-receipt", (e) => { e.preventDefault(); this._ops_print_manifest($(e.currentTarget).data("name"), "ePOD Transfer Manifest"); });
+		$r.on("click", ".lcc-mf-print-ewb",     (e) => { e.preventDefault(); this._ops_print_ewaybills($(e.currentTarget).data("name")); });
+
+		// Recalls inbox — confirm physical return + reverse stock.
+		$r.on("click", ".lcc-rec-confirm",      (e) => { e.preventDefault(); this._ops_confirm_recall_return($(e.currentTarget).data("name")); });
 	}
 
 	async _ops_load() {
@@ -692,17 +959,19 @@ class LogisticsCommandCenter {
 		const args_board = { trip_date: this.trip_date, include_days: this.include_days };
 		if (co) args_board.company = co;
 
-		const [b, u, x, d] = await Promise.all([
+		const [b, u, x, d, rc] = await Promise.all([
 			frappe.call({ method: _LCC + "ops_board",              args: args_board }),
 			frappe.call({ method: _LCC + "ops_unassigned_manifests", args: { limit: 100 } }),
 			frappe.call({ method: _LCC + "ops_exception_inbox",     args: { resolution_status: "Open", limit: 100 } }),
 			frappe.call({ method: _LCC + "ops_drivers_available" }),
+			frappe.call({ method: _LCC + "ops_recall_inbox",        args: { limit: 100 } }),
 		]);
 
 		this.board      = b.message || { buckets: {}, totals: {} };
 		this.unassigned = u.message || [];
 		this.exceptions = x.message || [];
 		this.drivers    = d.message || [];
+		this.recalls    = rc.message || [];
 		this.selected_manifests.clear();
 
 		this._ops_render_board();
@@ -732,7 +1001,29 @@ class LogisticsCommandCenter {
 		const $board = $("#lcc-ops-board").empty();
 
 		if (!ORDER.some((s) => (buckets[s] || []).length > 0)) {
-			$board.html(`<div class="lcc-empty"><i class="fa fa-calendar-times-o"></i> ${__("No trips for this period.")}</div>`);
+			const unassigned_n = (this.unassigned || []).length;
+			const hint = unassigned_n > 0
+				? `<div class="lcc-empty-hint">
+						<i class="fa fa-info-circle"></i>
+						${__("{0} unassigned manifest(s) are waiting to be dispatched.", [`<b>${unassigned_n}</b>`])}
+						<button class="lcc-link-btn lcc-empty-show-manifests">${__("View manifests")} <i class="fa fa-arrow-down"></i></button>
+					</div>`
+				: "";
+			$board.html(`
+				<div class="lcc-empty lcc-empty-state">
+					<i class="fa fa-truck"></i>
+					<div class="lcc-empty-title">${__("No trips scheduled for this period")}</div>
+					<div class="lcc-empty-sub">${__("Start by creating a trip manually, or auto-plan trips from unassigned manifests.")}</div>
+					<div class="lcc-empty-actions">
+						<button class="btn btn-primary lcc-empty-new-trip">
+							<i class="fa fa-plus"></i> ${__("Create Trip")}
+						</button>
+						<button class="btn btn-default lcc-empty-autoplan">
+							<i class="fa fa-magic"></i> ${__("Auto-plan from Manifests")}
+						</button>
+					</div>
+					${hint}
+				</div>`);
 			return;
 		}
 		ORDER.forEach((status) => {
@@ -772,44 +1063,138 @@ class LogisticsCommandCenter {
 
 	_ops_render_bottom() {
 		const exc_cnt = this.exceptions.length;
+		const rec_cnt = (this.recalls || []).length;
 		$("#lcc-cnt-mf").text(this.unassigned.length);
 		$("#lcc-cnt-exc").text(exc_cnt).toggleClass("has-items", exc_cnt > 0);
+		$("#lcc-cnt-rec").text(rec_cnt).toggleClass("has-items", rec_cnt > 0);
 		$("#lcc-cnt-drv").text(this.drivers.length);
 
 		const $b = $("#lcc-ops-bottom").empty();
 		if (this.bottom_tab === "manifests")  return this._ops_render_manifests($b);
+		if (this.bottom_tab === "recalls")    return this._ops_render_recalls($b);
 		if (this.bottom_tab === "exceptions") return this._ops_render_exceptions($b);
 		if (this.bottom_tab === "drivers")    return this._ops_render_drivers($b);
 	}
 
 	_ops_render_manifests($b) {
 		if (!this.unassigned.length) {
-			$b.html(`<div class="lcc-empty"><i class="fa fa-check-circle"></i> ${__("No unassigned manifests.")}</div>`);
+			$b.html(`<div class="lcc-empty"><i class="fa fa-check-circle"></i> ${__("No manifests waiting to be attached. (Only Draft / Packed manifests appear here — anything already in motion is hidden.)")}</div>`);
 			return;
 		}
-		const rows = this.unassigned.map((m) => `<tr>
+		// Status pill colours — mirror form indicator map.
+		const STATUS_COLOR = { "Draft": "gray", "Packed": "blue" };
+		const rows = this.unassigned.map((m) => {
+			const color = STATUS_COLOR[m.status] || "gray";
+			const status = frappe.utils.escape_html(m.status || "—");
+			const nm = encodeURIComponent(m.name);
+			return `<tr>
 			<td><input type="checkbox" class="lcc-mf-check" data-name="${m.name}"></td>
-			<td><a href="/app/ch-transfer-manifest/${m.name}" target="_blank">${frappe.utils.escape_html(m.name)}</a></td>
+			<td><a href="/app/ch-transfer-manifest/${nm}" target="_blank">${frappe.utils.escape_html(m.name)}</a></td>
+			<td><span class="indicator-pill ${color}">${status}</span></td>
 			<td>${frappe.utils.escape_html(m.direction || "—")}</td>
 			<td><span class="lcc-prio lcc-prio-${(m.shipment_priority || "Normal").toLowerCase()}">${m.shipment_priority || "Normal"}</span></td>
 			<td>${frappe.utils.escape_html(m.source_warehouse || "—")} → ${frappe.utils.escape_html(m.destination_warehouse || "—")}</td>
-			<td>${m.total_qty || 0}</td>
-			<td>${m.box_count || 0}</td>
+			<td class="tr">${m.total_qty || 0}</td>
+			<td class="tr">${m.box_count || 0}</td>
 			<td>${frappe.datetime.str_to_user(m.creation)}</td>
-		</tr>`).join("");
+			<td class="lcc-mf-actions">
+				<button class="btn btn-xs btn-default lcc-mf-print-box" data-name="${m.name}"
+					title="${__("Print Box Label")}"><i class="fa fa-tags"></i></button>
+				<button class="btn btn-xs btn-default lcc-mf-print-receipt" data-name="${m.name}"
+					title="${__("Print Transfer Receipt")}"><i class="fa fa-file-text-o"></i></button>
+				<button class="btn btn-xs btn-default lcc-mf-print-ewb" data-name="${m.name}"
+					title="${__("Print e-Way Bills")}"><i class="fa fa-file-pdf-o"></i></button>
+			</td>
+		</tr>`;
+		}).join("");
 
 		$b.html(`
 			<div class="lcc-ops-bar">
 				<button class="btn btn-sm btn-primary lcc-attach-btn" disabled>
 					<i class="fa fa-link"></i> ${__("Attach to Trip")} (<span class="lcc-attach-n">0</span>)
 				</button>
+				<button class="btn btn-sm btn-default lcc-new-trip-from-sel" disabled>
+					<i class="fa fa-plus"></i> ${__("Create Trip from Selected")}
+				</button>
+				<span class="lcc-ops-bar-spacer"></span>
+				<span class="lcc-muted lcc-ops-bar-hint">${__("Only open manifests (Draft / Packed) are listed. Use the icons on the right to print labels, transfer receipts and e-Way Bills before dispatch.")}</span>
 			</div>
 			<div class="lcc-table-wrap"><table class="lcc-table">
 				<thead><tr>
 					<th style="width:32px"></th>
-					<th>${__("Manifest")}</th><th>${__("Dir")}</th><th>${__("Priority")}</th>
+					<th>${__("Manifest")}</th>
+					<th>${__("Status")}</th>
+					<th>${__("Dir")}</th><th>${__("Priority")}</th>
 					<th>${__("Route")}</th><th class="tr">${__("Qty")}</th>
 					<th class="tr">${__("Boxes")}</th><th>${__("Created")}</th>
+					<th style="width:120px">${__("Actions")}</th>
+				</tr></thead>
+				<tbody>${rows}</tbody>
+			</table></div>`);
+	}
+
+	/* ── Recalls inbox ────────────────────────────────────────────
+	 * Dispatcher worklist for in-flight transfer recalls (status =
+	 * "Recall Initiated").  Equivalent to SAP TM's Returns Cockpit /
+	 * Manhattan TMS's Returns Inbox: list every recalled manifest with
+	 * its original trip + driver + vehicle + age clock, and let the
+	 * dispatcher click "Confirm Return" once the goods physically arrive
+	 * back at the source warehouse (which reverses the Stock Entries).
+	 */
+	_ops_render_recalls($b) {
+		if (!(this.recalls || []).length) {
+			$b.html(`<div class="lcc-empty"><i class="fa fa-check-circle"></i> ${__("No open recalls. Recalled manifests appear here until physical return is confirmed at the source warehouse.")}</div>`);
+			return;
+		}
+		const rows = this.recalls.map((r) => {
+			const age = (r.recall_age_hours == null) ? "—" : `${r.recall_age_hours}h`;
+			let age_cls = "lcc-sev-low";
+			if (r.recall_age_hours != null) {
+				if (r.recall_age_hours >= 24) age_cls = "lcc-sev-critical";
+				else if (r.recall_age_hours >= 8) age_cls = "lcc-sev-high";
+				else if (r.recall_age_hours >= 2) age_cls = "lcc-sev-medium";
+			}
+			const nm = encodeURIComponent(r.name);
+			const trip_html = r.trip
+				? `<a href="#" class="lcc-trip-link" data-name="${frappe.utils.escape_html(r.trip)}">${frappe.utils.escape_html(r.trip)}</a>
+				   <div class="lcc-muted">${frappe.utils.escape_html(r.trip_status || "")}</div>`
+				: `<span class="text-muted">—</span>`;
+			const driver_html = r.driver_name
+				? `${frappe.utils.escape_html(r.driver_name)}${r.driver_phone ? ` · <a href="tel:${frappe.utils.escape_html(r.driver_phone)}">${frappe.utils.escape_html(r.driver_phone)}</a>` : ""}
+				   ${r.vehicle_number ? `<div class="lcc-muted"><i class="fa fa-truck"></i> ${frappe.utils.escape_html(r.vehicle_number)}</div>` : ""}`
+				: `<span class="text-muted">—</span>`;
+			return `<tr>
+				<td><a href="/app/ch-transfer-manifest/${nm}" target="_blank">${frappe.utils.escape_html(r.name)}</a></td>
+				<td>${trip_html}</td>
+				<td>${driver_html}</td>
+				<td>${frappe.utils.escape_html(r.source_warehouse || "—")} ← ${frappe.utils.escape_html(r.destination_warehouse || "—")}</td>
+				<td class="lcc-exc-remarks">${frappe.utils.escape_html(r.recall_reason || "—")}</td>
+				<td><span class="lcc-sev ${age_cls}">${age}</span><div class="lcc-muted">${r.recall_initiated_at ? frappe.datetime.str_to_user(r.recall_initiated_at) : ""}</div></td>
+				<td>
+					<button class="btn btn-xs btn-success lcc-rec-confirm" data-name="${r.name}"
+						title="${__("Confirm return — reverses stock entries to source warehouse")}">
+						<i class="fa fa-check"></i> ${__("Confirm Return")}
+					</button>
+				</td>
+			</tr>`;
+		}).join("");
+
+		$b.html(`
+			<div class="lcc-ops-bar">
+				<span class="lcc-muted lcc-ops-bar-hint">
+					<i class="fa fa-info-circle"></i>
+					${__("Recalled manifests stay in this inbox until source warehouse confirms physical return. Confirming return reverses the underlying Stock Entries.")}
+				</span>
+			</div>
+			<div class="lcc-table-wrap"><table class="lcc-table">
+				<thead><tr>
+					<th>${__("Manifest")}</th>
+					<th>${__("Original Trip")}</th>
+					<th>${__("Driver / Vehicle")}</th>
+					<th>${__("Returning To ← From")}</th>
+					<th>${__("Reason")}</th>
+					<th>${__("Recall Age")}</th>
+					<th style="width:160px">${__("Action")}</th>
 				</tr></thead>
 				<tbody>${rows}</tbody>
 			</table></div>`);
@@ -870,6 +1255,159 @@ class LogisticsCommandCenter {
 	_ops_update_attach() {
 		const n = this.selected_manifests.size;
 		this.$root.find(".lcc-attach-btn").prop("disabled", n === 0).find(".lcc-attach-n").text(n);
+		this.$root.find(".lcc-new-trip-from-sel").prop("disabled", n === 0);
+	}
+
+	/* ── Per-row print helpers (Operations → Manifests) ─────────
+	 * Pattern mirrors market-standard TMS cockpits (Oracle TM, SAP TM):
+	 * the dispatcher prints box labels, transfer receipts and e-Way Bills
+	 * inline from the worklist row without opening the document form.
+	 */
+	_ops_print_manifest(name, format) {
+		if (!name) return;
+		const params = new URLSearchParams({
+			doctype: "CH Transfer Manifest",
+			name: name,
+			format: format,
+			trigger_print: "1",
+			_lang: (frappe.boot && frappe.boot.lang) || "en",
+		});
+		window.open("/printview?" + params.toString(), "_blank");
+	}
+
+	_ops_print_ewaybills(name) {
+		if (!name) return;
+		const ewb_api = "ch_logistics.logistics.doctype.ch_transfer_manifest.ch_transfer_manifest.";
+		frappe.call({
+			method: ewb_api + "refresh_ewaybill_summary",
+			args: { manifest: name },
+			freeze: true,
+			freeze_message: __("Fetching e-Way Bills..."),
+			callback: (r) => {
+				const rows = r.message || [];
+				if (!rows.length) {
+					frappe.msgprint(__("No Stock Entries on this manifest."));
+					return;
+				}
+				const html = `
+					<table class="table table-bordered" style="margin-top:8px">
+						<thead><tr>
+							<th>${__("Stock Entry")}</th>
+							<th>${__("e-Way Bill")}</th>
+							<th>${__("Status")}</th>
+							<th>${__("Valid Till")}</th>
+							<th>${__("Vehicle")}</th>
+							<th>${__("Print")}</th>
+						</tr></thead>
+						<tbody>
+							${rows.map(rr => `
+								<tr>
+									<td><a href="/app/stock-entry/${encodeURIComponent(rr.stock_entry)}" target="_blank">${frappe.utils.escape_html(rr.stock_entry)}</a></td>
+									<td>${rr.ewaybill ? `<code>${frappe.utils.escape_html(rr.ewaybill)}</code>` : `<span class="text-muted">—</span>`}</td>
+									<td>${rr.status ? `<span class="indicator-pill ${rr.ewaybill ? "green" : "orange"}">${frappe.utils.escape_html(rr.status)}</span>` : ""}</td>
+									<td>${rr.ewaybill_validity || ""}</td>
+									<td>${rr.vehicle_no ? `<code>${frappe.utils.escape_html(rr.vehicle_no)}</code>` : ""}</td>
+									<td>${rr.ewaybill
+										? `<a class="btn btn-xs btn-default" href="/app/stock-entry/${encodeURIComponent(rr.stock_entry)}?print=1" target="_blank">${__("Print")}</a>`
+										: ""}</td>
+								</tr>`).join("")}
+						</tbody>
+					</table>
+					<div class="text-muted" style="margin-top:8px">
+						${__("Driver must carry one printout per Stock Entry. Click 'Print All' to open all in new tabs (allow pop-ups).")}
+					</div>
+				`;
+				const d = new frappe.ui.Dialog({
+					title: __("e-Way Bills — {0}", [name]),
+					size: "large",
+					fields: [{ fieldtype: "HTML", fieldname: "ewb_table", options: html }],
+					primary_action_label: __("Print All"),
+					primary_action: () => {
+						rows.forEach(rr => {
+							if (rr.ewaybill) {
+								window.open(`/app/stock-entry/${encodeURIComponent(rr.stock_entry)}?print=1`, "_blank");
+							}
+						});
+						d.hide();
+					},
+				});
+				d.show();
+			},
+		});
+	}
+
+	/* ── Recalls: confirm physical return ─────────────────────────
+	 * Wraps transfer_manifest_api.confirm_return — same dialog the
+	 * manifest form shows, but inlined into the dispatcher console so
+	 * source-warehouse staff don't need to open each manifest.
+	 */
+	_ops_confirm_recall_return(name) {
+		if (!name) return;
+		const api = "ch_logistics.api.transfer_manifest_api.";
+		const row = (this.recalls || []).find((r) => r.name === name) || {};
+		const src = frappe.utils.escape_html(row.source_warehouse || "—");
+		const d = new frappe.ui.Dialog({
+			title: __("Confirm Return — {0}", [name]),
+			size: "large",
+			fields: [
+				{
+					fieldname: "info_html",
+					fieldtype: "HTML",
+					options: `<div class="alert alert-info" style="padding:12px;border-radius:6px;background:#d1ecf1;border:1px solid #bee5eb;">
+						<strong>${__("Return Checklist")}:</strong>
+						<ul style="margin:8px 0 0 0;padding-left:18px">
+							<li>${__("All items have been physically returned to")} <strong>${src}</strong></li>
+							<li>${__("Each item has been scanned / counted and matches the manifest")}</li>
+							<li>${__("A photo has been taken of the returned items")}</li>
+						</ul>
+						<div style="margin-top:8px"><b>${__("Recall Reason")}:</b> ${frappe.utils.escape_html(row.recall_reason || "—")}</div>
+					</div>`,
+				},
+				{
+					fieldname: "return_photo",
+					fieldtype: "Attach Image",
+					label: __("Return Photo (Required)"),
+					description: __("Photo of all items returned to source warehouse"),
+					reqd: 1,
+				},
+				{
+					fieldname: "confirmed_by",
+					fieldtype: "Data",
+					label: __("Received By (Name at Source)"),
+					description: __("Name of person who received the returned items at source warehouse"),
+				},
+			],
+			primary_action_label: __("Confirm Return & Reverse Stock"),
+			primary_action: (values) => {
+				d.hide();
+				frappe.confirm(
+					__("Confirm that all items have been returned? This will reverse the stock entries and cannot be undone."),
+					() => {
+						frappe.call({
+							method: api + "confirm_return",
+							args: {
+								manifest: name,
+								return_photo: values.return_photo,
+								confirmed_by: values.confirmed_by,
+							},
+							freeze: true,
+							freeze_message: __("Reversing stock entries..."),
+							callback: (r) => {
+								if (r.message) {
+									const reversed = (r.message.reversed_stock_entries || []).join(", ");
+									frappe.show_alert({
+										message: __("Return confirmed. Stock reversed: {0}", [reversed || "N/A"]),
+										indicator: "green",
+									}, 7);
+									this._ops_load();
+								}
+							},
+						});
+					}
+				);
+			},
+		});
+		d.show();
 	}
 
 	/* ── Side panel ───────────────────────────────────────────── */
@@ -1091,9 +1629,14 @@ class LogisticsCommandCenter {
 	// DIALOGS
 	// ══════════════════════════════════════════════════════════════
 
-	_dlg_new_trip() {
+	_dlg_new_trip(preselected_manifests = null) {
+		const manifests = Array.isArray(preselected_manifests) && preselected_manifests.length
+			? preselected_manifests : null;
+		const title = manifests
+			? __("New Trip — {0} manifest(s)", [manifests.length])
+			: __("New Trip");
 		const d = new frappe.ui.Dialog({
-			title: __("New Trip"),
+			title,
 			fields: [
 				{ fieldtype: "Date",     fieldname: "trip_date",     label: __("Trip Date"),   reqd: 1, default: this.trip_date },
 				{ fieldtype: "Link",     fieldname: "company",       label: __("Company"),     options: "Company", reqd: 1, default: frappe.defaults.get_default("company") },
@@ -1104,13 +1647,26 @@ class LogisticsCommandCenter {
 				{ fieldtype: "Link",     fieldname: "vehicle",       label: __("Vehicle"),     options: "Vehicle" },
 				{ fieldtype: "Datetime", fieldname: "planned_start", label: __("Planned Start") },
 				{ fieldtype: "Datetime", fieldname: "planned_end",   label: __("Planned End") },
+				...(manifests ? [
+					{ fieldtype: "Section Break", label: __("Attached Manifests") },
+					{ fieldtype: "HTML",     fieldname: "mf_html",
+						options: `<div class="text-muted" style="font-size:12px">${
+							manifests.map((m) => frappe.utils.escape_html(m)).join(", ")
+						}</div>` },
+				] : []),
 			],
-			primary_action_label: __("Create"),
+			primary_action_label: manifests ? __("Create & Attach") : __("Create"),
 			primary_action: (vals) => {
-				frappe.call({ method: _LCC + "trip_create", args: vals }).then((r) => {
+				const args = { ...vals };
+				if (manifests) args.manifests = JSON.stringify(manifests);
+				frappe.call({ method: _LCC + "trip_create", args, freeze: true }).then((r) => {
 					d.hide();
-					frappe.show_alert({ message: __("Trip {0} created", [r.message]), indicator: "green" });
+					const msg = manifests
+						? __("Trip {0} created with {1} manifest(s)", [r.message, manifests.length])
+						: __("Trip {0} created", [r.message]);
+					frappe.show_alert({ message: msg, indicator: "green" });
 					if (this.mode === "ops") {
+						this.selected_manifests.clear();
 						this._ops_load();
 						if (r.message) this._ops_open_trip(r.message);
 					} else {
@@ -1120,6 +1676,11 @@ class LogisticsCommandCenter {
 			},
 		});
 		d.show();
+	}
+
+	_ops_new_trip_from_selection() {
+		if (!this.selected_manifests.size) return;
+		this._dlg_new_trip(Array.from(this.selected_manifests));
 	}
 
 	_dlg_auto_plan() {

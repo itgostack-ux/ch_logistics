@@ -24,10 +24,35 @@ class CHTransferManifest(Document):
     def before_submit(self):
         if not self.transfers:
             frappe.throw(_("Add at least one Stock Entry to the manifest."), title=_("Ch Transfer Manifest Error"))
+        # Oracle WMS gate: a manifest cannot transition Draft → Packed
+        # until at least one carton/box has been recorded on the packing
+        # slip.  This guarantees ``box_count`` is meaningful by the time
+        # the driver picks up and lines up box labels with physical reality.
+        if (not self.packages) and self._packing_required():
+            frappe.throw(
+                _("Add at least one packed box (use 'Pack Box' on the Packages tab) before submitting. " 
+                  "Box count must be > 0 before dispatch."),
+                title=_("Packing Slip Required"),
+            )
         # Trip linking is optional at submit time — manifests can be submitted
         # standalone and attached to a trip via the Logistics Control Tower.
         if self.status in ("Draft", None, ""):
             self.status = "Packed"
+
+    def _packing_required(self) -> bool:
+        """Honour the global CH Logistics Settings → require_packing_slip flag.
+
+        Defaults to ``False`` so existing manifests keep submitting; flip
+        the setting on once warehouse staff have been trained to pack at
+        a pack station, after which submission without a packing slip is
+        rejected (matching Oracle WMS / Manhattan WMS behaviour).
+        """
+        try:
+            return bool(frappe.db.get_single_value(
+                "CH Logistics Settings", "require_packing_slip"
+            ))
+        except Exception:
+            return False
 
     def on_submit(self):
         self._update_stock_entries_manifest()
@@ -46,6 +71,14 @@ class CHTransferManifest(Document):
 
     def _populate_transfer_details(self):
         """Auto-fill warehouse, item count, MR link from each Stock Entry."""
+        # Once a manifest has moved beyond Draft, the linked Stock Entries
+        # may have been cancelled or even deleted (e.g. by a recall +
+        # reverse-SE workflow that purges the original).  Tolerate that
+        # case so legacy/submitted manifests can still be re-saved and
+        # re-submitted for repairs (matches behaviour of SAP TM where
+        # shipment lines stay queryable after their underlying GR is
+        # cancelled).
+        post_draft = (self.status or "Draft") not in ("Draft", "")
         for row in self.transfers:
             if not row.stock_entry:
                 continue
@@ -56,8 +89,14 @@ class CHTransferManifest(Document):
                 as_dict=True,
             )
             if not se:
+                if post_draft:
+                    # Legacy / post-recall row — keep whatever was stamped
+                    # on the manifest line and move on.
+                    continue
                 frappe.throw(_("Stock Entry {0} not found.").format(row.stock_entry), title=_("Ch Transfer Manifest Error"))
             if se.docstatus == 2:
+                if post_draft:
+                    continue
                 frappe.throw(_("Stock Entry {0} is cancelled.").format(row.stock_entry), title=_("Ch Transfer Manifest Error"))
             if se.stock_entry_type != "Material Transfer":
                 frappe.throw(
@@ -89,7 +128,40 @@ class CHTransferManifest(Document):
         self.total_stock_entries = len(self.transfers)
         self.total_items = sum(cint(r.item_count) for r in self.transfers)
         self.total_qty = sum(flt(r.total_qty) for r in self.transfers)
+        # Oracle WMS pattern: box_count is auto-derived from the packing
+        # slips (CH Transfer Package rows) — one row per physical carton.
+        self._auto_label_packages()
+        self.box_count = len(self.packages or [])
         self._compute_freight()
+
+    def _auto_label_packages(self):
+        """Assign sequential LPN labels and stamp packer audit fields.
+
+        Mirrors Oracle WMS's License Plate Number scheme: every physical
+        box gets a unique label of the form ``{manifest}-B{NN}`` so that
+        scanning the label at any downstream stop (loading, hand-off,
+        receiving) unambiguously identifies the carton.
+        """
+        used = {
+            (p.package_label or "").strip().upper()
+            for p in (self.packages or [])
+            if (p.package_label or "").strip()
+        }
+        next_seq = 1
+        for p in (self.packages or []):
+            if not (p.package_label or "").strip():
+                while True:
+                    candidate = f"{self.name or 'TM-NEW'}-B{next_seq:02d}"
+                    if candidate.upper() not in used:
+                        p.package_label = candidate
+                        used.add(candidate.upper())
+                        next_seq += 1
+                        break
+                    next_seq += 1
+            if not p.packed_by:
+                p.packed_by = frappe.session.user
+            if not p.packed_at:
+                p.packed_at = now_datetime()
 
     def _validate_transfers(self):
         """Ensure no Stock Entry is already on another active manifest."""

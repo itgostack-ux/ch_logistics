@@ -166,7 +166,7 @@ def _maybe_whatsapp(phones, m, event, url):
         try:
             send_template_message(
                 phone=phone,
-                template_name="transfer_status",
+                event="transfer_status",
                 body_values={"1": m.name, "2": m.destination_store or "", "3": url},
                 ref_doctype="CH Transfer Manifest", ref_name=m.name, enqueue=True,
             )

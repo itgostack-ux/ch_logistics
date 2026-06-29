@@ -16,6 +16,12 @@ from ch_logistics.api import driver_status as ds
 _TRIP_CLOSE_TERMINAL_MANIFEST_STATUSES = {"Closed", "Delivered", "Cancelled"}
 _LOGISTICS_HEAD_ROLES = {"System Manager", "Logistics Head", "Logistic Head"}
 
+# Manifest statuses considered "attachable to a trip" in the Logistics
+# Control Tower Operations tab.  Mirrors how TMS dispatcher consoles
+# (Oracle WMS, SAP TM, Manhattan WMS) only surface freight that is
+# packed/ready-to-load — anything already in motion or terminal is hidden.
+_OPS_ATTACHABLE_MANIFEST_STATUSES = ("Draft", "Packed")
+
 
 # ---------------------------------------------------------------------------
 # Trip lifecycle
@@ -831,9 +837,18 @@ def ops_board(trip_date=None, include_days=1):
 
 @frappe.whitelist()
 def ops_unassigned_manifests(direction=None, hub=None, limit=100):
-    """CH Transfer Manifests that are not yet attached to a trip."""
+    """CH Transfer Manifests that are ready to be attached to a trip.
+
+    Only returns manifests in attachable (pre-dispatch) statuses — anything
+    already Assigned/In Transit/Delivered/Closed/Cancelled/etc. is hidden
+    from the dispatcher's worklist, matching market-standard TMS cockpit
+    behaviour (Oracle Transportation Management, SAP TM, Manhattan TMS).
+    """
     _require_ops()
-    filters = {"docstatus": ["<", 2]}
+    filters = {
+        "docstatus": ["<", 2],
+        "status": ["in", list(_OPS_ATTACHABLE_MANIFEST_STATUSES)],
+    }
     if _has_manifest_trip_field():
         filters["trip"] = ["in", [None, ""]]
     has_direction = _has_manifest_direction_field()
@@ -872,6 +887,149 @@ def ops_unassigned_manifests(direction=None, hub=None, limit=100):
         order_by=("shipment_priority desc, creation asc" if has_shipment_priority else "creation asc"),
         limit=cint(limit) or 100,
     )
+
+
+@frappe.whitelist()
+def ops_recall_inbox(limit=100):
+    """In-flight transfer recalls awaiting physical return + stock reversal.
+
+    Mirrors the "Returns Cockpit" pattern from SAP TM / Oracle TM /
+    Manhattan TMS: every recalled manifest stays in the dispatcher's
+    inbox with its original trip, driver, vehicle and a recall-age clock
+    until someone at the source warehouse confirms physical return
+    (which reverses the underlying Stock Entries).
+    """
+    _require_ops()
+    has_trip = _has_manifest_trip_field()
+    fields = [
+        "name", "status",
+        "source_warehouse", "destination_warehouse",
+        "source_store", "destination_store",
+        "total_stock_entries", "total_items", "total_qty",
+        "recall_reason", "recall_notes",
+        "recall_initiated_by", "recall_initiated_at",
+        "creation",
+    ]
+    if has_trip:
+        fields.append("trip")
+    if _has_manifest_direction_field():
+        fields.append("direction")
+
+    rows = frappe.get_all(
+        "CH Transfer Manifest",
+        filters={"status": "Recall Initiated"},
+        fields=fields,
+        order_by="recall_initiated_at desc, modified desc",
+        limit=cint(limit) or 100,
+    )
+
+    # Enrich with driver / vehicle context from the originating trip so the
+    # dispatcher can chase the driver without opening the manifest form.
+    trip_names = {r.get("trip") for r in rows if r.get("trip")}
+    trip_info = {}
+    if trip_names:
+        for t in frappe.get_all(
+            "CH Logistics Trip",
+            filters={"name": ["in", list(trip_names)]},
+            fields=[
+                "name", "status", "driver", "driver_name",
+                "driver_phone", "vehicle_number",
+            ],
+        ):
+            trip_info[t.name] = t
+
+    now = now_datetime()
+    for r in rows:
+        ti = trip_info.get(r.get("trip")) if r.get("trip") else None
+        r["trip_status"] = ti.status if ti else None
+        r["driver"] = ti.driver if ti else None
+        r["driver_name"] = ti.driver_name if ti else None
+        r["driver_phone"] = ti.driver_phone if ti else None
+        r["vehicle_number"] = ti.vehicle_number if ti else None
+        if r.get("recall_initiated_at"):
+            age_seconds = (now - r["recall_initiated_at"]).total_seconds()
+            r["recall_age_hours"] = round(age_seconds / 3600.0, 1)
+        else:
+            r["recall_age_hours"] = None
+
+    return rows
+
+
+@frappe.whitelist()
+def ops_packing_queue(limit=100):
+    """Draft manifests awaiting pack-station processing.
+
+    Returns each Draft manifest plus the running packing totals derived
+    from the CH Transfer Package child table (carton count, packed
+    qty, total weight, last packer).  Mirrors the "Pack Station Work
+    Queue" view from Oracle WMS Cloud and Manhattan Active WMS where
+    packers see every open order with its remaining-to-pack count.
+    """
+    _require_ops()
+    fields = [
+        "name", "status",
+        "source_warehouse", "destination_warehouse",
+        "source_store", "destination_store",
+        "total_stock_entries", "total_items", "total_qty",
+        "manifest_date", "creation",
+    ]
+    if _has_manifest_box_count_field():
+        fields.append("box_count")
+    if _has_manifest_shipment_priority_field():
+        fields.append("shipment_priority")
+    if _has_manifest_direction_field():
+        fields.append("direction")
+
+    rows = frappe.get_all(
+        "CH Transfer Manifest",
+        filters={"docstatus": 0, "status": "Draft"},
+        fields=fields,
+        order_by=(
+            "shipment_priority desc, creation asc"
+            if _has_manifest_shipment_priority_field() else "creation asc"
+        ),
+        limit=cint(limit) or 100,
+    )
+
+    if not rows:
+        return rows
+
+    names = [r["name"] for r in rows]
+    # Aggregate packed_qty / total weight / max packed_at per parent
+    # in a single query so the queue is O(1) round-trips even with a
+    # large worklist.
+    pkg_rows = frappe.db.sql(
+        """
+        SELECT parent,
+               COUNT(*)               AS box_count,
+               COALESCE(SUM(packed_qty), 0)  AS packed_qty,
+               COALESCE(SUM(weight_kg), 0)   AS total_weight_kg,
+               MAX(packed_at)         AS last_packed_at,
+               MAX(packed_by)         AS last_packed_by
+        FROM `tabCH Transfer Package`
+        WHERE parent IN %(names)s
+        GROUP BY parent
+        """,
+        {"names": tuple(names)},
+        as_dict=True,
+    )
+    agg = {p["parent"]: p for p in pkg_rows}
+    now = now_datetime()
+    for r in rows:
+        a = agg.get(r["name"]) or {}
+        r["pkg_box_count"] = int(a.get("box_count") or 0)
+        r["pkg_packed_qty"] = float(a.get("packed_qty") or 0)
+        r["pkg_total_weight_kg"] = float(a.get("total_weight_kg") or 0)
+        r["pkg_last_packed_at"] = a.get("last_packed_at")
+        r["pkg_last_packed_by"] = a.get("last_packed_by")
+        total_qty = float(r.get("total_qty") or 0)
+        r["pkg_remaining_qty"] = max(total_qty - r["pkg_packed_qty"], 0)
+        if r.get("creation"):
+            r["age_hours"] = round((now - r["creation"]).total_seconds() / 3600.0, 1)
+        else:
+            r["age_hours"] = None
+
+    return rows
 
 
 @frappe.whitelist()

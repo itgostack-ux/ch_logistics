@@ -291,6 +291,57 @@
 	font-size: 12px;
 }
 .lcc-empty i { display: block; font-size: 24px; margin-bottom: 6px; opacity: 0.4; }
+
+/* Rich empty state with CTAs (Operations board) */
+.lcc-empty-state {
+	padding: 48px 24px;
+	background: #fafbfc;
+	border: 1px dashed var(--lcc-border);
+	border-radius: var(--lcc-radius);
+}
+.lcc-empty-state > i {
+	font-size: 40px;
+	color: var(--lcc-accent);
+	opacity: 0.6;
+	margin-bottom: 10px;
+}
+.lcc-empty-title {
+	font-size: 15px;
+	font-weight: 600;
+	color: #1f2937;
+	margin-bottom: 4px;
+}
+.lcc-empty-sub {
+	font-size: 12px;
+	color: var(--lcc-muted);
+	max-width: 480px;
+	margin: 0 auto 16px;
+}
+.lcc-empty-actions {
+	display: inline-flex;
+	gap: 10px;
+	margin-top: 4px;
+}
+.lcc-empty-actions .btn { padding: 6px 14px; font-size: 13px; }
+.lcc-empty-actions .btn i { margin-right: 4px; }
+.lcc-empty-hint {
+	margin-top: 18px;
+	padding-top: 14px;
+	border-top: 1px solid var(--lcc-border);
+	font-size: 12px;
+	color: #475569;
+}
+.lcc-empty-hint i.fa-info-circle { color: var(--lcc-accent); margin-right: 4px; display: inline-block; font-size: 13px; opacity: 1; }
+.lcc-link-btn {
+	background: none;
+	border: none;
+	color: var(--lcc-accent);
+	font-weight: 600;
+	font-size: 12px;
+	padding: 2px 6px;
+	cursor: pointer;
+}
+.lcc-link-btn:hover { text-decoration: underline; }
 .lcc-error-banner {
 	background: #fef2f2;
 	border: 1px solid #fecaca;
@@ -769,6 +820,16 @@
 	display: flex;
 	gap: 8px;
 	align-items: center;
+	flex-wrap: wrap;
+}
+.lcc-ops-bar-spacer { flex: 1; }
+.lcc-ops-bar-hint { font-size: 11px; }
+.lcc-ops-toolbar-divider {
+	display: inline-block;
+	width: 1px;
+	height: 20px;
+	background: var(--lcc-border);
+	margin: 0 4px;
 }
 
 .lcc-ops-bottom { padding-bottom: 20px; }
@@ -941,4 +1002,53 @@
 	.lcc-intel-grid { grid-template-columns: 1fr; }
 	.lcc-side { width: 100%; max-width: 100vw; }
 	.lcc-ops-toolbar { flex-direction: column; align-items: flex-start; }
+}
+
+/* ───────────────────────────────────────────────────────────────
+ * Packing mode (Oracle WMS-style pack station hub)
+ * ─────────────────────────────────────────────────────────────── */
+.lcc-pack { padding: 12px 16px 24px; }
+.lcc-pack-howto {
+	background: linear-gradient(135deg, #eff6ff 0%, #ecfeff 100%);
+	border: 1px solid #bae6fd;
+	border-radius: 8px;
+	padding: 12px 16px;
+	margin-bottom: 12px;
+}
+.lcc-pack-howto-title {
+	font-weight: 600;
+	color: #075985;
+	margin-bottom: 6px;
+	font-size: 13px;
+}
+.lcc-pack-howto-title .fa { margin-right: 6px; }
+.lcc-pack-steps {
+	margin: 0;
+	padding-left: 22px;
+	color: #0f172a;
+	font-size: 12.5px;
+	line-height: 1.55;
+}
+.lcc-pack-steps li { margin-bottom: 2px; }
+.lcc-pack-steps b { color: #0c4a6e; }
+.lcc-pack-body { margin-top: 8px; }
+.lcc-pack-table th, .lcc-pack-table td { vertical-align: middle; }
+.lcc-pack-prog-wrap {
+	width: 100%;
+	height: 6px;
+	background: #f1f5f9;
+	border-radius: 3px;
+	overflow: hidden;
+}
+.lcc-pack-prog {
+	height: 100%;
+	transition: width 0.25s ease;
+}
+.lcc-pack-prog-low  { background: #fca5a5; }
+.lcc-pack-prog-mid  { background: #fbbf24; }
+.lcc-pack-prog-done { background: #34d399; }
+.lcc-pack-pct {
+	font-size: 11px;
+	margin-top: 2px;
+	text-align: right;
 }

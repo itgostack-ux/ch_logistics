@@ -3,6 +3,8 @@ frappe.ui.form.on("CH Transfer Manifest", {
         render_status_badge(frm);
         render_lane_banner(frm);
         add_action_buttons(frm);
+        add_print_label_button(frm);
+        add_pack_box_button(frm);
     },
 
     source_store(frm) {
@@ -21,6 +23,107 @@ frappe.ui.form.on("CH Transfer Manifest", {
         }
     },
 });
+
+// One-click: print the box label (FROM→TO + scannable QR = manifest number).
+// Lifecycle gate (SAP EWM / Manhattan Active WMS / Oracle WMS Cloud parity):
+// carton labels are an operational artefact of the pack ↔ dispatch phase.
+// Once goods are in motion (In Transit) or delivered, labels are sealed on
+// the carton and re-printing creates an audit-trail conflict, so the form
+// hides the prominent shortcut.  Historical reprint stays available via the
+// standard Print menu (Frappe page "Print" icon).
+const BOX_LABEL_STATES = new Set(["Draft", "Packed", "Assigned"]);
+
+function add_print_label_button(frm) {
+    if (frm.is_new()) return;
+    if (frm.doc.docstatus === 2) return;        // cancelled — nothing to label
+    if (!BOX_LABEL_STATES.has(frm.doc.status)) return;
+    frm.add_custom_button(__("Print Box Label"), () => {
+        const params = new URLSearchParams({
+            doctype: frm.doctype,
+            name: frm.doc.name,
+            format: "CH Transfer Manifest Label",
+            trigger_print: "1",
+            _lang: frappe.boot.lang || "en",
+        });
+        window.open("/printview?" + params.toString(), "_blank");
+    });
+    // Promote to primary CTA only when no other stage-action owns the slot
+    // (i.e. Packed/Assigned where the next manual step is to print + hand
+    // off cartons).  On Draft, submit remains primary.
+    if (frm.doc.status === "Packed" || frm.doc.status === "Assigned") {
+        frm.page.btn_secondary && frm.page.btn_secondary.removeClass("btn-primary");
+        const $btn = frm.page.inner_toolbar.find(`.btn:contains('${__("Print Box Label")}')`);
+        $btn.addClass("btn-primary");
+    }
+}
+
+// Oracle WMS-style "Pack Box" pack-station shortcut. One click opens a
+// quick-capture dialog (qty / weight / dimensions / seal / photo / notes),
+// appends a packing-slip row with an auto-generated LPN, and lets the
+// packer mint the next box without scrolling through the grid.
+function add_pack_box_button(frm) {
+    if (frm.is_new()) return;
+    if (frm.doc.docstatus !== 0) return;     // packing is a Draft-only activity
+    frm.add_custom_button(__("Pack Box"), () => show_pack_box_dialog(frm), __("Packing"));
+}
+
+function show_pack_box_dialog(frm) {
+    const next_seq = ((frm.doc.packages || []).length || 0) + 1;
+    const suggested_label = `${frm.doc.name}-B${String(next_seq).padStart(2, "0")}`;
+    const total_qty = frm.doc.total_qty || 0;
+    const packed_so_far = (frm.doc.packages || []).reduce(
+        (s, p) => s + (p.packed_qty || 0), 0
+    );
+    const remaining = Math.max(0, total_qty - packed_so_far);
+
+    const d = new frappe.ui.Dialog({
+        title: __("Pack Box — {0}", [suggested_label]),
+        fields: [
+            {
+                fieldname: "summary_html",
+                fieldtype: "HTML",
+                options: `<div class="alert alert-info" style="padding:8px 12px;border-radius:6px;background:#d1ecf1;border:1px solid #bee5eb;font-size:13px">
+                    <b>${__("Manifest total qty")}:</b> ${total_qty} &middot;
+                    <b>${__("Packed so far")}:</b> ${packed_so_far} &middot;
+                    <b>${__("Remaining")}:</b> ${remaining}
+                </div>`,
+            },
+            { fieldname: "packed_qty", fieldtype: "Int", label: __("Packed Qty"), reqd: 1,
+              default: remaining || null,
+              description: __("How many item units are physically in this box?") },
+            { fieldname: "weight_kg", fieldtype: "Float", label: __("Weight (kg)") },
+            { fieldname: "dimensions_cm", fieldtype: "Data", label: __("Dimensions (LxWxH cm)"),
+              description: __("Optional — used for courier dimensional weight, e.g. 30x20x15") },
+            { fieldname: "col_break", fieldtype: "Column Break" },
+            { fieldname: "seal_number", fieldtype: "Data", label: __("Seal / Tamper Tag") },
+            { fieldname: "packing_photo", fieldtype: "Attach Image", label: __("Packing Photo") },
+            { fieldname: "notes", fieldtype: "Small Text", label: __("Notes") },
+        ],
+        primary_action_label: __("Add Box & Save"),
+        primary_action(values) {
+            const row = frm.add_child("packages", {
+                package_label: suggested_label,
+                packed_qty: values.packed_qty,
+                weight_kg: values.weight_kg,
+                dimensions_cm: values.dimensions_cm,
+                seal_number: values.seal_number,
+                packing_photo: values.packing_photo,
+                notes: values.notes,
+                packed_by: frappe.session.user,
+                packed_at: frappe.datetime.now_datetime(),
+            });
+            frm.refresh_field("packages");
+            d.hide();
+            frm.save().then(() => {
+                frappe.show_alert({
+                    message: __("Box {0} packed ({1} units).", [row.package_label, values.packed_qty || 0]),
+                    indicator: "green",
+                }, 5);
+            });
+        },
+    });
+    d.show();
+}
 
 frappe.ui.form.on("CH Transfer Manifest Item", {
     stock_entry(frm, cdt, cdn) {
@@ -167,13 +270,27 @@ function add_action_buttons(frm) {
     // GST Rule 138: one EWB per Stock Entry, generated atomically with the
     // driver+vehicle assignment. The driver carries one printout per
     // consignment — bundled into a single print job here.
-    const ewbStates = ["Assigned", "Pickup Started", "In Transit", "Delivered", "Received", "Closed"];
-    if (ewbStates.includes(frm.doc.status)) {
-        const ewb_api = "ch_logistics.ch_logistics.logistics.doctype.ch_transfer_manifest.ch_transfer_manifest.";
+    //
+    // Lifecycle gates (SAP TM / Oracle TM / Manhattan TMS parity):
+    //  • Print  → transport phase only (Assigned…In Transit).  Once the
+    //    consignment is Delivered the e-Way Bill has served its legal
+    //    purpose; historical reprint stays accessible via the standard
+    //    Print menu so we don't pollute the next-step CTA bar.
+    //  • Refresh Status → extended to Delivered so accept-delivery staff
+    //    can confirm the NIC closure before posting GRN.  Drops at Received.
+    //  • Re-sync → generation/Part-B fixes are only meaningful while goods
+    //    are still in motion; restricted to transport phase.
+    const ewbPrintStates  = ["Assigned", "Pickup Started", "In Transit"];
+    const ewbStatusStates = ["Assigned", "Pickup Started", "In Transit", "Delivered"];
+    const ewbResyncStates = ["Assigned", "Pickup Started", "In Transit"];
+    if (ewbStatusStates.includes(frm.doc.status)) {
+        const ewb_api = "ch_logistics.logistics.doctype.ch_transfer_manifest.ch_transfer_manifest.";
 
-        frm.add_custom_button(__("Print e-Way Bills"), () => {
-            show_ewaybill_print_dialog(frm, ewb_api);
-        }, __("e-Way Bill"));
+        if (ewbPrintStates.includes(frm.doc.status)) {
+            frm.add_custom_button(__("Print e-Way Bills"), () => {
+                show_ewaybill_print_dialog(frm, ewb_api);
+            }, __("e-Way Bill"));
+        }
 
         frm.add_custom_button(__("Refresh Status"), () => {
             frappe.call({
@@ -185,9 +302,11 @@ function add_action_buttons(frm) {
             });
         }, __("e-Way Bill"));
 
-        // Resync (re-enqueue generation/Part-B update) — visible only when
-        // status is not yet Generated, so HO Admin can retry partial/failed.
-        if (frm.doc.ewaybill_status && frm.doc.ewaybill_status !== "Generated"
+        // Resync (re-enqueue generation/Part-B update) — visible only while
+        // goods are still in motion AND the NIC sync is not yet Generated.
+        if (ewbResyncStates.includes(frm.doc.status)
+            && frm.doc.ewaybill_status
+            && frm.doc.ewaybill_status !== "Generated"
             && frm.doc.ewaybill_status !== "Not Required") {
             frm.add_custom_button(__("Re-sync e-Way Bills"), () => {
                 frappe.confirm(

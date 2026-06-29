@@ -129,6 +129,7 @@
   {
    "fieldname": "trip",
    "fieldtype": "Link",
+   "in_list_view": 1,
    "in_standard_filter": 1,
    "label": "Logistics Trip",
    "options": "CH Logistics Trip",
@@ -161,6 +162,7 @@
   {
    "fieldname": "source_store",
    "fieldtype": "Link",
+   "in_standard_filter": 1,
    "label": "Source Store",
    "options": "CH Store"
   },
@@ -179,6 +181,7 @@
   {
    "fieldname": "destination_store",
    "fieldtype": "Link",
+   "in_standard_filter": 1,
    "label": "Destination Store",
    "options": "CH Store"
   },
@@ -190,6 +193,7 @@
   {
    "fieldname": "courier_partner",
    "fieldtype": "Link",
+   "in_standard_filter": 1,
    "label": "Courier Partner",
    "options": "Courier Partner"
   },
@@ -219,6 +223,7 @@
    "fieldname": "driver_name",
    "fieldtype": "Data",
    "fetch_from": "driver.full_name",
+   "in_list_view": 1,
    "label": "Driver Name",
    "read_only": 1
   },
@@ -232,6 +237,7 @@
   {
    "fieldname": "estimated_delivery_date",
    "fieldtype": "Datetime",
+   "in_list_view": 1,
    "label": "Estimated Delivery"
   },
   {
@@ -248,7 +254,7 @@
    "options": "Not Required\nNot Generated\nGenerating\nPartial\nGenerated\nFailed",
    "default": "Not Generated",
    "read_only": 1,
-   "in_list_view": 0,
+   "in_list_view": 1,
    "in_standard_filter": 1,
    "allow_on_submit": 1
   },
@@ -457,6 +463,7 @@
   {
    "fieldname": "total_qty",
    "fieldtype": "Float",
+   "in_list_view": 1,
    "label": "Total Qty",
    "read_only": 1
   },
@@ -683,8 +690,9 @@
    "role": "Delivery User"
   }
  ],
- "sort_field": "creation",
+ "sort_field": "manifest_date",
  "sort_order": "DESC",
+ "search_fields": "name,tracking_number,vehicle_number,driver_name,courier_partner,trip,source_store,destination_store",
  "states": [
   {
    "title": "Draft",
@@ -731,6 +739,5 @@
    "color": "red"
   }
  ],
- "title_field": "status",
  "track_changes": 1
 }

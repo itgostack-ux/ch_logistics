@@ -99,6 +99,45 @@ def get_manifest(manifest) -> dict:
     return doc.as_dict()
 
 
+@frappe.whitelist()
+def pack_box(manifest, packed_qty, weight_kg=None, dimensions_cm=None,
+             seal_number=None, packing_photo=None, notes=None) -> dict:
+    """Add one carton (LPN) to a Draft manifest's packing slip.
+
+    Used by the Logistics Command Center "Packing" hub so a packer can
+    mint cartons without opening each manifest form.  The LPN label and
+    packed_by / packed_at audit fields are auto-stamped by the manifest
+    controller via _auto_label_packages() on save.
+    """
+    doc = frappe.get_doc("CH Transfer Manifest", manifest)
+    doc.check_permission("write")
+    if doc.docstatus != 0:
+        frappe.throw(frappe._("Packing can only be added while the manifest is Draft."))
+    try:
+        packed_qty_int = int(packed_qty)
+    except (TypeError, ValueError):
+        frappe.throw(frappe._("Packed quantity is required."))
+    if packed_qty_int <= 0:
+        frappe.throw(frappe._("Packed quantity must be greater than zero."))
+
+    doc.append("packages", {
+        "packed_qty": packed_qty_int,
+        "weight_kg": weight_kg or None,
+        "dimensions_cm": dimensions_cm or None,
+        "seal_number": seal_number or None,
+        "packing_photo": packing_photo or None,
+        "notes": notes or None,
+    })
+    doc.save()
+    last = doc.packages[-1] if doc.packages else None
+    return {
+        "name": doc.name,
+        "box_count": doc.get("box_count"),
+        "package_label": last.package_label if last else None,
+        "packed_qty": last.packed_qty if last else 0,
+    }
+
+
 # ── Status Transitions ──────────────────────────────────────────────────────
 
 @frappe.whitelist()
