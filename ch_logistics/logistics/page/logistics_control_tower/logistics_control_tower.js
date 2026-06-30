@@ -880,6 +880,10 @@ class LogisticsCommandCenter {
 					<div class="lcc-ops-kpi-bar" id="lcc-ops-kpi-bar"></div>
 				</div>
 
+				<div class="lcc-ops-lifecycle" id="lcc-ops-lifecycle">
+					<div class="lcc-loading"><i class="fa fa-spinner fa-spin"></i> ${__("Loading lifecycle…")}</div>
+				</div>
+
 				<div class="lcc-ops-board" id="lcc-ops-board">
 					<div class="lcc-loading">${__("Loading…")}</div>
 				</div>
@@ -941,6 +945,12 @@ class LogisticsCommandCenter {
 			this._ops_render_bottom();
 		});
 
+		// Lifecycle stage strip — click a chip to filter the canvas.
+		$r.on("click", ".lcc-ls-chip", (e) => {
+			const stage = $(e.currentTarget).data("stage");
+			this._ops_set_lifecycle_stage(stage);
+		});
+
 		$r.on("click",  ".lcc-trip-card",     (e) => this._ops_open_trip($(e.currentTarget).data("name")));
 		$r.on("click",  ".lcc-side-close",    () => this._ops_close_side());
 		$r.on("change", ".lcc-mf-check",      (e) => { const n = $(e.currentTarget).data("name"); e.currentTarget.checked ? this.selected_manifests.add(n) : this.selected_manifests.delete(n); this._ops_update_attach(); });
@@ -968,12 +978,13 @@ class LogisticsCommandCenter {
 		const args_board = { trip_date: this.trip_date, include_days: this.include_days };
 		if (co) args_board.company = co;
 
-		const [b, u, x, d, rc] = await Promise.all([
+		const [b, u, x, d, rc, lc] = await Promise.all([
 			frappe.call({ method: _LCC + "ops_board",              args: args_board }),
 			frappe.call({ method: _LCC + "ops_unassigned_manifests", args: { limit: 100 } }),
 			frappe.call({ method: _LCC + "ops_exception_inbox",     args: { resolution_status: "Open", limit: 100 } }),
 			frappe.call({ method: _LCC + "ops_drivers_available" }),
 			frappe.call({ method: _LCC + "ops_recall_inbox",        args: { limit: 100 } }),
+			frappe.call({ method: _LCC + "ops_lifecycle_counts",    args: args_board }),
 		]);
 
 		this.board      = b.message || { buckets: {}, totals: {} };
@@ -981,12 +992,83 @@ class LogisticsCommandCenter {
 		this.exceptions = x.message || [];
 		this.drivers    = d.message || [];
 		this.recalls    = rc.message || [];
+		this.lifecycle  = lc.message || { stages: [] };
 		this.selected_manifests.clear();
 
+		this._ops_render_lifecycle();
 		this._ops_render_board();
 		this._ops_render_kpi();
 		this._ops_render_bottom();
 		if (this.active_trip) this._ops_open_trip(this.active_trip);
+	}
+
+	/* ── Lifecycle strip (Manifest → Packing → Trip → In Transit → Delivered) ── */
+
+	_ops_render_lifecycle() {
+		const stages = (this.lifecycle && this.lifecycle.stages) || [];
+		const active = this.lifecycle_stage || "";
+		const $w = $("#lcc-ops-lifecycle").empty();
+		if (!stages.length) {
+			$w.html(`<div class="lcc-empty">${__("Lifecycle counters unavailable.")}</div>`);
+			return;
+		}
+		const chips = stages.map((s, idx) => {
+			const sec = (s.secondary_count != null)
+				? `<span class="lcc-ls-sec" title="${__("shipments in this stage")}">${s.secondary_count}</span>`
+				: "";
+			const arrow = (idx < stages.length - 1)
+				? `<i class="fa fa-angle-right lcc-ls-arrow"></i>`
+				: "";
+			return `
+				<button class="lcc-ls-chip lcc-ls-${s.key} ${active === s.key ? "active" : ""}"
+				        data-stage="${s.key}" title="${frappe.utils.escape_html(s.hint || "")}">
+					<i class="fa ${s.icon || "fa-circle"}"></i>
+					<span class="lcc-ls-label">${frappe.utils.escape_html(s.label)}</span>
+					<span class="lcc-ls-count">${s.count}</span>
+					${sec}
+				</button>
+				${arrow}
+			`;
+		}).join("");
+		$w.html(`<div class="lcc-ls-rail">${chips}</div>`);
+	}
+
+	_ops_set_lifecycle_stage(stage) {
+		// Toggle off if the same chip is clicked twice — a familiar pattern from
+		// every dispatcher cockpit (SAP TM Freight Order Monitor, Manhattan
+		// Active TMS): clicking the active stage clears the filter.
+		this.lifecycle_stage = (this.lifecycle_stage === stage) ? null : stage;
+		this._ops_render_lifecycle();
+
+		// Map stage → bottom-tab + Kanban column behaviour.
+		//   draft / packed  → focus the Unassigned Manifests panel
+		//   planned         → highlight Draft+Assigned columns
+		//   in_transit      → highlight Started column
+		//   delivered       → highlight Completed+Closed columns
+		const board_focus_map = {
+			planned:    ["Draft", "Assigned"],
+			in_transit: ["Started"],
+			delivered:  ["Completed", "Closed"],
+		};
+		this._ops_board_focus = board_focus_map[this.lifecycle_stage] || null;
+		this._ops_manifest_status_filter = (
+			this.lifecycle_stage === "draft"  ? "Draft"  :
+			this.lifecycle_stage === "packed" ? "Packed" : null
+		);
+
+		// Re-render the trip board so the column highlight matches.
+		this._ops_render_board();
+
+		if (this.lifecycle_stage === "draft" || this.lifecycle_stage === "packed") {
+			this.bottom_tab = "manifests";
+			this.$root.find(".lcc-ops-tabs .lcc-tab").removeClass("active");
+			this.$root.find('.lcc-ops-tabs .lcc-tab[data-tab="manifests"]').addClass("active");
+			this._ops_render_bottom();
+			const el = document.getElementById("lcc-ops-bottom");
+			if (el && el.scrollIntoView) el.scrollIntoView({ behavior: "smooth", block: "start" });
+		} else {
+			this._ops_render_bottom();
+		}
 	}
 
 	/* ── KPI bar ──────────────────────────────────────────────── */
@@ -1038,8 +1120,11 @@ class LogisticsCommandCenter {
 		ORDER.forEach((status) => {
 			const trips = buckets[status] || [];
 			if (!trips.length && ["Closed","Cancelled"].includes(status)) return;
+			const focus = this._ops_board_focus;
+			const dim = focus && !focus.includes(status) ? " is-dim" : "";
+			const hi  = focus &&  focus.includes(status) ? " is-focus" : "";
 			const $col = $(`
-				<div class="lcc-ops-col">
+				<div class="lcc-ops-col${dim}${hi}">
 					<div class="lcc-ops-col-head lcc-ops-s-${status.toLowerCase().replace(/ /g,"-")}">
 						${__(status)} <span class="lcc-ops-col-cnt">${trips.length}</span>
 					</div>
@@ -1086,13 +1171,23 @@ class LogisticsCommandCenter {
 	}
 
 	_ops_render_manifests($b) {
-		if (!this.unassigned.length) {
-			$b.html(`<div class="lcc-empty"><i class="fa fa-check-circle"></i> ${__("No manifests waiting to be attached. (Only Draft / Packed manifests appear here — anything already in motion is hidden.)")}</div>`);
+		// Optional lifecycle filter: when a stage chip (draft / packed) is
+		// active, narrow the panel to just that status. Otherwise show
+		// everything attachable, like before.
+		const want = this._ops_manifest_status_filter;
+		const list = want
+			? (this.unassigned || []).filter((m) => (m.status || "").toLowerCase() === want.toLowerCase())
+			: (this.unassigned || []);
+		if (!list.length) {
+			const empty_msg = want
+				? __("No {0} manifests right now.", [want])
+				: __("No manifests waiting to be attached. (Only Draft / Packed manifests appear here — anything already in motion is hidden.)");
+			$b.html(`<div class="lcc-empty"><i class="fa fa-check-circle"></i> ${empty_msg}</div>`);
 			return;
 		}
 		// Status pill colours — mirror form indicator map.
 		const STATUS_COLOR = { "Draft": "gray", "Packed": "blue" };
-		const rows = this.unassigned.map((m) => {
+		const rows = list.map((m) => {
 			const color = STATUS_COLOR[m.status] || "gray";
 			const status = frappe.utils.escape_html(m.status || "—");
 			const nm = encodeURIComponent(m.name);

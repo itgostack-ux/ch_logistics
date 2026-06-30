@@ -872,6 +872,123 @@ def ops_board(trip_date=None, include_days=1):
 
 
 @frappe.whitelist()
+def ops_lifecycle_counts(trip_date=None, include_days=1):
+    """Per-stage counts for the Operations lifecycle strip.
+
+    Mirrors how SAP TM Freight Order Cockpit / Manhattan TMS Active Dock
+    show the journey of a shipment as discrete chips above the trip board:
+
+        Draft Manifest → Packed → Trip Planned → In Transit → Delivered
+
+    Each chip is a count of *real* docs currently in that stage; the
+    front-end lets the dispatcher click a chip to filter the canvas.
+    Counts are scoped to the same date window the trip board uses so the
+    numbers stay consistent with what the dispatcher sees on the board.
+    """
+    _require_ops()
+    trip_date = trip_date or frappe.utils.today()
+    end_date = frappe.utils.add_days(trip_date, max(cint(include_days) - 1, 0))
+
+    # Manifest-side counts (not bound to a trip yet).
+    manifest_base = {"docstatus": ["<", 2]}
+    if _has_manifest_trip_field():
+        manifest_base["trip"] = ["in", [None, ""]]
+
+    draft_manifests = frappe.db.count(
+        "CH Transfer Manifest",
+        filters={**manifest_base, "status": "Draft"},
+    )
+    packed_manifests = frappe.db.count(
+        "CH Transfer Manifest",
+        filters={**manifest_base, "status": "Packed"},
+    )
+
+    # Trip-side counts inside the date window. We aggregate Draft+Assigned
+    # under "Trip Planned" because both represent a trip that is built but
+    # has not physically left the hub — Draft = still being assembled,
+    # Assigned = driver attached, waiting to start. This is the same
+    # grouping SAP TM uses in the Freight Order Monitor ("Open" + "Ready").
+    trip_filters = {"trip_date": ["between", [trip_date, end_date]]}
+    trip_status_count = frappe.db.sql(
+        """
+        SELECT status, COUNT(*) AS cnt
+        FROM `tabCH Logistics Trip`
+        WHERE trip_date BETWEEN %(start)s AND %(end)s
+        GROUP BY status
+        """,
+        {"start": trip_date, "end": end_date},
+        as_dict=True,
+    )
+    by_status = {r.status: cint(r.cnt) for r in trip_status_count}
+    planned_trips = by_status.get("Draft", 0) + by_status.get("Assigned", 0)
+    in_transit_trips = by_status.get("Started", 0)
+    delivered_trips = by_status.get("Completed", 0) + by_status.get("Closed", 0)
+
+    # Also count manifests in transit / delivered today, because a trip can
+    # carry multiple manifests and the dispatcher cares about shipment-level
+    # throughput, not just truck-level.
+    in_transit_manifests = frappe.db.count(
+        "CH Transfer Manifest",
+        filters={"docstatus": ["<", 2], "status": "In Transit"},
+    )
+    delivered_manifests_today = frappe.db.sql(
+        """
+        SELECT COUNT(*) AS cnt
+        FROM `tabCH Transfer Manifest`
+        WHERE status IN ('Delivered', 'Closed')
+          AND DATE(IFNULL(delivery_datetime, modified)) BETWEEN %(start)s AND %(end)s
+        """,
+        {"start": trip_date, "end": end_date},
+        as_dict=True,
+    )
+    delivered_manifests = cint(delivered_manifests_today[0].cnt if delivered_manifests_today else 0)
+
+    return {
+        "trip_date": trip_date,
+        "end_date": end_date,
+        "stages": [
+            {
+                "key": "draft",
+                "label": _("Draft Manifests"),
+                "count": draft_manifests,
+                "hint": _("Manifests being prepared at pack station."),
+                "icon": "fa-file-text-o",
+            },
+            {
+                "key": "packed",
+                "label": _("Packed"),
+                "count": packed_manifests,
+                "hint": _("Packed manifests waiting to be attached to a trip."),
+                "icon": "fa-cube",
+            },
+            {
+                "key": "planned",
+                "label": _("Trip Planned"),
+                "count": planned_trips,
+                "hint": _("Trips Draft + Assigned. Driver may still be unassigned."),
+                "icon": "fa-list-ol",
+            },
+            {
+                "key": "in_transit",
+                "label": _("In Transit"),
+                "count": in_transit_trips,
+                "secondary_count": in_transit_manifests,
+                "hint": _("Trips currently on the road (manifests in transit also shown)."),
+                "icon": "fa-truck",
+            },
+            {
+                "key": "delivered",
+                "label": _("Delivered"),
+                "count": delivered_trips,
+                "secondary_count": delivered_manifests,
+                "hint": _("Trips completed/closed within the date window."),
+                "icon": "fa-check-circle",
+            },
+        ],
+    }
+
+
+@frappe.whitelist()
 def ops_unassigned_manifests(direction=None, hub=None, limit=100):
     """CH Transfer Manifests that are ready to be attached to a trip.
 
