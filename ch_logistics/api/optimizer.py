@@ -79,7 +79,46 @@ def _warehouse_coords(warehouse: str):
         "Warehouse", warehouse, ["custom_latitude", "custom_longitude"]) or (None, None)
     if lat and lng:
         return (flt(lat), flt(lng))
+    # Fallback: the CH Store linked to this warehouse carries the geocode
+    # (stores are geocoded; their warehouses may not be). Keeps the delivery
+    # optimizer working for every store even before the bulk geo sync runs.
+    store = (frappe.db.get_value("Warehouse", warehouse, "ch_store")
+             or frappe.db.get_value("CH Store", {"warehouse": warehouse}, "name"))
+    if store:
+        slat, slng = frappe.db.get_value(
+            "CH Store", store, ["latitude", "longitude"]) or (None, None)
+        if slat and slng:
+            return (flt(slat), flt(slng))
     return None
+
+
+@frappe.whitelist()
+def sync_store_geo_to_warehouses(overwrite: int = 0):
+    """Copy each CH Store's lat/lng onto its warehouse(s).
+
+    The map + any layer reading Warehouse.custom_latitude/longitude (e.g. the
+    Location Hierarchy map) then has coordinates for every store. Fills blanks
+    only unless ``overwrite`` is set. Idempotent.
+    """
+    updated = 0
+    for s in frappe.get_all("CH Store", filters={"disabled": 0},
+                            fields=["name", "warehouse", "latitude", "longitude", "geocoded_at"]):
+        if not (s.latitude and s.longitude):
+            continue
+        whs = set(filter(None, [s.warehouse]))
+        whs.update(frappe.get_all("Warehouse", filters={"ch_store": s.name}, pluck="name"))
+        for wh in whs:
+            cur = frappe.db.get_value("Warehouse", wh, ["custom_latitude", "custom_longitude"]) or (None, None)
+            if not int(overwrite) and cur[0] and cur[1]:
+                continue
+            frappe.db.set_value("Warehouse", wh, {
+                "custom_latitude": s.latitude,
+                "custom_longitude": s.longitude,
+                "custom_geocoded_at": s.geocoded_at or now_datetime(),
+            }, update_modified=False)
+            updated += 1
+    frappe.db.commit()
+    return {"warehouses_updated": updated}
 
 
 def _stop_coords(stop):

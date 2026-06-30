@@ -9,3 +9,4 @@ ch_logistics.patches.v0_0_6.add_arrival_location_fields
 ch_logistics.patches.v0_0_7.install_store_geo_fields
 ch_logistics.patches.v0_0_8.seed_gogizmo_stores
 ch_logistics.patches.v0_0_9.install_driver_status_fields
+ch_logistics.patches.v0_0_10.sync_store_geo_to_warehouses
