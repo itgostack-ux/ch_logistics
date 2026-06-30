@@ -1828,6 +1828,15 @@ class DeliveryApp {
             });
         }
 
+        // ── Bundle-QR fast path ──────────────────────────────────
+        // If the dispatcher printed a consolidated bundle label for this
+        // stop (pickup_token on CH Logistics Trip Stop), let the driver
+        // SCAN ONCE for the whole load instead of N times. Same pattern
+        // as Delhivery's stop-handover scan and Ekart's bag-master scan.
+        if (stop.has_pickup_token) {
+            return this._do_stop_pickup_bundle(seq, candidates, stop);
+        }
+
         // Build per-manifest QR fields. One pickup photo (the goods on the
         // dock) is shared across the load — that mirrors Ekart / Delhivery
         // handover scans where one rack photo covers all bundles in the lot.
@@ -1951,6 +1960,15 @@ class DeliveryApp {
                 frappe.show_alert({ message: __("Stop arrival recorded"), indicator: "green" });
                 this.show_trip_detail(this.active_trip);
             });
+        }
+
+        // ── Bundle-QR fast path ──────────────────────────────────
+        // If the dispatcher printed a consolidated drop label (delivery
+        // token on CH Logistics Trip Stop), use the one-scan / one-OTP
+        // path. The server mints a single shared OTP for the whole stop
+        // and complete_stop_delivery cascades to every manifest.
+        if (stop.has_delivery_token) {
+            return this._do_stop_drop_bundle(seq, deliverable, not_yet, stop);
         }
 
         // Two-stage POD: record stop arrival + per-manifest geofence ping +
@@ -2160,6 +2178,273 @@ class DeliveryApp {
                     [fail.join(", ")]),
             });
         }
+    }
+
+    // ── Bundle-QR pickup flow ────────────────────────────────────
+    // One scan unlocks the WHOLE stop. Backed by start_stop_pickup,
+    // which cascades start_pickup to every manifest at the stop
+    // (Assigned → In Transit) and sets stop.status = Arrived.
+    _do_stop_pickup_bundle(seq, candidates, stop) {
+        const manifest_rows_html = candidates.map((m) => `
+            <div class="da-stop-batch-row" style="border:1px solid #eee;border-radius:6px;padding:6px 8px;margin-bottom:6px;">
+                <div style="font-weight:600;font-size:12px;">${frappe.utils.escape_html(m.name)}</div>
+                <div class="text-muted" style="font-size:11px;">${frappe.utils.escape_html(m.destination_store || m.destination_warehouse || "—")}</div>
+            </div>`).join("");
+
+        const fields = [
+            {
+                fieldname: "summary", fieldtype: "HTML",
+                options: `<div class="alert alert-info" style="padding:8px 10px;border-radius:6px;margin-bottom:8px;">
+                    <strong><i class="fa fa-qrcode"></i> ${__("Bundle pickup")} — ${frappe.utils.escape_html(stop.store || stop.warehouse || "—")}</strong>
+                    <div style="font-size:12px;">${__("One scan picks up all {0} manifest(s) at this stop.", [candidates.length])}</div>
+                </div>
+                <div class="da-stop-batch-list">${manifest_rows_html}</div>`,
+            },
+            {
+                fieldname: "scanned_qr",
+                fieldtype: "Data",
+                label: __("Scan Stop Pickup QR"),
+                reqd: 1,
+                description: __("Scan the consolidated pickup label printed at dispatch. Pickup is blocked until it matches."),
+            },
+            {
+                fieldname: "pickup_photo",
+                fieldtype: "Attach Image",
+                label: __("Photo of Goods (single photo covers the load)"),
+                reqd: 1,
+            },
+            {
+                fieldname: "notes",
+                fieldtype: "Small Text",
+                label: __("Notes (optional)"),
+            },
+        ];
+
+        const d = new frappe.ui.Dialog({
+            title: __("Arrive & Pick Up — Stop #{0} (Bundle)", [seq]),
+            size: "small",
+            fields,
+            primary_action_label: __("Confirm Pickup"),
+            primary_action: (values) => {
+                d.hide();
+                this._submit_stop_pickup_bundle(seq, candidates, values);
+            },
+        });
+        d.show();
+    }
+
+    _submit_stop_pickup_bundle(seq, candidates, values) {
+        frappe.dom.freeze(__("Recording arrival & cascading pickup…"));
+        return this._capture_gps_promise()
+            .then(({ lat, lng }) => {
+                return this._call_promise(API + "start_stop_pickup", {
+                    trip: this.active_trip,
+                    sequence: seq,
+                    scanned_qr: values.scanned_qr,
+                    pickup_photo: values.pickup_photo,
+                    lat, lng,
+                    notes: values.notes,
+                });
+            })
+            .then((res) => {
+                const ok = (res && res.started) || [];
+                const fail = ((res && res.skipped) || []).map((s) => s.name);
+                // Keep parity with the legacy per-manifest path: when
+                // every manifest at the stop succeeded, finalise the
+                // trip-level stop accounting so scan_compliance_pct
+                // reports the same value as the older flow.
+                const all_ok = ok.length && !fail.length;
+                const tail = all_ok
+                    ? this._call_promise(TRIP_API + "stop_complete", {
+                          trip: this.active_trip,
+                          sequence: seq,
+                          scan_compliance_pct: 100,
+                      })
+                    : Promise.resolve();
+                return tail.then(() => ({ ok, fail }));
+            })
+            .then(({ ok, fail }) => {
+                frappe.dom.unfreeze();
+                this._show_batch_result(__("Bundle pickup"), ok, fail);
+                this.show_trip_detail(this.active_trip);
+                this.load_data();
+            })
+            .catch((err) => {
+                frappe.dom.unfreeze();
+                this.show_trip_detail(this.active_trip);
+                console.error("bundle pickup flow failed", err);
+            });
+    }
+
+    // ── Bundle-QR drop flow ──────────────────────────────────────
+    // One OTP + one scan for the whole stop. Backed by request_stop_otp
+    // (mints a shared OTP across every manifest) and
+    // complete_stop_delivery (cascades complete_delivery so every
+    // manifest goes In Transit → Delivered in one atomic call).
+    _do_stop_drop_bundle(seq, deliverable, not_yet, stop) {
+        // Soft-warn about manifests still in pickup state — the bundle
+        // call would reject (request_stop_otp requires every manifest at
+        // the stop to be In Transit) so surface the problem up front.
+        if (not_yet && not_yet.length) {
+            frappe.msgprint({
+                title: __("Pickup Not Done Yet"),
+                indicator: "orange",
+                message: __(
+                    "These manifest(s) at this drop are not In Transit yet: <b>{0}</b>.<br>" +
+                    "Return to the pickup stop and run <b>Arrive &amp; Pick Up</b> first, " +
+                    "or open the manifest to complete pickup individually.",
+                    [not_yet.map((m) => m.name).join(", ")]
+                ),
+            });
+            return;
+        }
+
+        frappe.dom.freeze(__("Capturing arrival & sending one OTP for this stop…"));
+        let gps_cache = null;
+        this._capture_gps_promise()
+            .then(({ lat, lng }) => {
+                gps_cache = { lat, lng };
+                return this._call_promise(API + "request_stop_otp", {
+                    trip: this.active_trip,
+                    sequence: seq,
+                    lat, lng,
+                });
+            })
+            .then((info) => {
+                frappe.dom.unfreeze();
+                this._open_stop_drop_bundle_dialog(seq, deliverable, stop, info || {}, gps_cache);
+            })
+            .catch((err) => {
+                frappe.dom.unfreeze();
+                this.show_trip_detail(this.active_trip);
+                console.error("bundle drop prepare failed", err);
+            });
+    }
+
+    _open_stop_drop_bundle_dialog(seq, deliverable, stop, otp_info, gps) {
+        const recipients_block = (info) => {
+            if (!info) return "";
+            const parts = [];
+            if ((info.masked_emails || []).length) {
+                parts.push(__("Email: {0}", [info.masked_emails.map(frappe.utils.escape_html).join(", ")]));
+            }
+            if ((info.masked_mobiles || []).length) {
+                parts.push(__("SMS: {0}", [info.masked_mobiles.map(frappe.utils.escape_html).join(", ")]));
+            }
+            return parts.length
+                ? `<div class="text-muted" style="font-size:11px;margin-top:4px;">${__("OTP sent")} — ${parts.join(" • ")}</div>`
+                : `<div class="text-muted" style="font-size:11px;margin-top:4px;">${__("OTP regenerated. Ask the store directly.")}</div>`;
+        };
+
+        const manifest_rows_html = deliverable.map((m) => `
+            <div class="da-stop-batch-row" style="border:1px solid #eee;border-radius:6px;padding:6px 8px;margin-bottom:6px;">
+                <div style="font-weight:600;font-size:12px;">${frappe.utils.escape_html(m.name)}</div>
+            </div>`).join("");
+
+        const fields = [
+            {
+                fieldname: "summary", fieldtype: "HTML",
+                options: `<div class="alert alert-info" style="padding:8px 10px;border-radius:6px;margin-bottom:8px;">
+                    <strong><i class="fa fa-qrcode"></i> ${__("Bundle drop")} — ${frappe.utils.escape_html(stop.store || stop.warehouse || "—")}</strong>
+                    <div style="font-size:12px;">${__("One scan + one OTP delivers all {0} manifest(s) at this stop.", [deliverable.length])}</div>
+                    ${recipients_block(otp_info)}
+                </div>
+                <div class="da-stop-batch-list">${manifest_rows_html}</div>`,
+            },
+            {
+                fieldname: "scanned_qr",
+                fieldtype: "Data",
+                label: __("Scan Stop Delivery QR"),
+                reqd: 1,
+                description: __("Scan the consolidated drop label printed at dispatch. Delivery is blocked until it matches."),
+            },
+            {
+                fieldname: "otp",
+                fieldtype: "Data",
+                label: __("Receiver OTP (one code unlocks the whole stop)"),
+                reqd: 1,
+            },
+            {
+                fieldname: "receiver_name",
+                fieldtype: "Data",
+                label: __("Receiver Name (delivered to)"),
+                reqd: 1,
+            },
+            {
+                fieldname: "delivery_photo",
+                fieldtype: "Attach Image",
+                label: __("Photo of Delivery (single photo covers this drop)"),
+                reqd: 1,
+            },
+            {
+                fieldname: "notes",
+                fieldtype: "Small Text",
+                label: __("Notes (optional)"),
+            },
+        ];
+
+        const d = new frappe.ui.Dialog({
+            title: __("Arrive & Deliver — Stop #{0} (Bundle)", [seq]),
+            size: "small",
+            fields,
+            primary_action_label: __("Confirm Delivery"),
+            primary_action: (values) => {
+                d.hide();
+                this._submit_stop_drop_bundle(seq, deliverable, values, gps);
+            },
+            secondary_action_label: __("Resend OTP"),
+            secondary_action: () => {
+                this._call_promise(API + "request_stop_otp", {
+                    trip: this.active_trip,
+                    sequence: seq,
+                    lat: gps && gps.lat,
+                    lng: gps && gps.lng,
+                }).then(() => {
+                    frappe.show_alert({ message: __("OTP resent"), indicator: "blue" });
+                });
+            },
+        });
+        d.show();
+    }
+
+    _submit_stop_drop_bundle(seq, deliverable, values, gps) {
+        frappe.dom.freeze(__("Completing delivery for the whole stop…"));
+        const lat = (gps && gps.lat) || null;
+        const lng = (gps && gps.lng) || null;
+        return this._call_promise(API + "complete_stop_delivery", {
+            trip: this.active_trip,
+            sequence: seq,
+            scanned_qr: values.scanned_qr,
+            delivery_photo: values.delivery_photo,
+            receiver_name: values.receiver_name,
+            otp: values.otp,
+            lat, lng,
+            notes: values.notes,
+        })
+            .then((res) => {
+                const ok = (res && res.delivered) || [];
+                const fail = ((res && res.skipped) || []).map((s) => s.name);
+                const all_ok = ok.length && !fail.length;
+                const tail = all_ok
+                    ? this._call_promise(TRIP_API + "stop_complete", {
+                          trip: this.active_trip,
+                          sequence: seq,
+                          scan_compliance_pct: 100,
+                      })
+                    : Promise.resolve();
+                return tail.then(() => ({ ok, fail }));
+            })
+            .then(({ ok, fail }) => {
+                frappe.dom.unfreeze();
+                this._show_batch_result(__("Bundle delivery"), ok, fail);
+                this.show_trip_detail(this.active_trip);
+                this.load_data();
+            })
+            .catch((err) => {
+                frappe.dom.unfreeze();
+                this.show_trip_detail(this.active_trip);
+                console.error("bundle drop submit failed", err);
+            });
     }
 
     do_trip_exception() {

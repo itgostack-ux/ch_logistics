@@ -686,6 +686,13 @@ def get_trip_detail(trip):
             "manifest_count": s.manifest_count,
             "scan_compliance_pct": s.scan_compliance_pct,
             "notes": s.notes,
+            # Bundle-QR awareness — the driver UI uses these booleans to
+            # decide whether to show the consolidated "scan once" dialog
+            # (start_stop_pickup / complete_stop_delivery) instead of the
+            # legacy per-manifest QR loop. The actual token strings are
+            # NEVER returned over the wire; only their presence.
+            "has_pickup_token": bool((s.pickup_token or "").strip()),
+            "has_delivery_token": bool((s.delivery_token or "").strip()),
         })
 
     _has_stop_seq = _has_manifest_stop_seq_field()
@@ -1789,6 +1796,110 @@ def complete_stop_delivery(trip, sequence, scanned_qr, delivery_photo,
         "stop": stop.sequence,
         "delivered": delivered,
         "skipped": skipped,
+    }
+
+
+@frappe.whitelist()
+def request_stop_otp(trip, sequence, lat=None, lng=None):
+    """Mint ONE OTP for a whole consolidated stop.
+
+    Driver-app companion to ``complete_stop_delivery``. Carrier apps that
+    bundle multiple shipments under one drop (Delhivery, Ekart, Bringg)
+    issue a SINGLE receiver OTP per stop, not one per AWB — otherwise the
+    receiver would have to read out three codes for one handover.
+
+    Pipeline (mirrors what the per-manifest path does, but in one shot):
+      1. Every manifest at the stop must be In Transit.
+      2. ``mark_reached_destination`` is called on each manifest with the
+         driver's current GPS so the per-manifest arrival ping is on file
+         (needed by the existing ``complete_delivery`` guard).
+      3. A single 6-digit OTP is generated and written to every manifest's
+         ``delivery_otp`` so that the subsequent
+         ``complete_stop_delivery`` cascade validates against one shared
+         secret instead of N independent ones.
+      4. The OTP is dispatched via the first manifest's destination-store
+         contacts — by the bundling invariant every manifest in the stop
+         shares the same destination, so one notification covers them all.
+
+    Returns masked recipients (same shape as ``request_delivery_otp``) so
+    the UI can confirm where the code went without leaking PII.
+    """
+    from ch_logistics.api.transfer_manifest_api import (
+        _send_delivery_otp,
+        _require_stage_role,
+    )
+
+    _require_stage_role("complete_delivery")
+    trip_doc = frappe.get_doc("CH Logistics Trip", trip)
+    trip_doc.check_permission("write")
+    stop = _get_trip_stop(trip_doc, sequence)
+
+    rows = _stop_manifest_rows(trip_doc.name, stop.sequence)
+    if not rows:
+        frappe.throw(_("No manifests are attached to stop #{0}.").format(stop.sequence),
+                     title=_("Empty Stop"))
+
+    # Pre-flight: every manifest needs to be In Transit before OTP makes
+    # sense (request_delivery_otp enforces the same rule per manifest).
+    not_ready = [r.name for r in rows if r.status != "In Transit"]
+    if not_ready:
+        frappe.throw(
+            _("Cannot request stop OTP — these manifest(s) are not In Transit yet: {0}.")
+                .format(", ".join(not_ready)),
+            title=_("Pickup Not Done"),
+        )
+
+    # Mint one OTP using the first manifest's generator (so the secrets
+    # source and audit trail are identical to the per-manifest flow), then
+    # broadcast that same OTP across every other manifest at the stop.
+    first = frappe.get_doc("CH Transfer Manifest", rows[0].name)
+    first.check_permission("write")
+    # Step 1: arrival ping for the first manifest (so its delivery_otp can
+    # be requested via the same path as the per-manifest flow).
+    first.mark_reached_destination(lat=lat, lng=lng)
+    first._generate_delivery_otp()
+    first.flags.ignore_validate_update_after_submit = True
+    first.save()
+    shared_otp = first.delivery_otp
+
+    for r in rows[1:]:
+        doc = frappe.get_doc("CH Transfer Manifest", r.name)
+        doc.check_permission("write")
+        doc.mark_reached_destination(lat=lat, lng=lng)
+        doc.delivery_otp = shared_otp
+        doc.delivery_otp_verified = 0
+        doc.flags.ignore_validate_update_after_submit = True
+        doc.save()
+
+    frappe.db.commit()
+
+    # Send via the first manifest's destination — same store for all of
+    # them by the bundle invariant.
+    recipients = _send_delivery_otp(first) or {}
+
+    def _mask_email(addr):
+        if not addr or "@" not in addr:
+            return addr
+        local, _, domain = addr.partition("@")
+        if len(local) <= 1:
+            return f"{local[:1]}***@{domain}"
+        return f"{local[:1]}***{local[-1:]}@{domain}"
+
+    def _mask_mobile(num):
+        if not num:
+            return num
+        s = str(num)
+        if len(s) <= 4:
+            return s
+        return s[:2] + "*" * (len(s) - 4) + s[-2:]
+
+    return {
+        "message": _("OTP sent to the destination store. The same code unlocks every manifest at this stop."),
+        "manifest_count": len(rows),
+        "masked_emails": [_mask_email(e) for e in recipients.get("emails", [])],
+        "masked_mobiles": [_mask_mobile(m) for m in recipients.get("mobiles", [])],
+        "email_count": len(recipients.get("emails", [])),
+        "sms_count": len(recipients.get("mobiles", [])),
     }
 
 
