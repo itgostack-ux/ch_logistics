@@ -986,18 +986,21 @@ def get_driver_assignments() -> list:
     active_statuses = ["Assigned", "Pickup Started", "In Transit", "Delivered"]
     filters["status"] = ["in", active_statuses]
 
+    fields = [
+        "name", "status", "source_warehouse", "destination_warehouse",
+        "source_store", "destination_store",
+        "driver_name", "driver_phone",
+        "total_stock_entries", "total_items", "total_qty",
+        "estimated_delivery_date", "creation",
+        "trip",
+    ]
+    if frappe.db.has_column("CH Transfer Manifest", "arrival_datetime"):
+        fields.append("arrival_datetime")
+
     manifests = frappe.get_all(
         "CH Transfer Manifest",
         filters=filters,
-        fields=[
-            "name", "status", "source_warehouse", "destination_warehouse",
-            "source_store", "destination_store",
-            "driver_name", "driver_phone",
-            "total_stock_entries", "total_items", "total_qty",
-            "estimated_delivery_date", "creation",
-            "trip",
-            "arrival_datetime",
-        ],
+        fields=fields,
         order_by="creation desc",
         limit=100,
     )
