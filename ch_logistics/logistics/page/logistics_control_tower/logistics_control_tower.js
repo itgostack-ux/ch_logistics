@@ -632,6 +632,10 @@ class LogisticsCommandCenter {
 						<li><b>${__("Click Pack Box for each carton")}</b> — ${__("enter qty, weight, dimensions, seal & photo. The system mints a unique LPN like TM-2026-00025-B01.")}</li>
 						<li><b>${__("Box count auto-updates")}</b> — ${__("the manifest, list view, and command-tower KPIs all reflect the running carton count in real time.")}</li>
 					</ol>
+					<div class="lcc-pack-bundle-tip">
+						<i class="fa fa-qrcode"></i>
+						${__("<b>Bundling multiple manifests under one pickup QR?</b> Once they are marked Packed, switch to <b>Operations</b> → tick the manifests in <b>Unassigned Manifests</b> → click <b>Bundle &amp; Print Pickup QR</b>. The system clubs same-destination shipments into one trip stop with a single consolidated QR — driver scans once per drop.")}
+					</div>
 				</div>
 				<div class="lcc-ops-bar">
 					<div class="lcc-ops-bar-actions">
@@ -937,6 +941,7 @@ class LogisticsCommandCenter {
 			if (el && el.scrollIntoView) el.scrollIntoView({ behavior: "smooth", block: "start" });
 		});
 		$r.on("click",  ".lcc-new-trip-from-sel", () => this._ops_new_trip_from_selection());
+		$r.on("click",  ".lcc-bundle-print-qr",   () => this._ops_bundle_print_qr());
 
 		$r.on("click", ".lcc-ops-tabs .lcc-tab", (e) => {
 			this.bottom_tab = $(e.currentTarget).data("tab");
@@ -1220,6 +1225,10 @@ class LogisticsCommandCenter {
 				<button class="btn btn-sm btn-default lcc-new-trip-from-sel" disabled>
 					<i class="fa fa-plus"></i> ${__("Create Trip from Selected")}
 				</button>
+				<button class="btn btn-sm btn-warning lcc-bundle-print-qr" disabled
+					title="${__("Group selected manifests into one trip per destination and print the consolidated pickup QR — driver scans once per drop.")}">
+					<i class="fa fa-qrcode"></i> ${__("Bundle & Print Pickup QR")}
+				</button>
 				<span class="lcc-ops-bar-spacer"></span>
 				<span class="lcc-muted lcc-ops-bar-hint">${__("Only open manifests (Draft / Packed) are listed. Use the icons on the right to print labels, transfer receipts and e-Way Bills before dispatch.")}</span>
 			</div>
@@ -1360,6 +1369,10 @@ class LogisticsCommandCenter {
 		const n = this.selected_manifests.size;
 		this.$root.find(".lcc-attach-btn").prop("disabled", n === 0).find(".lcc-attach-n").text(n);
 		this.$root.find(".lcc-new-trip-from-sel").prop("disabled", n === 0);
+		// Bundling needs at least 2 manifests to be meaningful (one
+		// manifest already prints its own per-shipment QR via the
+		// per-row Print Box action).
+		this.$root.find(".lcc-bundle-print-qr").prop("disabled", n < 2);
 	}
 
 	/* ── Per-row print helpers (Operations → Manifests) ─────────
@@ -1785,6 +1798,135 @@ class LogisticsCommandCenter {
 	_ops_new_trip_from_selection() {
 		if (!this.selected_manifests.size) return;
 		this._dlg_new_trip(Array.from(this.selected_manifests));
+	}
+
+	/* ── Bundle into one consolidated pickup QR ──────────────────
+	 * One-click "pack N manifests together, print one scannable
+	 * label per destination" — the dispatcher-side equivalent of how
+	 * Ekart / Delhivery group a multi-shipment route into a single
+	 * driver scan per drop.
+	 *
+	 * Pipeline:
+	 *   1. club_transfers_into_trip(selected) — creates one trip with
+	 *      one stop per destination_store/warehouse. Each stop owns a
+	 *      random pickup_token + delivery_token (length 22, minted in
+	 *      _ensure_stop_tokens on the trip controller).
+	 *   2. get_stop_label(trip, sequence, kind=pickup) — server-side
+	 *      renders printable HTML with the QR data-URI embedded.
+	 *   3. Open every label in a single print-ready window so the
+	 *      packing team can hit Ctrl+P once and get a sheet per drop.
+	 */
+	async _ops_bundle_print_qr() {
+		const selected = Array.from(this.selected_manifests || []);
+		if (selected.length < 2) {
+			frappe.show_alert({ message: __("Select at least 2 manifests to bundle."), indicator: "orange" }, 5);
+			return;
+		}
+		const co = this.filters?.fields?.company?.get_value() || frappe.defaults.get_user_default("Company");
+		// Source warehouse is the only filter the API really needs; we
+		// trust the user's selection but block cross-warehouse bundles
+		// because those can't share a pickup label by definition.
+		const rows = (this.unassigned || []).filter((m) => selected.includes(m.name));
+		const sources = new Set(rows.map((r) => r.source_warehouse).filter(Boolean));
+		if (sources.size > 1) {
+			frappe.msgprint({
+				title: __("Cannot bundle"),
+				message: __("Selected manifests are picked up from {0} different warehouses. A single pickup QR only works for one pickup location.", [sources.size]),
+				indicator: "red",
+			});
+			return;
+		}
+		if (sources.size === 0) {
+			frappe.show_alert({ message: __("Selected manifests have no source warehouse set."), indicator: "red" }, 7);
+			return;
+		}
+		const source_warehouse = sources.values().next().value;
+
+		frappe.dom.freeze(__("Bundling manifests and minting pickup QR…"));
+		try {
+			const club = await frappe.call({
+				method: "ch_logistics.api.logistics_api.club_transfers_into_trip",
+				args: {
+					source_warehouse,
+					manifests: selected,
+					trip_date: this.trip_date || frappe.datetime.get_today(),
+					company:   co,
+				},
+			});
+			const res = (club && club.message) || {};
+			const trip = res.trip;
+			const stops = res.stops || [];
+			if (!trip || !stops.length) {
+				frappe.dom.unfreeze();
+				frappe.msgprint({ title: __("Bundle Failed"), message: __("Server did not return a trip."), indicator: "red" });
+				return;
+			}
+
+			// Pull every stop's printable label in parallel.
+			const labels = await Promise.all(stops.map((s) =>
+				frappe.call({
+					method: "ch_logistics.api.logistics_api.get_stop_label",
+					args: { trip, sequence: s.sequence, kind: "pickup" },
+				}).then((r) => r.message)
+			));
+
+			frappe.dom.unfreeze();
+
+			// Render in a print-ready dialog. One page-break per stop so
+			// hitting Print produces a sheet per drop.
+			const sheets = labels.map((lb, i) => `
+				<div class="lcc-bundle-sheet" style="page-break-after:${i < labels.length - 1 ? "always" : "auto"};">
+					${(lb && lb.html) || `<div class="lcc-empty">${__("Label render failed for stop {0}", [stops[i].sequence])}</div>`}
+				</div>
+			`).join("");
+
+			const d = new frappe.ui.Dialog({
+				title: __("Pickup QR — Trip {0}", [trip]),
+				size: "large",
+				fields: [{
+					fieldname: "html", fieldtype: "HTML",
+					options: `
+						<div class="lcc-bundle-summary alert alert-success" style="padding:8px 12px;margin-bottom:10px">
+							<i class="fa fa-check-circle"></i>
+							${__("Created trip <b>{0}</b> with <b>{1}</b> destination stop(s) covering <b>{2}</b> manifest(s). Each stop has one consolidated pickup QR — driver scans once per drop.", [trip, stops.length, selected.length])}
+						</div>
+						<div class="lcc-bundle-sheets">${sheets}</div>
+					`,
+				}],
+				primary_action_label: __("Print"),
+				primary_action: () => {
+					// Frappe-style print: open the rendered HTML in a new
+					// window so the browser print dialog scopes to JUST
+					// the labels (not the desk chrome).
+					const w = window.open("", "_blank", "width=480,height=720");
+					w.document.write(`
+						<html><head><title>${frappe.utils.escape_html(trip)} — ${__("Pickup QR")}</title>
+						<style>
+							body { font-family: Arial, sans-serif; margin: 0; padding: 16px; background:#fff; }
+							.lcc-bundle-sheet { margin: 0 auto 24px auto; }
+							@media print { .lcc-bundle-sheet { page-break-after: always; } .lcc-bundle-sheet:last-child { page-break-after: auto; } }
+						</style>
+						</head><body>${sheets}<script>window.onload=()=>setTimeout(()=>window.print(),200);</script></body></html>
+					`);
+					w.document.close();
+				},
+				secondary_action_label: __("Open Trip"),
+				secondary_action: () => {
+					d.hide();
+					frappe.set_route("Form", "CH Logistics Trip", trip);
+				},
+			});
+			d.show();
+
+			// Refresh the panel so the bundled manifests disappear from
+			// the unassigned list (they now have a trip).
+			this.selected_manifests.clear();
+			this._ops_load();
+		} catch (err) {
+			frappe.dom.unfreeze();
+			const msg = (err && err.message) || __("Unknown error");
+			frappe.msgprint({ title: __("Bundle Failed"), message: msg, indicator: "red" });
+		}
 	}
 
 	_dlg_auto_plan() {

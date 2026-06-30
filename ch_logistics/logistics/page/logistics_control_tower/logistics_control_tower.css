@@ -1102,6 +1102,17 @@
 }
 .lcc-pack-steps li { margin-bottom: 2px; }
 .lcc-pack-steps b { color: #0c4a6e; }
+.lcc-pack-bundle-tip {
+	margin-top: 10px;
+	padding: 8px 12px;
+	background: #fff7ed;
+	border: 1px solid #fed7aa;
+	border-radius: 6px;
+	color: #7c2d12;
+	font-size: 12.5px;
+	line-height: 1.5;
+}
+.lcc-pack-bundle-tip .fa { color: #c2410c; margin-right: 6px; }
 .lcc-pack-body { margin-top: 8px; }
 .lcc-pack-table th, .lcc-pack-table td { vertical-align: middle; }
 .lcc-pack-prog-wrap {
