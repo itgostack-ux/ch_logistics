@@ -129,64 +129,93 @@ def run():
         s1   = _ensure_store(f"{_TAG}-Store1", d1wh)
         s2   = _ensure_store(f"{_TAG}-Store2", d2wh)
 
-        # Three Packed manifests, two destinations — exactly what the
-        # dispatcher would tick after the pack station marks them Packed.
+        # Three Packed manifests, ALL going to the SAME destination —
+        # exactly what the bundle button now requires (same source +
+        # same destination = one pickup QR + one delivery QR).
         m1 = _make_manifest(src, d1wh, s1, 1)
-        m2 = _make_manifest(src, d2wh, s2, 2)
+        m2 = _make_manifest(src, d1wh, s1, 2)
         m3 = _make_manifest(src, d1wh, s1, 3)
         selected = [m1, m2, m3]
-        print(f"  packed manifests ready: {selected}")
+        print(f"  packed manifests ready (same dest): {selected}")
 
         # ── Step 1 : Bundle ────────────────────────────────────────
-        print("== Step 1 — club_transfers_into_trip ==")
+        print("== Step 1 — club_transfers_into_trip (enforce_single_destination=1) ==")
         res = api.club_transfers_into_trip(
             source_warehouse=src,
             manifests=selected,
             trip_date=nowdate(),
             company=_company(),
+            enforce_single_destination=1,
         )
         trip = res["trip"]
         stops = res["stops"]
         _expect(trip, f"trip created: {trip}")
-        _expect(len(stops) == 2, f"two stops created (got {len(stops)})")
-        _expect(sum(len(s["manifests"]) for s in stops) == 3,
-                "all 3 manifests landed on a stop")
+        _expect(len(stops) == 1, f"exactly ONE stop created (got {len(stops)})")
+        _expect(len(stops[0]["manifests"]) == 3,
+                "all 3 manifests landed on the single stop")
+        _expect(stops[0]["store"] == s1,
+                f"stop is the shared destination store ({s1})")
 
-        # ── Step 2 : Get label for each stop ──────────────────────
-        print("== Step 2 — get_stop_label per stop ==")
-        labels = []
-        for s in stops:
-            lbl = api.get_stop_label(trip=trip, sequence=s["sequence"], kind="pickup")
-            labels.append((s, lbl))
-            _expect(s["pickup_token"] == lbl["token"],
-                    f"stop #{s['sequence']} label token matches pickup_token")
-            _expect(lbl["manifest_count"] == len(s["manifests"]),
-                    f"stop #{s['sequence']} manifest count consistent ({lbl['manifest_count']})")
-            _expect("<div" in lbl["html"] and lbl["token"] in lbl["html"],
-                    f"stop #{s['sequence']} HTML embeds the token and renders a div")
+        # ── Step 2 : Get label for the stop ───────────────────────
+        print("== Step 2 — get_stop_label for the consolidated stop ==")
+        s = stops[0]
+        lbl = api.get_stop_label(trip=trip, sequence=s["sequence"], kind="pickup")
+        _expect(s["pickup_token"] == lbl["token"],
+                "label token matches stop.pickup_token")
+        _expect(lbl["manifest_count"] == 3,
+                f"label manifest_count == 3 (got {lbl['manifest_count']})")
+        _expect("<div" in lbl["html"] and lbl["token"] in lbl["html"],
+                "label HTML embeds the token and renders a div")
 
-        # ── Step 3 : Negative path (different source warehouses) ─
-        # Mirrors the front-end guard: a bundle with two source
-        # warehouses must NOT produce a trip. The UI catches this client
-        # side; the server-side API enforces the same invariant because
-        # its filter is anchored to ``source_warehouse``: a manifest from
-        # a *different* source is silently skipped, which leaves an empty
-        # attachable pool and the API throws "Nothing to Club".
+        # ── Step 3 : Negative path — cross-source bundle is refused ─
+        # Mirrors the UI guard for source warehouse: a manifest from a
+        # different source warehouse is silently skipped by the filter,
+        # which leaves an empty attachable pool and the API throws
+        # "Nothing to Club".
         print("== Step 3 — refuses to bundle across source warehouses ==")
         other_src = _ensure_warehouse(f"{_TAG}-Hub2", abbr)
-        m4 = _make_manifest(other_src, d1wh, s1, 4)  # Packed @ other_src
+        m4 = _make_manifest(other_src, d1wh, s1, 4)
         try:
             api.club_transfers_into_trip(
-                source_warehouse=src,         # anchor source = src
-                manifests=[m4],                # but the manifest is from other_src
+                source_warehouse=src,
+                manifests=[m4],
                 trip_date=nowdate(),
                 company=_company(),
+                enforce_single_destination=1,
             )
             _expect(False, "API should refuse — m4 is from a different source")
         except frappe.ValidationError as exc:
             msg = str(exc).lower()
             _expect("no attachable" in msg or "nothing to club" in msg or "warehouse" in msg,
                     f"server rejected cross-warehouse bundle: {exc}")
+
+        # ── Step 4 : Negative path — mixed destinations is refused ─
+        # This is the server-side mirror of the new client-side guard:
+        # when enforce_single_destination=1, the API must throw before
+        # any trip/stop is created.
+        print("== Step 4 — refuses to bundle across destination stores ==")
+        m5 = _make_manifest(src, d1wh, s1, 5)
+        m6 = _make_manifest(src, d2wh, s2, 6)
+        try:
+            api.club_transfers_into_trip(
+                source_warehouse=src,
+                manifests=[m5, m6],
+                trip_date=nowdate(),
+                company=_company(),
+                enforce_single_destination=1,
+            )
+            _expect(False, "API should refuse — m5 and m6 have different destinations")
+        except frappe.ValidationError as exc:
+            msg = str(exc).lower()
+            _expect("cannot bundle" in msg or "mixed destinations" in msg
+                    or "different destinations" in msg or "destination" in msg,
+                    f"server rejected mixed-destination bundle: {exc}")
+        # And ensure neither m5 nor m6 was attached to any trip.
+        residue = frappe.get_all("CH Transfer Manifest",
+                                 filters={"name": ["in", [m5, m6]]},
+                                 fields=["name", "trip"])
+        _expect(all((r.trip in (None, "")) for r in residue),
+                "no trip was created for the refused bundle")
 
         print("\nALL BUNDLE-FLOW ASSERTIONS PASSED")
         return {

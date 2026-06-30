@@ -1801,20 +1801,28 @@ class LogisticsCommandCenter {
 	}
 
 	/* ── Bundle into one consolidated pickup QR ──────────────────
-	 * One-click "pack N manifests together, print one scannable
-	 * label per destination" — the dispatcher-side equivalent of how
-	 * Ekart / Delhivery group a multi-shipment route into a single
-	 * driver scan per drop.
+	 * One-click "pack N manifests together, print ONE scannable
+	 * label" — the dispatcher-side equivalent of how Ekart /
+	 * Delhivery group a multi-shipment drop into a single driver scan.
+	 *
+	 * Hard rules (enforced both client- and server-side):
+	 *   • All selected manifests must share the SAME source warehouse
+	 *     (one physical pickup point).
+	 *   • All selected manifests must share the SAME destination
+	 *     store / warehouse (one physical drop point).
+	 * Anything that violates these is refused with a clear modal
+	 * before the API is ever called.
 	 *
 	 * Pipeline:
 	 *   1. club_transfers_into_trip(selected) — creates one trip with
-	 *      one stop per destination_store/warehouse. Each stop owns a
-	 *      random pickup_token + delivery_token (length 22, minted in
-	 *      _ensure_stop_tokens on the trip controller).
+	 *      one stop (because all destinations are identical). The stop
+	 *      owns a random pickup_token + delivery_token (length 22,
+	 *      minted in _ensure_stop_tokens on the trip controller).
 	 *   2. get_stop_label(trip, sequence, kind=pickup) — server-side
 	 *      renders printable HTML with the QR data-URI embedded.
 	 *   3. Open every label in a single print-ready window so the
-	 *      packing team can hit Ctrl+P once and get a sheet per drop.
+	 *      packing team can hit Ctrl+P once and get the consolidated
+	 *      pickup sheet.
 	 */
 	async _ops_bundle_print_qr() {
 		const selected = Array.from(this.selected_manifests || []);
@@ -1823,11 +1831,16 @@ class LogisticsCommandCenter {
 			return;
 		}
 		const co = this.filters?.fields?.company?.get_value() || frappe.defaults.get_user_default("Company");
-		// Source warehouse is the only filter the API really needs; we
-		// trust the user's selection but block cross-warehouse bundles
-		// because those can't share a pickup label by definition.
-		const rows = (this.unassigned || []).filter((m) => selected.includes(m.name));
+		// A bundle = one pickup QR + one delivery QR. That only makes
+		// sense when every selected manifest shares (a) the same source
+		// warehouse — the one physical pickup point — AND (b) the same
+		// destination store/warehouse — the one physical drop point.
+		// Mixed sources break the pickup label; mixed destinations break
+		// the delivery label.
+		const rows  = (this.unassigned || []).filter((m) => selected.includes(m.name));
+		const _key  = (r) => r.destination_store || r.destination_warehouse || "";
 		const sources = new Set(rows.map((r) => r.source_warehouse).filter(Boolean));
+		const dests   = new Set(rows.map(_key).filter(Boolean));
 		if (sources.size > 1) {
 			frappe.msgprint({
 				title: __("Cannot bundle"),
@@ -1836,8 +1849,21 @@ class LogisticsCommandCenter {
 			});
 			return;
 		}
+		if (dests.size > 1) {
+			const list = Array.from(dests).map(frappe.utils.escape_html).join(", ");
+			frappe.msgprint({
+				title: __("Cannot bundle"),
+				message: __("Selected manifests are dropping at {0} different destinations ({1}). To share one pickup &amp; delivery QR, all manifests in a bundle must go to the <b>same destination store</b>.", [dests.size, list]),
+				indicator: "red",
+			});
+			return;
+		}
 		if (sources.size === 0) {
 			frappe.show_alert({ message: __("Selected manifests have no source warehouse set."), indicator: "red" }, 7);
+			return;
+		}
+		if (dests.size === 0) {
+			frappe.show_alert({ message: __("Selected manifests have no destination store set."), indicator: "red" }, 7);
 			return;
 		}
 		const source_warehouse = sources.values().next().value;
@@ -1851,6 +1877,7 @@ class LogisticsCommandCenter {
 					manifests: selected,
 					trip_date: this.trip_date || frappe.datetime.get_today(),
 					company:   co,
+					enforce_single_destination: 1,
 				},
 			});
 			const res = (club && club.message) || {};

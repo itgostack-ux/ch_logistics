@@ -1808,7 +1808,8 @@ def _destination_key(m):
 
 @frappe.whitelist()
 def club_transfers_into_trip(source_warehouse, trip_date=None, company=None,
-                             manifests=None, vehicle=None, driver=None):
+                             manifests=None, vehicle=None, driver=None,
+                             enforce_single_destination=False):
     """Group ready-to-ship manifests from one warehouse into one trip.
 
     For the dispatcher who has five transfer requests like:
@@ -1832,6 +1833,10 @@ def club_transfers_into_trip(source_warehouse, trip_date=None, company=None,
       mirrored by Operations Tab) and which is not yet on a trip.
     * ``trip_date`` (optional): when scanning by status, restricts to the
       given date. Defaults to today.
+    * ``enforce_single_destination`` (default False): when True, refuses
+      to club manifests that span multiple destination stores/warehouses
+      — this is the rule the "Bundle & Print Pickup QR" UI sends so that
+      one bundle = one pickup + one delivery point.
     """
     if not _has_manifest_trip_field():
         frappe.throw(_("CH Transfer Manifest is missing the 'trip' field. Run bench migrate."),
@@ -1883,6 +1888,16 @@ def club_transfers_into_trip(source_warehouse, trip_date=None, company=None,
     if not groups:
         frappe.throw(_("No manifests in the pool have a destination set."),
                      title=_("Nothing to Club"))
+
+    if enforce_single_destination and len(order) > 1:
+        # Mirrors the client-side guard on the "Bundle & Print Pickup QR"
+        # button: a single bundle = one pickup point + one delivery point.
+        frappe.throw(
+            _("Cannot bundle: selected manifests drop at {0} different destinations ({1}). "
+              "For a single consolidated QR all manifests must share the same destination store.")
+                .format(len(order), ", ".join(order)),
+            title=_("Mixed Destinations"),
+        )
 
     # Create the trip.
     trip = frappe.new_doc("CH Logistics Trip")
