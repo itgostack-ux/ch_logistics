@@ -2237,7 +2237,7 @@ class DeliveryApp {
         frappe.dom.freeze(__("Recording arrival & cascading pickup…"));
         return this._capture_gps_promise()
             .then(({ lat, lng }) => {
-                return this._call_promise(API + "start_stop_pickup", {
+                return this._call_promise(TRIP_API + "start_stop_pickup", {
                     trip: this.active_trip,
                     sequence: seq,
                     scanned_qr: values.scanned_qr,
@@ -2304,7 +2304,7 @@ class DeliveryApp {
         this._capture_gps_promise()
             .then(({ lat, lng }) => {
                 gps_cache = { lat, lng };
-                return this._call_promise(API + "request_stop_otp", {
+                return this._call_promise(TRIP_API + "request_stop_otp", {
                     trip: this.active_trip,
                     sequence: seq,
                     lat, lng,
@@ -2394,7 +2394,7 @@ class DeliveryApp {
             },
             secondary_action_label: __("Resend OTP"),
             secondary_action: () => {
-                this._call_promise(API + "request_stop_otp", {
+                this._call_promise(TRIP_API + "request_stop_otp", {
                     trip: this.active_trip,
                     sequence: seq,
                     lat: gps && gps.lat,
@@ -2411,7 +2411,7 @@ class DeliveryApp {
         frappe.dom.freeze(__("Completing delivery for the whole stop…"));
         const lat = (gps && gps.lat) || null;
         const lng = (gps && gps.lng) || null;
-        return this._call_promise(API + "complete_stop_delivery", {
+        return this._call_promise(TRIP_API + "complete_stop_delivery", {
             trip: this.active_trip,
             sequence: seq,
             scanned_qr: values.scanned_qr,
