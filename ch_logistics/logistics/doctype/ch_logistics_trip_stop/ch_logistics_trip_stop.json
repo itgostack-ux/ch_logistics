@@ -16,6 +16,12 @@
   "gps_lng",
   "manifest_count",
   "scan_compliance_pct",
+  "pickup_token",
+  "delivery_token",
+  "pickup_scanned_at",
+  "pickup_scanned_by",
+  "delivery_scanned_at",
+  "delivery_scanned_by",
   "notes"
  ],
  "fields": [
@@ -100,6 +106,54 @@
    "fieldtype": "Percent",
    "label": "Scan %",
    "read_only": 1
+  },
+  {
+   "fieldname": "pickup_token",
+   "fieldtype": "Data",
+   "label": "Pickup QR Token",
+   "read_only": 1,
+   "no_copy": 1,
+   "length": 64,
+   "description": "Random token printed on the consolidated pickup label for this stop. Driver must scan this to start pickup of every shipment grouped under this stop."
+  },
+  {
+   "fieldname": "delivery_token",
+   "fieldtype": "Data",
+   "label": "Delivery QR Token",
+   "read_only": 1,
+   "no_copy": 1,
+   "length": 64,
+   "description": "Random token printed on the consolidated drop label for this stop. Driver must scan this to complete delivery of every shipment grouped under this stop."
+  },
+  {
+   "fieldname": "pickup_scanned_at",
+   "fieldtype": "Datetime",
+   "label": "Pickup Scanned At",
+   "read_only": 1,
+   "no_copy": 1
+  },
+  {
+   "fieldname": "pickup_scanned_by",
+   "fieldtype": "Link",
+   "label": "Pickup Scanned By",
+   "options": "User",
+   "read_only": 1,
+   "no_copy": 1
+  },
+  {
+   "fieldname": "delivery_scanned_at",
+   "fieldtype": "Datetime",
+   "label": "Delivery Scanned At",
+   "read_only": 1,
+   "no_copy": 1
+  },
+  {
+   "fieldname": "delivery_scanned_by",
+   "fieldtype": "Link",
+   "label": "Delivery Scanned By",
+   "options": "User",
+   "read_only": 1,
+   "no_copy": 1
   },
   {
    "fieldname": "notes",

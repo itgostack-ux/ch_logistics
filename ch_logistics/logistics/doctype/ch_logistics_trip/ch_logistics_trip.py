@@ -31,6 +31,7 @@ class CHLogisticsTrip(Document):
     def validate(self):
         self._validate_stops()
         self._populate_hub_from_route()
+        self._ensure_stop_tokens()
         self._recompute_totals()
 
     def before_save(self):
@@ -50,6 +51,24 @@ class CHLogisticsTrip(Document):
     def _populate_hub_from_route(self):
         if self.route and not self.hub_warehouse:
             self.hub_warehouse = frappe.db.get_value("CH Route", self.route, "hub_warehouse")
+
+    def _ensure_stop_tokens(self):
+        """Generate per-stop pickup/delivery QR tokens.
+
+        Each stop gets its own random tokens so the packing team can print a
+        single consolidated label per destination. The driver scans the
+        printed QR once at the source to start pickup for every manifest
+        grouped under that stop, and once at the destination to complete
+        delivery for the same group. Tokens are random hashes — never derived
+        from doc names — so they cannot be guessed.
+        """
+        if not self.stops:
+            return
+        for stop in self.stops:
+            if not stop.get("pickup_token"):
+                stop.pickup_token = frappe.generate_hash(length=22)
+            if not stop.get("delivery_token"):
+                stop.delivery_token = frappe.generate_hash(length=22)
 
     def _recompute_totals(self):
         # Total shipments = manifests linked to this trip (resolved on save).

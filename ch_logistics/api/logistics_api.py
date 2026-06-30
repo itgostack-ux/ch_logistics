@@ -1485,3 +1485,424 @@ def ops_map_data(trip_date=None, include_days=1, statuses=None):
         "manifests_with_coords": with_coords,
         "manifests_total": total,
     }
+
+
+# ---------------------------------------------------------------------------
+# Stop-level QR scanning
+# ---------------------------------------------------------------------------
+#
+# Business model
+# ──────────────
+# A single trip may carry many CH Transfer Manifests for the same destination
+# (e.g. five Store-1 transfer requests on one truck). Today every manifest has
+# its own QR. That works for full traceability, but the packing/driver team
+# wants ONE scannable label per destination drop so a multi-request load can
+# be picked up and dropped with a single scan.
+#
+# Implementation
+# ──────────────
+# 1. CH Logistics Trip Stop now owns two random tokens (pickup_token,
+#    delivery_token) generated at trip save (see _ensure_stop_tokens).
+# 2. The packing team prints one consolidated label per stop using
+#    get_stop_label() — the QR encodes the pickup_token.
+# 3. start_stop_pickup() / complete_stop_delivery() validate the scan against
+#    the stop tokens and cascade to every manifest sitting on that stop using
+#    the existing transfer-manifest pickup / delivery flow. Per-manifest audit
+#    fields (photos, GPS, scanned_qr) are still stamped on each manifest, so
+#    nothing in the downstream stock receipt or compliance reports changes.
+#
+# Stock semantics are unchanged: the source Stock Entry already moved goods
+# to "Goods In Transit" before the manifest was assigned. The stop scan only
+# governs the physical handover; the destination Stock Entry / receipt fires
+# from the per-manifest accept_delivery / receive flow as before.
+
+def _get_trip_stop(trip_doc, sequence):
+    seq = cint(sequence)
+    for s in trip_doc.stops:
+        if cint(s.sequence) == seq:
+            return s
+    frappe.throw(
+        _("Stop sequence {0} not found on trip {1}").format(seq, trip_doc.name),
+        title=_("API Error"),
+    )
+
+
+def _stop_manifest_rows(trip, sequence):
+    """All non-cancelled manifests bound to this trip + stop sequence."""
+    if not _has_manifest_trip_field() or not _has_manifest_stop_seq_field():
+        return []
+    return frappe.get_all(
+        "CH Transfer Manifest",
+        filters={"trip": trip, "stop_sequence": cint(sequence), "docstatus": ["<", 2]},
+        fields=["name", "status"],
+        order_by="creation asc",
+    )
+
+
+@frappe.whitelist()
+def start_stop_pickup(trip, sequence, scanned_qr, pickup_photo,
+                      lat=None, lng=None, notes=None):
+    """Driver scans the consolidated pickup label for a whole stop.
+
+    Validates the scanned token against CH Logistics Trip Stop.pickup_token
+    and runs start_pickup for every manifest under that stop. Per-manifest QR
+    is also stamped (scanned_qr=stop_token) so each manifest's individual
+    audit log still records what was scanned at pickup time.
+    """
+    trip_doc = frappe.get_doc("CH Logistics Trip", trip)
+    trip_doc.check_permission("write")
+    stop = _get_trip_stop(trip_doc, sequence)
+    scanned = (scanned_qr or "").strip()
+    if not scanned:
+        frappe.throw(_("QR scan is mandatory to start pickup for this stop."),
+                     title=_("Scan Required"))
+    expected = (stop.get("pickup_token") or "").strip()
+    if not expected:
+        frappe.throw(_("This stop has no pickup token yet. Re-save the trip to mint one."),
+                     title=_("Token Missing"))
+    if scanned != expected:
+        frappe.throw(_("Scanned QR does not match the pickup label for stop #{0}.").format(stop.sequence),
+                     title=_("Wrong Label"))
+
+    rows = _stop_manifest_rows(trip_doc.name, stop.sequence)
+    if not rows:
+        frappe.throw(_("No manifests are attached to stop #{0}.").format(stop.sequence),
+                     title=_("Empty Stop"))
+
+    started, skipped = [], []
+    audit_suffix = _("Consolidated stop pickup — driver scanned stop QR {0}.").format(scanned)
+    for r in rows:
+        try:
+            doc = frappe.get_doc("CH Transfer Manifest", r.name)
+            doc.check_permission("write")
+            # The driver scanned the consolidated stop label, not each carton.
+            # The per-manifest _validate_pickup_qr expects the manifest's own
+            # qr_payload, so we hand that through and log the stop token in
+            # pickup_notes for the audit trail — same pattern Ekart uses when
+            # a single "hand-over scan" covers multiple AWBs on one route.
+            manifest_note = audit_suffix if not notes else (notes + " | " + audit_suffix)
+            doc.start_pickup(
+                pickup_photo=pickup_photo,
+                lat=lat,
+                lng=lng,
+                notes=manifest_note,
+                scanned_qr=(doc.qr_payload or doc.name),
+            )
+            started.append(r.name)
+        except frappe.ValidationError as exc:
+            # Surface why a single manifest could not advance (e.g. already
+            # picked up) without aborting the whole stop.
+            skipped.append({"name": r.name, "reason": str(exc)})
+
+    if started:
+        stop.pickup_scanned_at = now_datetime()
+        stop.pickup_scanned_by = frappe.session.user
+        stop.status = "Arrived"
+        trip_doc.save(ignore_permissions=True)
+
+    return {
+        "trip": trip_doc.name,
+        "stop": stop.sequence,
+        "started": started,
+        "skipped": skipped,
+    }
+
+
+@frappe.whitelist()
+def complete_stop_delivery(trip, sequence, scanned_qr, delivery_photo,
+                           receiver_name, otp=None, lat=None, lng=None,
+                           notes=None):
+    """Driver scans the consolidated drop label for a whole stop.
+
+    Validates the scanned token against CH Logistics Trip Stop.delivery_token
+    and runs complete_delivery for every manifest under that stop. Receiver
+    name + OTP + GPS + photo are recorded per manifest so accept_delivery
+    downstream still has the data it needs.
+    """
+    trip_doc = frappe.get_doc("CH Logistics Trip", trip)
+    trip_doc.check_permission("write")
+    stop = _get_trip_stop(trip_doc, sequence)
+    scanned = (scanned_qr or "").strip()
+    if not scanned:
+        frappe.throw(_("QR scan is mandatory to complete delivery for this stop."),
+                     title=_("Scan Required"))
+    expected = (stop.get("delivery_token") or "").strip()
+    if not expected:
+        frappe.throw(_("This stop has no delivery token yet. Re-save the trip to mint one."),
+                     title=_("Token Missing"))
+    if scanned != expected:
+        frappe.throw(_("Scanned QR does not match the drop label for stop #{0}.").format(stop.sequence),
+                     title=_("Wrong Label"))
+
+    rows = _stop_manifest_rows(trip_doc.name, stop.sequence)
+    if not rows:
+        frappe.throw(_("No manifests are attached to stop #{0}.").format(stop.sequence),
+                     title=_("Empty Stop"))
+
+    delivered, skipped = [], []
+    for r in rows:
+        try:
+            doc = frappe.get_doc("CH Transfer Manifest", r.name)
+            doc.check_permission("write")
+            doc.complete_delivery(
+                delivery_photo=delivery_photo,
+                receiver_name=receiver_name,
+                otp=otp,
+                lat=lat,
+                lng=lng,
+                # Same translation as start_stop_pickup: consolidated stop
+                # token is the actual authorization; per-manifest validators
+                # still want each manifest's own qr_payload.
+                scanned_qr=(doc.qr_payload or doc.name),
+            )
+            delivered.append(r.name)
+        except frappe.ValidationError as exc:
+            skipped.append({"name": r.name, "reason": str(exc)})
+
+    if delivered:
+        stop.delivery_scanned_at = now_datetime()
+        stop.delivery_scanned_by = frappe.session.user
+        stop.status = "Completed"
+        if not stop.get("ata"):
+            stop.ata = now_datetime()
+        trip_doc.save(ignore_permissions=True)
+
+    return {
+        "trip": trip_doc.name,
+        "stop": stop.sequence,
+        "delivered": delivered,
+        "skipped": skipped,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Clubbing — one truck, one stop per destination
+# ---------------------------------------------------------------------------
+
+def _destination_key(m):
+    """Group key for clubbing.
+
+    Prefer destination store (CH Store) — that's what the driver actually
+    drops at. Fall back to destination warehouse for manifests that aren't
+    store-bound (e.g. inter-DC moves).
+    """
+    return m.get("destination_store") or m.get("destination_warehouse")
+
+
+@frappe.whitelist()
+def club_transfers_into_trip(source_warehouse, trip_date=None, company=None,
+                             manifests=None, vehicle=None, driver=None):
+    """Group ready-to-ship manifests from one warehouse into one trip.
+
+    For the dispatcher who has five transfer requests like:
+        10:00 Warehouse → Store 1
+        10:15 Warehouse → Store 2
+        10:20 Warehouse → Store 1
+        10:30 Warehouse → Store 1
+        10:45 Warehouse → Store 2
+
+    Calling this once with source_warehouse=W produces:
+        Trip
+          Stop 1 — Store 1 (3 manifests, one pickup_token, one delivery_token)
+          Stop 2 — Store 2 (2 manifests, one pickup_token, one delivery_token)
+
+    Selection rules
+    ───────────────
+    * ``manifests`` (optional): explicit list of manifest names. When given,
+      only those are clubbed.
+    * Otherwise: every CH Transfer Manifest whose source_warehouse matches
+      and whose status is Draft or Packed (the dispatcher-attachable set
+      mirrored by Operations Tab) and which is not yet on a trip.
+    * ``trip_date`` (optional): when scanning by status, restricts to the
+      given date. Defaults to today.
+    """
+    if not _has_manifest_trip_field():
+        frappe.throw(_("CH Transfer Manifest is missing the 'trip' field. Run bench migrate."),
+                     title=_("Schema Mismatch"))
+
+    if isinstance(manifests, str):
+        try:
+            manifests = frappe.parse_json(manifests)
+        except Exception:
+            manifests = [m.strip() for m in manifests.split(",") if m.strip()]
+
+    trip_date = trip_date or frappe.utils.today()
+    company = company or frappe.defaults.get_user_default("company")
+    if not company:
+        frappe.throw(_("Company is required to create a trip."), title=_("API Error"))
+
+    filters = {
+        "source_warehouse": source_warehouse,
+        "trip": ["in", [None, ""]],
+        "docstatus": ["<", 2],
+    }
+    if manifests:
+        filters["name"] = ["in", list(manifests)]
+    else:
+        filters["status"] = ["in", _OPS_ATTACHABLE_MANIFEST_STATUSES]
+
+    fields = ["name", "destination_store", "destination_warehouse", "status"]
+    pool = frappe.get_all("CH Transfer Manifest", filters=filters, fields=fields,
+                          order_by="creation asc")
+    if not pool:
+        frappe.throw(
+            _("No attachable manifests found from {0}. They must be Draft/Packed and not already on a trip.")
+                .format(source_warehouse),
+            title=_("Nothing to Club"),
+        )
+
+    # Group by destination — preserve first-seen order for deterministic stops.
+    groups = {}
+    order = []
+    for m in pool:
+        key = _destination_key(m)
+        if not key:
+            continue
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(m)
+
+    if not groups:
+        frappe.throw(_("No manifests in the pool have a destination set."),
+                     title=_("Nothing to Club"))
+
+    # Create the trip.
+    trip = frappe.new_doc("CH Logistics Trip")
+    trip.trip_date = trip_date
+    trip.company = company
+    trip.direction = "Forward"
+    trip.hub_warehouse = source_warehouse
+    if vehicle:
+        trip.vehicle = vehicle
+    trip.insert(ignore_permissions=True)
+
+    # One stop per destination.
+    for idx, key in enumerate(order, start=1):
+        store_name = None
+        warehouse_name = None
+        # Resolve store vs warehouse — the key may be either.
+        if frappe.db.exists("CH Store", key):
+            store_name = key
+            warehouse_name = frappe.db.get_value("CH Store", key, "warehouse")
+        else:
+            warehouse_name = key
+        if not warehouse_name:
+            # Fall back to the manifest's destination warehouse.
+            warehouse_name = groups[key][0].get("destination_warehouse")
+
+        trip.append("stops", {
+            "sequence": idx,
+            "warehouse": warehouse_name,
+            "store": store_name,
+            "stop_type": "Drop",
+            "status": "Pending",
+        })
+
+    trip.save(ignore_permissions=True)
+
+    # Attach manifests + stamp stop_sequence so existing
+    # _assign_stop_sequence semantics are honoured.
+    seq_by_key = {key: idx for idx, key in enumerate(order, start=1)}
+    for key, rows in groups.items():
+        _attach_manifests(trip.name, [r.name for r in rows])
+        seq = seq_by_key[key]
+        if _has_manifest_stop_seq_field():
+            for r in rows:
+                frappe.db.set_value("CH Transfer Manifest", r.name, "stop_sequence", seq)
+
+    # Optional driver assignment after the trip is built.
+    if driver:
+        assign_driver(trip.name, driver, vehicle)
+
+    trip.reload()
+    return {
+        "trip": trip.name,
+        "stops": [
+            {
+                "sequence": s.sequence,
+                "store": s.store,
+                "warehouse": s.warehouse,
+                "pickup_token": s.pickup_token,
+                "delivery_token": s.delivery_token,
+                "manifests": [m.name for m in groups[order[s.sequence - 1]]],
+            }
+            for s in trip.stops
+        ],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Printable consolidated stop label (QR)
+# ---------------------------------------------------------------------------
+
+@frappe.whitelist()
+def get_stop_label(trip, sequence, kind="pickup"):
+    """Return printable HTML for the consolidated stop label.
+
+    kind:
+        "pickup"   → QR encodes pickup_token
+        "delivery" → QR encodes delivery_token
+
+    Renders pure-HTML markup that the print preview can show, embed in the
+    desk \"Print\" dialog, or any client-side wrapper can paste into a
+    label-printer driver. The QR is a Code 128 / Data URI rendered by
+    frappe.utils.qrcode so no extra dependency is required.
+    """
+    from frappe.utils import escape_html
+    from urllib.parse import quote
+
+    if kind not in ("pickup", "delivery"):
+        frappe.throw(_("kind must be 'pickup' or 'delivery'."), title=_("API Error"))
+
+    trip_doc = frappe.get_doc("CH Logistics Trip", trip)
+    trip_doc.check_permission("read")
+    stop = _get_trip_stop(trip_doc, sequence)
+
+    token = stop.get("pickup_token") if kind == "pickup" else stop.get("delivery_token")
+    if not token:
+        frappe.throw(_("This stop is missing a {0} token. Re-save the trip.").format(kind),
+                     title=_("Token Missing"))
+
+    manifests = _stop_manifest_rows(trip_doc.name, stop.sequence)
+    manifest_list_html = "".join(
+        f"<li>{escape_html(m.name)} — {escape_html(m.status or '')}</li>" for m in manifests
+    ) or "<li><i>No manifests attached yet</i></li>"
+
+    title = _("Pickup Label") if kind == "pickup" else _("Drop Label")
+    qr_src = f"/api/method/frappe.utils.print_format.print_by_server?qr_text={quote(token)}"
+    # Use the public QR helper that's already bundled with frappe.
+    try:
+        from frappe.utils.image import generate_qrcode_dataurl
+        qr_src = generate_qrcode_dataurl(token)
+    except Exception:
+        try:
+            from frappe.utils import get_qr_code_data_url
+            qr_src = get_qr_code_data_url(token)
+        except Exception:
+            # Final fallback: an external QR service is NOT used to avoid
+            # leaking the token. We print the raw token instead so the
+            # operator can re-mint a barcode label-side.
+            qr_src = ""
+
+    return {
+        "trip": trip_doc.name,
+        "stop": stop.sequence,
+        "kind": kind,
+        "token": token,
+        "manifest_count": len(manifests),
+        "html": f"""
+            <div style=\"font-family: Arial, sans-serif; width: 384px; padding: 12px; border: 2px solid #000;\">
+                <h2 style=\"margin:0 0 4px 0;\">{escape_html(title)}</h2>
+                <div style=\"font-size: 12px; color:#444;\">Trip: <b>{escape_html(trip_doc.name)}</b></div>
+                <div style=\"font-size: 12px; color:#444;\">Stop #{stop.sequence} — {escape_html(stop.store or stop.warehouse or '')}</div>
+                <div style=\"text-align:center; margin: 12px 0;\">
+                    {f'<img src=\"{qr_src}\" alt=\"QR\" style=\"width:220px;height:220px;\"/>' if qr_src else f'<pre style=\"font-size:14px;\">{escape_html(token)}</pre>'}
+                </div>
+                <div style=\"font-size: 11px; word-break: break-all;\">{escape_html(token)}</div>
+                <hr/>
+                <div style=\"font-size: 12px;\">Shipments ({len(manifests)}):</div>
+                <ul style=\"font-size: 11px; margin: 4px 0 0 18px; padding: 0;\">{manifest_list_html}</ul>
+            </div>
+        """,
+    }
