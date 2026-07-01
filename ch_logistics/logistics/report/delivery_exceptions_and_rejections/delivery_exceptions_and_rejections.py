@@ -3,6 +3,7 @@ in-trip exception, for logistics head / ops follow-up."""
 import frappe
 from frappe import _
 
+from ch_erp15.ch_erp15.report_scope import scope_where_clause
 from ch_logistics.api.report_utils import col, resolve_company
 
 
@@ -29,6 +30,18 @@ def execute(filters=None):
     data = []
     co_clause = " AND {alias}.company = %(company)s" if company else ""
 
+    # Tier 4: fail-closed scope predicates reached through each subquery's
+    # join anchor (manifest for rejections, trip for exceptions).
+    m_scope = scope_where_clause(
+        warehouse_field="m.source_warehouse",
+        extra_warehouse_fields=("m.destination_warehouse",),
+        store_field="m.source_store",
+        extra_store_fields=("m.destination_store",),
+    )
+    m_scope_sql = f" AND {m_scope}" if m_scope else ""
+    t_scope = scope_where_clause(warehouse_field="t.hub_warehouse")
+    t_scope_sql = f" AND {t_scope}" if t_scope else ""
+
     if want in (None, "", "Rejection"):
         # Rejection has no company column — scope through its manifest.
         rej = frappe.db.sql(f"""
@@ -39,7 +52,7 @@ def execute(filters=None):
             JOIN `tabCH Transfer Manifest` m ON m.name = r.manifest
             WHERE 1=1 {_between('DATE(r.rejected_on)', p)}
                   {' AND r.driver = %(driver)s' if drv else ''}
-                  {co_clause.format(alias='m')}
+                  {co_clause.format(alias='m')}{m_scope_sql}
             ORDER BY r.rejected_on DESC
         """, p, as_dict=True)
         data += rej
@@ -54,7 +67,7 @@ def execute(filters=None):
             JOIN `tabCH Logistics Trip` t ON t.name = e.parent
             WHERE 1=1 {_between('DATE(e.occurred_at)', p)}
                   {' AND t.driver = %(driver)s' if drv else ''}
-                  {co_clause.format(alias='t')}
+                  {co_clause.format(alias='t')}{t_scope_sql}
             ORDER BY e.occurred_at DESC
         """, p, as_dict=True)
         data += exc

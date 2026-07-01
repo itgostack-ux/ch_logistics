@@ -8,7 +8,23 @@ import frappe
 from frappe import _
 from frappe.utils import flt
 
+from ch_erp15.ch_erp15.report_scope import scope_where_clause
 from ch_logistics.api.report_utils import col, resolve_company
+
+
+def _trip_scope():
+    """Fail-closed scope on `t.hub_warehouse` (CH Logistics Trip alias t)."""
+    return scope_where_clause(warehouse_field="t.hub_warehouse")
+
+
+def _manifest_scope(alias="m"):
+    """Fail-closed scope on any endpoint of CH Transfer Manifest."""
+    return scope_where_clause(
+        warehouse_field=f"{alias}.source_warehouse",
+        extra_warehouse_fields=(f"{alias}.destination_warehouse",),
+        store_field=f"{alias}.source_store",
+        extra_store_fields=(f"{alias}.destination_store",),
+    )
 
 
 def _dt(filters, field, alias="", with_company=True):
@@ -34,16 +50,20 @@ def execute(filters=None):
     filters = filters or {}
 
     tw, tv = _dt(filters, "trip_date", "t")
+    trip_scope = _trip_scope()
+    trip_scope_sql = f" AND {trip_scope}" if trip_scope else ""
     trips = frappe.db.sql(f"""
         SELECT t.driver, COUNT(*) trips,
                SUM(t.status IN ('Completed','Closed')) trips_done,
                COALESCE(SUM(t.total_distance_actual_km),0) distance_km
         FROM `tabCH Logistics Trip` t
-        WHERE t.driver IS NOT NULL {tw}
+        WHERE t.driver IS NOT NULL {tw}{trip_scope_sql}
         GROUP BY t.driver
     """, tv, as_dict=True)
 
     mw, mv = _dt(filters, "manifest_date", "m")
+    m_scope = _manifest_scope("m")
+    m_scope_sql = f" AND {m_scope}" if m_scope else ""
     delivs = frappe.db.sql(f"""
         SELECT m.driver,
                SUM(m.status IN ('Delivered','Partially Received','Received','Closed')) deliveries,
@@ -53,15 +73,22 @@ def execute(filters=None):
                    AND m.delivery_datetime <= m.estimated_delivery_date) on_time,
                SUM(m.damage_reported = 1) damaged
         FROM `tabCH Transfer Manifest` m
-        WHERE m.driver IS NOT NULL {mw}
+        WHERE m.driver IS NOT NULL {mw}{m_scope_sql}
         GROUP BY m.driver
     """, mv, as_dict=True)
 
     rw, rv = _dt(filters, "rejected_on", "r", with_company=False)  # rejection has no company
+    # Tier 4: CH Manifest Rejection has no store/warehouse of its own — reach
+    # scope through its linked manifest. LEFT JOIN preserves rejections whose
+    # manifest is missing only for bypass callers (where scope is None).
+    rej_scope = _manifest_scope("rm")
+    rej_scope_sql = f" AND {rej_scope}" if rej_scope else ""
+    rej_join = "LEFT JOIN `tabCH Transfer Manifest` rm ON rm.name = r.manifest" if rej_scope else ""
     rejs = frappe.db.sql(f"""
         SELECT r.driver, COUNT(*) rejections
         FROM `tabCH Manifest Rejection` r
-        WHERE r.driver IS NOT NULL {rw}
+        {rej_join}
+        WHERE r.driver IS NOT NULL {rw}{rej_scope_sql}
         GROUP BY r.driver
     """, rv, as_dict=True)
 
@@ -72,7 +99,7 @@ def execute(filters=None):
         FROM `tabCH Logistics Trip` t
         LEFT JOIN `tabCH Logistics Exception` e ON e.parent = t.name
         LEFT JOIN `tabCH Logistics Trip Stop` s ON s.parent = t.name
-        WHERE t.driver IS NOT NULL {ew}
+        WHERE t.driver IS NOT NULL {ew}{trip_scope_sql}
         GROUP BY t.driver
     """, ev, as_dict=True)
 

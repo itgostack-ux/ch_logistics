@@ -3,9 +3,19 @@
 Keeps each report's ``execute`` short: consistent column builders, standard
 company/date/store/driver filter conditions, and a current-driver resolver so
 delivery-staff reports default to the logged-in driver.
+
+Tier 4 (report-level fail-closed scope): ``manifest_conditions`` and
+``trip_conditions`` unconditionally append a scope narrowing clause via
+``ch_erp15.ch_erp15.report_scope.scope_where_clause``. Every logistics SQL
+report that flows through these two helpers is therefore automatically
+guarded — bypass roles (System Manager / Administrator) receive no filter,
+in-scope users receive an OR chain across all relevant store / warehouse
+columns, and scoped users with an empty scope receive ``1=0`` (zero rows).
 """
 import frappe
 from frappe.utils import flt  # noqa: F401  (re-exported for report convenience)
+
+from ch_erp15.ch_erp15.report_scope import scope_where_clause
 
 
 def resolve_company(filters):
@@ -48,6 +58,17 @@ def manifest_conditions(filters, alias="m", date_field="manifest_date"):
     if f.get("destination_store"):
         add(f"{alias}.destination_store = %(destination_store)s", "destination_store",
             f["destination_store"])
+    # Tier 4: unconditionally narrow to caller scope. Manifests link BOTH a
+    # source and a destination store/warehouse — the OR chain lets a user
+    # see the manifest if THEIR store/warehouse is either endpoint.
+    scope = scope_where_clause(
+        warehouse_field=f"{alias}.source_warehouse",
+        extra_warehouse_fields=(f"{alias}.destination_warehouse",),
+        store_field=f"{alias}.source_store",
+        extra_store_fields=(f"{alias}.destination_store",),
+    )
+    if scope is not None:
+        cond.append(scope)
     return " AND ".join(cond), vals
 
 
@@ -67,6 +88,10 @@ def trip_conditions(filters, alias="t"):
         add(f"{alias}.status = %(status)s", "status", f["status"])
     if f.get("driver"):
         add(f"{alias}.driver = %(driver)s", "driver", f["driver"])
+    # Tier 4: narrow by hub_warehouse. Trips are keyed to a single hub.
+    scope = scope_where_clause(warehouse_field=f"{alias}.hub_warehouse")
+    if scope is not None:
+        cond.append(scope)
     return " AND ".join(cond), vals
 
 

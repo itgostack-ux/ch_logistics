@@ -4,6 +4,7 @@ import frappe
 from frappe import _
 from frappe.utils import today
 
+from ch_erp15.ch_erp15.report_scope import scope_where_clause
 from ch_logistics.api.report_utils import col, current_driver, is_ops_user, resolve_company
 
 
@@ -25,6 +26,16 @@ def execute(filters=None):
         return _columns(), []  # no driver record & not ops → nothing
     if filters.get("status"):
         cond.append("m.status = %(status)s"); vals["status"] = filters["status"]
+
+    # Tier 4: fail-closed scope on either manifest endpoint.
+    scope = scope_where_clause(
+        warehouse_field="m.source_warehouse",
+        extra_warehouse_fields=("m.destination_warehouse",),
+        store_field="m.source_store",
+        extra_store_fields=("m.destination_store",),
+    )
+    if scope is not None:
+        cond.append(scope)
 
     rows = frappe.db.sql(f"""
         SELECT m.name, m.trip, m.stop_sequence, m.status, m.shipment_priority,

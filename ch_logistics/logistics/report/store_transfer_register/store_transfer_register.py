@@ -4,6 +4,7 @@ still to be received"."""
 import frappe
 from frappe import _
 
+from ch_erp15.ch_erp15.report_scope import scope_where_clause
 from ch_logistics.api.report_utils import col, resolve_company
 
 
@@ -31,6 +32,18 @@ def execute(filters=None):
             cond.append("m.source_store = %(store)s")
         else:
             cond.append("(m.source_store = %(store)s OR m.destination_store = %(store)s)")
+
+    # Tier 4: fail-closed narrow to caller scope. If the user picked a specific
+    # store above, the OR chain here is a superset — the user filter still
+    # narrows further; scope only ever removes rows they shouldn't see.
+    scope = scope_where_clause(
+        warehouse_field="m.source_warehouse",
+        extra_warehouse_fields=("m.destination_warehouse",),
+        store_field="m.source_store",
+        extra_store_fields=("m.destination_store",),
+    )
+    if scope is not None:
+        cond.append(scope)
 
     where = " AND ".join(cond)
     rows = frappe.db.sql(f"""
