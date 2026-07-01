@@ -785,7 +785,7 @@ class LogisticsCommandCenter {
 				},
 				{ fieldname: "packed_qty", fieldtype: "Int", label: __("Packed Qty"), reqd: 1,
 				  default: remaining || null,
-				  description: __("How many item units are physically in this box?") },
+				  description: __("How many item units are physically in this box? Max: {0} (remaining on manifest).", [remaining]) },
 				{ fieldname: "weight_kg", fieldtype: "Float", label: __("Weight (kg)") },
 				{ fieldname: "dimensions_cm", fieldtype: "Data", label: __("Dimensions (LxWxH cm)"),
 				  description: __("Optional — used for courier dimensional weight, e.g. 30x20x15") },
@@ -796,6 +796,19 @@ class LogisticsCommandCenter {
 			],
 			primary_action_label: __("Add Box"),
 			primary_action: (values) => {
+				// Client-side overpack guard for a clean UX. Server-side
+				// _validate_packing() on CH Transfer Manifest is the
+				// source-of-truth guard (also enforced by the pack_box API).
+				const req = Number(values.packed_qty || 0);
+				if (req > remaining) {
+					frappe.msgprint({
+						title: __("Overpack Blocked"),
+						indicator: "red",
+						message: __("Cannot pack {0} units — only {1} remaining on {2} (total {3}, already packed {4}).",
+							[req, remaining, manifest, total_qty, packed_so_far]),
+					});
+					return;
+				}
 				frappe.call({
 					method: "ch_logistics.api.transfer_manifest_api.pack_box",
 					args: {

@@ -120,6 +120,29 @@ def pack_box(manifest, packed_qty, weight_kg=None, dimensions_cm=None,
     if packed_qty_int <= 0:
         frappe.throw(frappe._("Packed quantity must be greater than zero."))
 
+    # Pre-flight overpack guard so the user sees a clean, contextual message
+    # BEFORE save() runs. The manifest controller's _validate_packing() is the
+    # source-of-truth guard (covers direct form saves + this API path); this
+    # check only exists to give the pack-station a nicer error string.
+    total_qty = float(doc.total_qty or 0)
+    if total_qty > 0:
+        packed_so_far = sum(float(p.packed_qty or 0) for p in (doc.packages or []))
+        remaining = total_qty - packed_so_far
+        if packed_qty_int > remaining:
+            frappe.throw(
+                frappe._(
+                    "Cannot pack {0} units — only {1} remaining on manifest {2}"
+                    " (total {3}, already packed {4})."
+                ).format(
+                    packed_qty_int,
+                    max(remaining, 0),
+                    doc.name,
+                    int(total_qty) if total_qty.is_integer() else total_qty,
+                    int(packed_so_far) if packed_so_far.is_integer() else packed_so_far,
+                ),
+                title=frappe._("Overpack Blocked"),
+            )
+
     doc.append("packages", {
         "packed_qty": packed_qty_int,
         "weight_kg": weight_kg or None,

@@ -90,7 +90,7 @@ function show_pack_box_dialog(frm) {
             },
             { fieldname: "packed_qty", fieldtype: "Int", label: __("Packed Qty"), reqd: 1,
               default: remaining || null,
-              description: __("How many item units are physically in this box?") },
+              description: __("How many item units are physically in this box? Max: {0} (remaining on manifest).", [remaining]) },
             { fieldname: "weight_kg", fieldtype: "Float", label: __("Weight (kg)") },
             { fieldname: "dimensions_cm", fieldtype: "Data", label: __("Dimensions (LxWxH cm)"),
               description: __("Optional — used for courier dimensional weight, e.g. 30x20x15") },
@@ -101,6 +101,19 @@ function show_pack_box_dialog(frm) {
         ],
         primary_action_label: __("Add Box & Save"),
         primary_action(values) {
+            // Client-side overpack guard so the user sees a clear message
+            // before we hit the server. The controller's _validate_packing()
+            // is the source-of-truth guard for direct form edits / API calls.
+            const req = Number(values.packed_qty || 0);
+            if (req > remaining) {
+                frappe.msgprint({
+                    title: __("Overpack Blocked"),
+                    indicator: "red",
+                    message: __("Cannot pack {0} units — only {1} remaining on this manifest (total {2}, already packed {3}).",
+                        [req, remaining, total_qty, packed_so_far]),
+                });
+                return;
+            }
             const row = frm.add_child("packages", {
                 package_label: suggested_label,
                 packed_qty: values.packed_qty,

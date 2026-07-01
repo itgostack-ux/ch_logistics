@@ -19,6 +19,7 @@ class CHTransferManifest(Document):
             self.status = "Draft"
         self._populate_transfer_details()
         self._compute_totals()
+        self._validate_packing()
         self._validate_transfers()
 
     def before_submit(self):
@@ -133,6 +134,41 @@ class CHTransferManifest(Document):
         self._auto_label_packages()
         self.box_count = len(self.packages or [])
         self._compute_freight()
+
+    def _validate_packing(self):
+        """Reject packing slips whose combined ``packed_qty`` exceeds the
+        manifest's ``total_qty``.
+
+        This is the server-side source-of-truth guard: the pack-station
+        dialog (both on the manifest form and in the Logistics Control
+        Tower) does a client-side pre-check, but a determined user can
+        bypass client validation by editing the packages child table
+        directly on the form or by calling ``pack_box`` via the API.
+
+        A packer physically cannot put more units into cartons than were
+        picked into the manifest, so over-packing signals a data-entry
+        mistake (typo, wrong manifest, missed decrement) that would
+        otherwise silently corrupt the box-count / weight totals used
+        downstream for freight billing and receiving reconciliation.
+
+        Fires only when ``packages`` has rows so unpacked drafts still
+        validate cleanly.
+        """
+        if not self.packages:
+            return
+        total_qty = flt(self.total_qty)
+        if total_qty <= 0:
+            return
+        packed_sum = sum(flt(p.packed_qty) for p in self.packages)
+        if packed_sum > total_qty:
+            over = packed_sum - total_qty
+            frappe.throw(
+                _(
+                    "Packed quantity ({0}) exceeds manifest total quantity ({1}) by {2}."
+                    " Remove or reduce the overfilled box(es) on the Packages tab."
+                ).format(packed_sum, total_qty, over),
+                title=_("Overpacked Manifest"),
+            )
 
     def _auto_label_packages(self):
         """Assign sequential LPN labels and stamp packer audit fields.
