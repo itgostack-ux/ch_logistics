@@ -1,0 +1,176 @@
+{
+ "actions": [],
+ "allow_rename": 0,
+ "autoname": "format:BRK-{YYYY}-{#####}",
+ "creation": "2026-07-08 00:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "driver",
+  "trip",
+  "column_break_top",
+  "break_type",
+  "reason",
+  "timings_section",
+  "start_ts",
+  "duration_min",
+  "column_break_ts",
+  "end_ts",
+  "geo_section",
+  "start_latitude",
+  "start_longitude",
+  "column_break_geo",
+  "end_latitude",
+  "end_longitude"
+ ],
+ "fields": [
+  {
+   "fieldname": "driver",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Driver",
+   "options": "Driver",
+   "reqd": 1,
+   "search_index": 1
+  },
+  {
+   "fieldname": "trip",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "Trip",
+   "options": "CH Logistics Trip"
+  },
+  {
+   "fieldname": "column_break_top",
+   "fieldtype": "Column Break"
+  },
+  {
+   "default": "Rest",
+   "fieldname": "break_type",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Break Type",
+   "options": "Rest\nMeal\nVehicle\nPersonal",
+   "reqd": 1
+  },
+  {
+   "fieldname": "reason",
+   "fieldtype": "Small Text",
+   "label": "Reason"
+  },
+  {
+   "fieldname": "timings_section",
+   "fieldtype": "Section Break",
+   "label": "Timings"
+  },
+  {
+   "default": "Now",
+   "fieldname": "start_ts",
+   "fieldtype": "Datetime",
+   "in_list_view": 1,
+   "label": "Start",
+   "read_only": 1,
+   "reqd": 1
+  },
+  {
+   "fieldname": "duration_min",
+   "fieldtype": "Float",
+   "in_list_view": 1,
+   "label": "Duration (min)",
+   "precision": "1",
+   "read_only": 1
+  },
+  {
+   "fieldname": "column_break_ts",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "end_ts",
+   "fieldtype": "Datetime",
+   "in_list_view": 1,
+   "label": "End",
+   "read_only": 1
+  },
+  {
+   "fieldname": "geo_section",
+   "fieldtype": "Section Break",
+   "label": "Location"
+  },
+  {
+   "fieldname": "start_latitude",
+   "fieldtype": "Float",
+   "label": "Start Latitude",
+   "precision": "6",
+   "read_only": 1
+  },
+  {
+   "fieldname": "start_longitude",
+   "fieldtype": "Float",
+   "label": "Start Longitude",
+   "precision": "6",
+   "read_only": 1
+  },
+  {
+   "fieldname": "column_break_geo",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "end_latitude",
+   "fieldtype": "Float",
+   "label": "End Latitude",
+   "precision": "6",
+   "read_only": 1
+  },
+  {
+   "fieldname": "end_longitude",
+   "fieldtype": "Float",
+   "label": "End Longitude",
+   "precision": "6",
+   "read_only": 1
+  }
+ ],
+ "in_create": 0,
+ "index_web_pages_for_search": 1,
+ "is_submittable": 0,
+ "links": [],
+ "modified": "2026-07-08 00:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Logistics",
+ "name": "CH Driver Break Log",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  },
+  {
+   "create": 1,
+   "read": 1,
+   "report": 1,
+   "role": "Delivery Manager",
+   "write": 1
+  },
+  {
+   "create": 1,
+   "read": 1,
+   "role": "Delivery User",
+   "write": 1
+  }
+ ],
+ "search_fields": "driver,break_type,start_ts",
+ "sort_field": "start_ts",
+ "sort_order": "DESC",
+ "states": [],
+ "title_field": "driver",
+ "track_changes": 1
+}

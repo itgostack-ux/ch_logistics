@@ -11,6 +11,7 @@
   "enforce_single_device",
   "packing_section",
   "require_packing_slip",
+  "require_packing_photo",
   "proof_section",
   "enforce_pickup_qr",
   "enforce_delivery_qr",
@@ -69,6 +70,13 @@
    "fieldname": "require_packing_slip",
    "fieldtype": "Check",
    "label": "Require Packing Slip Before Dispatch"
+  },
+  {
+   "default": "0",
+   "description": "When enabled, a CH Transfer Manifest cannot be submitted (Draft \u2192 Packed) until at least one packing photo has been attached. Complements the packing-slip check with visual evidence — matches SAP EWM Photo Documentation and Oracle SIM Pack Verification.",
+   "fieldname": "require_packing_photo",
+   "fieldtype": "Check",
+   "label": "Require Packing Photo Before Dispatch"
   },
   {
    "fieldname": "proof_section",

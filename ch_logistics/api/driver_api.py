@@ -125,21 +125,70 @@ def heartbeat(lat=None, lng=None):
 
 
 @frappe.whitelist()
-def set_break():
-    """Driver starts a break — Available → Break (FR-042)."""
+def set_break(break_type: str = "Rest", reason: str = None, lat=None, lng=None, trip: str = None):
+    """Driver starts a break — Available → Break (FR-042).
+
+    Also writes a CH Driver Break Log row so the Monthly Driver KPI
+    report has an audit trail of break-time.  The doctype's
+    ``validate`` prevents duplicate open rows for the same driver, and
+    ``start_break_for_driver`` is idempotent for concurrent taps.
+    """
+    from ch_logistics.logistics.doctype.ch_driver_break_log.ch_driver_break_log import (
+        start_break_for_driver,
+    )
+
     driver = _current_driver()
     ds.set_status(driver, ds.BREAK)
+    log_name = None
+    try:
+        log_name = start_break_for_driver(
+            driver,
+            break_type=(break_type or "Rest"),
+            reason=reason,
+            trip=trip,
+            latitude=float(lat) if lat not in (None, "") else None,
+            longitude=float(lng) if lng not in (None, "") else None,
+        )
+    except Exception:
+        # Break-log persistence is best-effort — never let it block the
+        # underlying status change (mirrors the same defensive pattern
+        # used in ``_cascade_stop_status_to_trip``).
+        frappe.log_error(
+            frappe.get_traceback(),
+            f"CH Driver Break Log start failed for {driver}",
+        )
     frappe.db.commit()
-    return {"driver": driver, "status": ds.BREAK}
+    return {"driver": driver, "status": ds.BREAK, "break_log": log_name}
 
 
 @frappe.whitelist()
-def end_break():
-    """Driver resumes from break — Break → Available (FR-043, FR-044)."""
+def end_break(lat=None, lng=None):
+    """Driver resumes from break — Break → Available (FR-043, FR-044).
+
+    Closes the newest open CH Driver Break Log row for the driver
+    and stamps end_ts + duration_min via the doctype's ``before_save``.
+    Returns the closed log name for the mobile app to display.
+    """
+    from ch_logistics.logistics.doctype.ch_driver_break_log.ch_driver_break_log import (
+        end_break_for_driver,
+    )
+
     driver = _current_driver()
     ds.set_status(driver, ds.AVAILABLE)
+    log_name = None
+    try:
+        log_name = end_break_for_driver(
+            driver,
+            latitude=float(lat) if lat not in (None, "") else None,
+            longitude=float(lng) if lng not in (None, "") else None,
+        )
+    except Exception:
+        frappe.log_error(
+            frappe.get_traceback(),
+            f"CH Driver Break Log end failed for {driver}",
+        )
     frappe.db.commit()
-    return {"driver": driver, "status": ds.AVAILABLE}
+    return {"driver": driver, "status": ds.AVAILABLE, "break_log": log_name}
 
 
 @frappe.whitelist()

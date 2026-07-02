@@ -35,6 +35,18 @@ class CHTransferManifest(Document):
                   "Box count must be > 0 before dispatch."),
                 title=_("Packing Slip Required"),
             )
+        # SAP EWM / Oracle SIM parity — optional visual evidence of
+        # packing quality (per-pack photo).  When the setting is on,
+        # at least one packing photo must be attached before Packed.
+        # Photos live either in the ``packing_photos`` child table (if
+        # the site has adopted it) or as generic File attachments on
+        # the manifest itself.
+        if self._packing_photo_required() and not self._has_packing_photo():
+            frappe.throw(
+                _("Attach at least one packing photo before submitting. "
+                  "See CH Logistics Settings → Require Packing Photo Before Dispatch."),
+                title=_("Packing Photo Required"),
+            )
         # Trip linking is optional at submit time — manifests can be submitted
         # standalone and attached to a trip via the Logistics Control Tower.
         if self.status in ("Draft", None, ""):
@@ -54,6 +66,49 @@ class CHTransferManifest(Document):
             ))
         except Exception:
             return False
+
+    def _packing_photo_required(self) -> bool:
+        """Honour the CH Logistics Settings → require_packing_photo flag."""
+        try:
+            return bool(frappe.db.get_single_value(
+                "CH Logistics Settings", "require_packing_photo"
+            ))
+        except Exception:
+            return False
+
+    def _has_packing_photo(self) -> bool:
+        """Return True when at least one packing photo is attached.
+
+        Accepts either:
+          * A ``packing_photos`` child table field on the manifest, OR
+          * A generic image ``File`` attachment on the manifest doc
+            with a name / description containing ``pack``.
+        This dual-mode check means the same setting works whether a
+        site has adopted the (upcoming) packing_photos child table or
+        continues using generic File attachments.
+        """
+        photos = getattr(self, "packing_photos", None)
+        if photos:
+            return True
+        try:
+            files = frappe.get_all(
+                "File",
+                filters={
+                    "attached_to_doctype": self.doctype,
+                    "attached_to_name": self.name,
+                },
+                fields=["file_name", "file_url", "is_private"],
+                limit=25,
+            )
+        except Exception:
+            return False
+        image_exts = (".jpg", ".jpeg", ".png", ".webp", ".heic")
+        for f in files:
+            fname = (f.get("file_name") or "").lower()
+            furl = (f.get("file_url") or "").lower()
+            if any(fname.endswith(ext) or furl.endswith(ext) for ext in image_exts):
+                return True
+        return False
 
     def on_submit(self):
         self._update_stock_entries_manifest()
