@@ -380,6 +380,8 @@ def driver_close_manifest(manifest, close_note=None) -> dict:
     doc.save()
     if close_note:
         doc.add_comment("Comment", _("Driver close note: {0}").format(close_note))
+    # Cascade to parent trip stop (Pending → Completed) before auto-close.
+    doc._cascade_stop_status_to_trip()
     doc._maybe_auto_close_parent_trip()
     if flt(doc.freight_amount) > 0 and not doc.freight_journal_entry:
         doc._post_freight_gl()

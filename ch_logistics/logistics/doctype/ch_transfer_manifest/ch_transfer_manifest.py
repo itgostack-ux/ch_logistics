@@ -634,6 +634,8 @@ class CHTransferManifest(Document):
             # (Delhivery / BlueDart / Ekart) all drive duty status from the
             # first manifest pickup, not from a separate "trip start" button.
             self._sync_driver_state_after_action(target_hint="In Transit")
+            # Cascade to parent trip's pickup-type stop (Pending → Completed)
+            self._cascade_stop_status_to_trip()
             # Proactive "out for delivery" to the destination store + track link.
             from ch_logistics.api.customer_tracking import notify_destination
             notify_destination(self.name, "out_for_delivery")
@@ -1050,6 +1052,8 @@ class CHTransferManifest(Document):
             # drops them back to AVAILABLE so dispatch can re-assign them.
             # If they're still carrying other loads, IN_TRANSIT is preserved.
             self._sync_driver_state_after_action()
+            # Cascade to parent trip's drop stop (Pending → Completed)
+            self._cascade_stop_status_to_trip()
             self._maybe_auto_close_parent_trip()
             from ch_logistics.api.customer_tracking import notify_destination
             notify_destination(self.name, "delivered")
@@ -1136,6 +1140,8 @@ class CHTransferManifest(Document):
 
             # GAP-2: auto-submit Draft SEs so ledger reflects physical receipt immediately
             self._auto_submit_stock_entries(received_map)
+            # Cascade to parent trip's drop stop (Pending → Completed)
+            self._cascade_stop_status_to_trip()
         finally:
             frappe.db.sql("SELECT RELEASE_LOCK(%s)", (lock_key,))
 
@@ -1145,6 +1151,10 @@ class CHTransferManifest(Document):
         self.status = "Closed"
         self.flags.ignore_validate_update_after_submit = True
         self.save()
+        # Cascade to parent trip's drop stop (Pending → Completed) BEFORE
+        # trip auto-close so the Trip Performance report sees the final
+        # stop state even if trip closes in the same request.
+        self._cascade_stop_status_to_trip()
         self._maybe_auto_close_parent_trip()
         if flt(self.freight_amount) > 0 and not self.freight_journal_entry:
             self._post_freight_gl()
@@ -1523,6 +1533,78 @@ class CHTransferManifest(Document):
             frappe.log_error(
                 frappe.get_traceback(),
                 f"trip auto-close check failed from manifest {self.name}",
+            )
+
+    # ── Stop-status cascade (SAP TM parity) ────────────────────────────
+    # SAP TM cascades Freight Order status down to Freight Unit stops
+    # automatically; Oracle OTM cascades Trip status to Segments the same
+    # way.  Without this, closing a manifest leaves the trip's Pickup /
+    # Drop stop rows stuck on "Pending" (they only get flipped to
+    # "Completed" when the driver taps the mobile app's stop_complete
+    # button — a step field ops routinely forget).  This cascade runs on
+    # every manifest state change that could advance a stop, so the
+    # Logistics Command Center + Trip Performance report always show the
+    # true operational state.
+    _MANIFEST_PICKUP_DONE = {
+        "In Transit", "Delivered", "Received", "Partially Received", "Closed",
+    }
+    _MANIFEST_DROP_DONE = {
+        "Delivered", "Received", "Partially Received", "Closed",
+    }
+    _STOP_TERMINAL = {"Completed", "Skipped", "Exception"}
+
+    def _cascade_stop_status_to_trip(self):
+        """Advance the parent trip's stop.status based on all peer manifests
+        at the same stop_sequence.
+
+        - Drop / Pickup+Drop stop → Completed once every peer manifest has
+          reached one of ``_MANIFEST_DROP_DONE``.
+        - Pickup stop → Completed once every peer manifest has reached
+          one of ``_MANIFEST_PICKUP_DONE``.
+
+        Stops already in a terminal state (Completed / Skipped / Exception)
+        are left alone so an explicit driver action wins over the cascade.
+        """
+        trip_name = self.get("trip")
+        seq = self.get("stop_sequence")
+        if not trip_name or not seq:
+            return
+        try:
+            trip = frappe.get_doc("CH Logistics Trip", trip_name)
+            stop = next((s for s in (trip.stops or []) if s.sequence == seq), None)
+            if not stop or (stop.status or "Pending") in self._STOP_TERMINAL:
+                return
+
+            peers = frappe.get_all(
+                "CH Transfer Manifest",
+                filters={
+                    "trip": trip_name,
+                    "stop_sequence": seq,
+                    "docstatus": ["<", 2],
+                },
+                fields=["name", "status"],
+            )
+            if not peers:
+                return
+
+            stype = (stop.stop_type or "Drop")
+            if stype == "Pickup":
+                required = self._MANIFEST_PICKUP_DONE
+            else:  # Drop or Pickup+Drop
+                required = self._MANIFEST_DROP_DONE
+            all_done = all((p.status or "Draft") in required for p in peers)
+            if not all_done:
+                return
+
+            stop.status = "Completed"
+            if not stop.ata:
+                stop.ata = now_datetime()
+            trip.flags.ignore_validate_update_after_submit = True
+            trip.save(ignore_permissions=True)
+        except Exception:
+            frappe.log_error(
+                frappe.get_traceback(),
+                f"trip stop cascade failed from manifest {self.name}",
             )
 
     # ── Recall / Reversal ───────────────────────────────────────────────
