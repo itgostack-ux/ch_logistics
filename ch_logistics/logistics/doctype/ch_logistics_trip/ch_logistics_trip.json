@@ -118,12 +118,14 @@
   {
    "fieldname": "planned_start",
    "fieldtype": "Datetime",
-   "label": "Planned Start"
+   "label": "Planned Start",
+   "reqd": 1
   },
   {
    "fieldname": "planned_end",
    "fieldtype": "Datetime",
-   "label": "Planned End"
+   "label": "Planned End",
+   "reqd": 1
   },
   {
    "fieldname": "sec_assignment",
@@ -137,6 +139,7 @@
    "in_standard_filter": 1,
    "label": "Driver",
    "options": "Driver",
+   "reqd": 1,
    "search_index": 1
   },
   {
@@ -161,7 +164,8 @@
    "fieldname": "vehicle",
    "fieldtype": "Link",
    "label": "Vehicle",
-   "options": "Vehicle"
+   "options": "Vehicle",
+   "reqd": 1
   },
   {
    "fieldname": "vehicle_number",

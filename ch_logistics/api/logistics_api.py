@@ -192,14 +192,21 @@ def _clear_trip_driver_from_manifests(trip, driver=None):
 
 
 def _ensure_single_active_trip_for_driver(driver: str, target_trip: str | None = None):
-    """Enforce one active trip per driver at any point in time."""
+    """Enforce one active trip per driver at any point in time.
+
+    "Active" = Assigned or Started (trip is currently blocking the driver's
+    time).  ``Completed`` is a post-run settlement state — driver has already
+    finished the physical trip and is free to be dispatched again while the
+    ops team closes out documentation.  This matches SAP TM Driver Roster
+    and Dynamics 365 Fleet's "planned + in-execution only" rule.
+    """
     if not driver:
         return
     rows = frappe.get_all(
         "CH Logistics Trip",
         filters={
             "driver": driver,
-            "status": ["in", ["Assigned", "Started", "Completed"]],
+            "status": ["in", ["Assigned", "Started"]],
         },
         fields=["name", "status"],
         order_by="modified desc",

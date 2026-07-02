@@ -1,7 +1,7 @@
 import frappe
 from frappe import _
 from frappe.model.document import Document
-from frappe.utils import now_datetime
+from frappe.utils import get_datetime, now_datetime
 
 
 # Status machine -----------------------------------------------------------
@@ -30,6 +30,7 @@ _MANIFEST_UNSETTLED = _MANIFEST_PREDELIVERY
 class CHLogisticsTrip(Document):
     def validate(self):
         self._validate_stops()
+        self._validate_planned_times()
         self._populate_hub_from_route()
         self._ensure_stop_tokens()
         self._recompute_totals()
@@ -47,6 +48,31 @@ class CHLogisticsTrip(Document):
                 frappe.throw(_("Duplicate stop sequence {0}").format(row.sequence))
             seen.add(row.sequence)
         self.stops.sort(key=lambda r: r.sequence or 0)
+
+    def _validate_planned_times(self):
+        """Enforce planned_end > planned_start.
+
+        SAP TM / Oracle OTM both reject freight orders where planned end
+        <= planned start.  Without this, trips with zero or negative
+        duration slip into KPI reports and skew on-time %.  We rely on
+        Frappe's ``reqd: 1`` on both fields (see trip JSON) to guarantee
+        presence, so this method only compares.
+        """
+        if not (self.planned_start and self.planned_end):
+            return
+        start = get_datetime(self.planned_start)
+        end = get_datetime(self.planned_end)
+        if end == start:
+            frappe.throw(_(
+                "Planned Start and Planned End cannot be the same. "
+                "Set a realistic drive-time window."
+            ), title=_("Invalid Trip Window"))
+        if end < start:
+            frappe.throw(_(
+                "Planned End ({0}) is before Planned Start ({1}). "
+                "Correct the trip window."
+            ).format(self.planned_end, self.planned_start),
+                title=_("Invalid Trip Window"))
 
     def _populate_hub_from_route(self):
         if self.route and not self.hub_warehouse:
