@@ -15,6 +15,8 @@
   "enforce_pickup_qr",
   "enforce_delivery_qr",
   "enforce_delivery_otp",
+  "enforce_geofence",
+  "geofence_radius_m",
   "push_section",
   "push_provider",
   "column_break_push",
@@ -63,7 +65,7 @@
   },
   {
    "default": "0",
-   "description": "When enabled, a CH Transfer Manifest cannot be submitted (Draft → Packed) until at least one carton has been recorded on the Packages tab. Box Count is then auto-derived from the number of packing-slip rows.",
+   "description": "When enabled, a CH Transfer Manifest cannot be submitted (Draft \u2192 Packed) until at least one carton has been recorded on the Packages tab. Box Count is then auto-derived from the number of packing-slip rows.",
    "fieldname": "require_packing_slip",
    "fieldtype": "Check",
    "label": "Require Packing Slip Before Dispatch"
@@ -93,6 +95,20 @@
    "fieldname": "enforce_delivery_otp",
    "fieldtype": "Check",
    "label": "Enforce Delivery OTP"
+  },
+  {
+   "fieldname": "enforce_geofence",
+   "fieldtype": "Check",
+   "label": "Enforce Pickup/Delivery Geofence",
+   "default": "1",
+   "description": "Block pickup/delivery when the driver's GPS is farther than the radius from the source/destination warehouse."
+  },
+  {
+   "fieldname": "geofence_radius_m",
+   "fieldtype": "Int",
+   "label": "Geofence Radius (metres)",
+   "default": "300",
+   "depends_on": "enforce_geofence"
   },
   {
    "fieldname": "push_section",

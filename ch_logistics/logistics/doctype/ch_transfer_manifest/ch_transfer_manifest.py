@@ -702,7 +702,42 @@ class CHTransferManifest(Document):
             frappe.throw(_("Driver location for {0} could not be captured "
                            "(GPS returned 0, 0). Enable location on the device and retry.").format(label),
                          title=_("Location Required"))
+        # Geofence: the driver must physically be at the correct location — so a
+        # parcel can't be picked up at the wrong source or delivered to the wrong
+        # store even if the right QR is scanned.
+        self._validate_geofence(lat_f, lng_f, kind)
         return lat_f, lng_f
+
+    def _validate_geofence(self, lat_f, lng_f, kind: str):
+        """Reject a pickup/arrival tap that is too far from the expected
+        warehouse. Skips silently when disabled or when the target warehouse has
+        no coordinates (can't compare). Radius + on/off from CH Logistics
+        Settings (default: on, 300 m)."""
+        enforce = frappe.db.get_single_value("CH Logistics Settings", "enforce_geofence")
+        if enforce is not None and not int(enforce):
+            return
+        target_wh = self.source_warehouse if kind == "pickup" else self.destination_warehouse
+        if not target_wh:
+            return
+        try:
+            from ch_logistics.api.optimizer import _warehouse_coords, haversine_km
+            coords = _warehouse_coords(target_wh)
+        except Exception:
+            return
+        if not coords:
+            return  # no target geo → cannot validate, don't block
+        radius_m = cint(frappe.db.get_single_value("CH Logistics Settings", "geofence_radius_m")) or 300
+        dist_m = haversine_km(lat_f, lng_f, coords[0], coords[1]) * 1000.0
+        if dist_m > radius_m:
+            place = (self.source_store or self.source_warehouse) if kind == "pickup" \
+                else (self.destination_store or self.destination_warehouse)
+            action = _("pick up here") if kind == "pickup" else _("deliver here")
+            frappe.throw(
+                _("You are {0} m from {1} (must be within {2} m to {3}). "
+                  "Go to the correct location, or report an issue if this is wrong.")
+                .format(int(dist_m), place, radius_m, action),
+                title=_("Wrong Location"),
+            )
 
     def _sync_driver_state_after_action(self, target_hint: str | None = None):
         """Reconcile the driver's operational status after a manifest action.

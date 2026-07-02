@@ -44,6 +44,17 @@ on_login = "ch_logistics.api.driver_status.handle_user_login"
 on_logout = "ch_logistics.api.driver_status.handle_user_logout"
 
 # --------------------------------------------------------------------------
+# Document events
+# --------------------------------------------------------------------------
+doc_events = {
+	# Keep a store's warehouses (Sellable + group + bins) in sync with its
+	# coordinates on every save, so the map/delivery layers never show blanks.
+	"CH Store": {
+		"on_update": "ch_logistics.api.optimizer.sync_one_store_geo",
+	},
+}
+
+# --------------------------------------------------------------------------
 # Scheduler
 # --------------------------------------------------------------------------
 scheduler_events = {

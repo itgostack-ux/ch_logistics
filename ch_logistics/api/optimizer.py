@@ -102,11 +102,16 @@ def sync_store_geo_to_warehouses(overwrite: int = 0):
     """
     updated = 0
     for s in frappe.get_all("CH Store", filters={"disabled": 0},
-                            fields=["name", "warehouse", "latitude", "longitude", "geocoded_at"]):
+                            fields=["name", "warehouse", "warehouse_group", "latitude", "longitude", "geocoded_at"]):
         if not (s.latitude and s.longitude):
             continue
-        whs = set(filter(None, [s.warehouse]))
+        # Every warehouse in the store's tree gets the store's coords: the
+        # Sellable leaf (s.warehouse), the group parent (what the tree/map pin
+        # points at), and every bin under the group — so no warehouse is blank.
+        whs = set(filter(None, [s.warehouse, s.warehouse_group]))
         whs.update(frappe.get_all("Warehouse", filters={"ch_store": s.name}, pluck="name"))
+        if s.warehouse_group:
+            whs.update(frappe.get_all("Warehouse", filters={"parent_warehouse": s.warehouse_group}, pluck="name"))
         for wh in whs:
             cur = frappe.db.get_value("Warehouse", wh, ["custom_latitude", "custom_longitude"]) or (None, None)
             if not int(overwrite) and cur[0] and cur[1]:
@@ -119,6 +124,27 @@ def sync_store_geo_to_warehouses(overwrite: int = 0):
             updated += 1
     frappe.db.commit()
     return {"warehouses_updated": updated}
+
+
+def sync_one_store_geo(doc, method=None):
+    """on_update hook for CH Store: push its coords onto all its warehouses
+    (Sellable + group + bins) so the map/delivery layers stay accurate without
+    a batch run. No external call — only fires when the store already has
+    coordinates (manual entry or after geocoding)."""
+    lat = flt(doc.get("latitude"))
+    lng = flt(doc.get("longitude"))
+    if not (lat and lng):
+        return
+    whs = set(filter(None, [doc.get("warehouse"), doc.get("warehouse_group")]))
+    whs.update(frappe.get_all("Warehouse", filters={"ch_store": doc.name}, pluck="name"))
+    if doc.get("warehouse_group"):
+        whs.update(frappe.get_all("Warehouse", filters={"parent_warehouse": doc.warehouse_group}, pluck="name"))
+    for wh in whs:
+        frappe.db.set_value("Warehouse", wh, {
+            "custom_latitude": lat,
+            "custom_longitude": lng,
+            "custom_geocoded_at": doc.get("geocoded_at") or now_datetime(),
+        }, update_modified=False)
 
 
 def _stop_coords(stop):
