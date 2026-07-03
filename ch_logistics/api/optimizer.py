@@ -27,6 +27,7 @@ from frappe.utils import cint, flt, now_datetime, add_to_date
 EARTH_KM = 6371.0
 DEFAULT_URBAN_SPEED_KMH = 24.0
 DEFAULT_DWELL_MIN = 5
+_RESEQUENCE_OVERRIDE_ROLES = {"System Manager", "Logistics Head", "Logistic Head", "Operations Manager"}
 
 
 # ── geo helpers ────────────────────────────────────────────────────────────
@@ -275,6 +276,113 @@ def optimize_trip(trip: str) -> dict:
         "stops": len(ordered),
         "distance_before_km": round(before, 2),
         "distance_after_km": round(total, 2),
+        "distance_saved_km": saved,
+        "saved_pct": round((saved / before * 100), 1) if before else 0,
+    }
+
+
+@frappe.whitelist()
+def resequence_trip(trip: str) -> dict:
+    """Controlled resequencing with audit trail.
+
+    - Draft / Assigned: delegates to ``optimize_trip``.
+    - Started: resequences only remaining stops (Pending / Exception), keeps
+      reached stops (Arrived / Completed / Skipped) immutable.
+    """
+    doc = frappe.get_doc("CH Logistics Trip", trip)
+    if doc.status in ("Draft", "Assigned"):
+        out = optimize_trip(trip)
+        doc = frappe.get_doc("CH Logistics Trip", trip)
+        try:
+            doc.add_comment(
+                "Comment",
+                _("Trip resequenced by {0} using optimizer (status: {1}).").format(
+                    frappe.session.user,
+                    doc.status,
+                ),
+            )
+        except Exception:
+            frappe.log_error(title=f"resequence comment failed for {trip}", message=frappe.get_traceback())
+        return out
+
+    if doc.status != "Started":
+        frappe.throw(_("Can resequence only Draft/Assigned/Started trips."))
+
+    roles = set(frappe.get_roles(frappe.session.user))
+    if not (roles & _RESEQUENCE_OVERRIDE_ROLES):
+        frappe.throw(
+            _("Only Operations Manager / Logistics Head / System Manager can resequence a Started trip."),
+            frappe.PermissionError,
+        )
+
+    reached = [
+        s for s in (doc.stops or [])
+        if (s.get("status") or "") in ("Arrived", "Completed", "Skipped")
+    ]
+    movable = [
+        s for s in (doc.stops or [])
+        if (s.get("status") or "") not in ("Arrived", "Completed", "Skipped")
+    ]
+    if len(movable) < 2:
+        frappe.throw(_("Need at least two remaining stops to resequence."))
+
+    backfill_stop_coords(doc)
+    coords = {s.name: c for s in movable if (c := _stop_coords(s))}
+    if len(coords) < 2:
+        frappe.throw(_("Need at least two geocoded remaining stops to resequence."))
+
+    origin = _driver_last_pos(doc.driver)
+    if not origin and reached:
+        reached_sorted = sorted(reached, key=lambda r: r.sequence or 0)
+        origin = _stop_coords(reached_sorted[-1])
+    origin = origin or _hub_coords(doc) or coords[next(iter(coords))]
+
+    before = _route_len([s for s in movable if s.name in coords], coords, origin)
+    ordered, _ = _sequence(list(movable), coords, origin)
+
+    seq = (max([cint(s.sequence) for s in reached], default=0) + 1)
+    total, prev = 0.0, origin
+    for s in ordered:
+        s.sequence = seq
+        seq += 1
+        c = coords.get(s.name)
+        if c:
+            leg = haversine_km(prev[0], prev[1], c[0], c[1])
+            s.leg_distance_km = round(leg, 2)
+            total += leg
+            prev = c
+        else:
+            s.leg_distance_km = 0
+
+    doc.stops.sort(key=lambda r: r.sequence or 0)
+    doc.flags.ignore_version = False
+    doc.save()
+
+    after = _route_len([s for s in ordered if s.name in coords], coords, origin)
+    saved = round(before - after, 2)
+    try:
+        doc.add_comment(
+            "Comment",
+            _(
+                "Started-trip resequence by {0}: remaining stops {1}, distance {2}km -> {3}km (saved {4}km)."
+            ).format(
+                frappe.session.user,
+                len(ordered),
+                round(before, 2),
+                round(after, 2),
+                saved,
+            ),
+        )
+    except Exception:
+        frappe.log_error(title=f"resequence comment failed for {trip}", message=frappe.get_traceback())
+
+    return {
+        "trip": doc.name,
+        "status": doc.status,
+        "mode": "started_remaining_only",
+        "stops_resequenced": len(ordered),
+        "distance_before_km": round(before, 2),
+        "distance_after_km": round(after, 2),
         "distance_saved_km": saved,
         "saved_pct": round((saved / before * 100), 1) if before else 0,
     }

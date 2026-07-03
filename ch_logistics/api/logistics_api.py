@@ -5,6 +5,7 @@ Frontend (delivery-app page, desk forms) calls into here.
 """
 from __future__ import annotations
 
+import math
 import frappe
 from frappe import _
 from frappe.utils import cint, flt, now_datetime
@@ -304,8 +305,9 @@ def trip_start(trip, gps_lat=None, gps_lng=None):
 
 
 @frappe.whitelist()
-def trip_complete(trip):
+def trip_complete(trip, override_exceptions=0):
     doc = frappe.get_doc("CH Logistics Trip", trip)
+    _assert_exception_gate(doc, action="complete trip", override_exceptions=override_exceptions)
     doc.mark_completed()
     doc.save()
     if doc.driver:
@@ -395,6 +397,129 @@ def attach_manifests(trip, manifests):
     return True
 
 
+def _manifest_target_for_trip(trip_doc, manifest_name: str) -> dict:
+    mf_fields = ["source_store", "source_warehouse", "destination_store", "destination_warehouse"]
+    if _has_manifest_direction_field():
+        mf_fields.insert(0, "direction")
+    mf = frappe.db.get_value("CH Transfer Manifest", manifest_name, mf_fields, as_dict=True) or {}
+    is_reverse = (
+        (mf.get("direction") == "Reverse")
+        if _has_manifest_direction_field()
+        else (trip_doc.direction == "Reverse")
+    )
+    target_store = mf.get("source_store") if is_reverse else mf.get("destination_store")
+    target_wh = mf.get("source_warehouse") if is_reverse else mf.get("destination_warehouse")
+    stop_type = "Pickup" if is_reverse else "Drop"
+    return {
+        "store": target_store,
+        "warehouse": target_wh,
+        "stop_type": stop_type,
+    }
+
+
+def _nearest_insertion_sequence(trip_doc, target_coord) -> int:
+    stops = sorted(trip_doc.get("stops") or [], key=lambda r: cint(r.get("sequence") or 0))
+    if not stops:
+        return 1
+
+    movable = [s for s in stops if not _stop_has_been_reached(s.get("status"))]
+    if not movable:
+        return max(cint(s.get("sequence") or 0) for s in stops) + 1
+
+    min_seq = min(cint(s.get("sequence") or 0) for s in movable)
+    if not target_coord:
+        return min_seq
+
+    best_seq = None
+    best_cost = None
+    prev_coord = _trip_live_origin(trip_doc) or _stop_coords(movable[0])
+    for idx in range(len(movable) + 1):
+        next_coord = _stop_coords(movable[idx]) if idx < len(movable) else None
+        if prev_coord and next_coord:
+            cost = (
+                _haversine_km(prev_coord[0], prev_coord[1], target_coord[0], target_coord[1])
+                + _haversine_km(target_coord[0], target_coord[1], next_coord[0], next_coord[1])
+                - _haversine_km(prev_coord[0], prev_coord[1], next_coord[0], next_coord[1])
+            )
+        elif prev_coord:
+            cost = _haversine_km(prev_coord[0], prev_coord[1], target_coord[0], target_coord[1])
+        elif next_coord:
+            cost = _haversine_km(target_coord[0], target_coord[1], next_coord[0], next_coord[1])
+        else:
+            cost = 0
+
+        candidate_seq = (
+            cint(movable[idx].get("sequence") or min_seq)
+            if idx < len(movable)
+            else max(cint(s.get("sequence") or 0) for s in stops) + 1
+        )
+        if best_cost is None or cost < best_cost:
+            best_cost = cost
+            best_seq = candidate_seq
+
+        if idx < len(movable):
+            prev_coord = _stop_coords(movable[idx]) or prev_coord
+
+    return best_seq or min_seq
+
+
+def _shift_sequences_for_insert(trip_doc, insert_seq: int) -> None:
+    for s in sorted(
+        trip_doc.get("stops") or [],
+        key=lambda r: cint(r.get("sequence") or 0),
+        reverse=True,
+    ):
+        if cint(s.get("sequence") or 0) >= cint(insert_seq):
+            s.sequence = cint(s.get("sequence") or 0) + 1
+
+
+def _ensure_dynamic_stop_for_manifest(trip_doc, manifest_name: str):
+    target = _manifest_target_for_trip(trip_doc, manifest_name)
+    target_store = target.get("store")
+    target_wh = target.get("warehouse")
+    if not target_wh and target_store:
+        target_wh = frappe.db.get_value("CH Store", target_store, "warehouse")
+    if not target_wh:
+        return None
+
+    for s in sorted(trip_doc.get("stops") or [], key=lambda r: cint(r.get("sequence") or 0)):
+        if _is_stop_terminal(s.get("status")):
+            continue
+        if target_store and s.get("store") == target_store:
+            return cint(s.get("sequence") or 0) or None
+        if s.get("warehouse") == target_wh:
+            return cint(s.get("sequence") or 0) or None
+
+    insert_seq = _nearest_insertion_sequence(
+        trip_doc,
+        _store_coords(target_store) or _warehouse_coords(target_wh),
+    )
+    _shift_sequences_for_insert(trip_doc, insert_seq)
+    trip_doc.append(
+        "stops",
+        {
+            "sequence": insert_seq,
+            "warehouse": target_wh,
+            "store": target_store,
+            "stop_type": target.get("stop_type") or ("Pickup" if trip_doc.direction == "Reverse" else "Drop"),
+            "status": "Pending",
+            "notes": _("Inserted on-route for manifest {0}").format(manifest_name),
+        },
+    )
+    _trip_audit(
+        trip_doc,
+        _(
+            "Dynamic stop inserted at sequence #{0} for manifest {1} (warehouse: {2}, store: {3})."
+        ).format(
+            insert_seq,
+            manifest_name,
+            target_wh,
+            target_store or "-",
+        ),
+    )
+    return insert_seq
+
+
 def _attach_manifests(trip, manifests):
     if not _has_manifest_trip_field():
         frappe.throw(
@@ -409,6 +534,10 @@ def _attach_manifests(trip, manifests):
     trip_doc = frappe.get_doc("CH Logistics Trip", trip)
     if trip_doc.status in ("Closed", "Cancelled"):
         frappe.throw(_("Cannot attach manifests to a {0} trip").format(trip_doc.status))
+    if trip_doc.status == "Started":
+        _require_ops()
+
+    dynamically_inserted = []
     for manifest_name in manifests:
         current_trip = frappe.db.get_value("CH Transfer Manifest", manifest_name, "trip")
         if current_trip and current_trip != trip:
@@ -416,7 +545,22 @@ def _attach_manifests(trip, manifests):
                 _("Manifest {0} is already attached to trip {1}").format(manifest_name, current_trip)
             )
         frappe.db.set_value("CH Transfer Manifest", manifest_name, "trip", trip)
-        _assign_stop_sequence(trip_doc, manifest_name)
+        seq = _assign_stop_sequence(trip_doc, manifest_name)
+        if seq is None and trip_doc.status == "Started":
+            seq = _ensure_dynamic_stop_for_manifest(trip_doc, manifest_name)
+            if seq is not None and _has_manifest_stop_seq_field():
+                frappe.db.set_value("CH Transfer Manifest", manifest_name, "stop_sequence", seq)
+                dynamically_inserted.append(f"{manifest_name}->#{seq}")
+
+    if dynamically_inserted:
+        trip_doc.stops.sort(key=lambda r: cint(r.get("sequence") or 0))
+        _trip_audit(
+            trip_doc,
+            _("On-route manifests inserted with dynamic stops: {0}").format(
+                ", ".join(dynamically_inserted)
+            ),
+        )
+        trip_doc.save(ignore_permissions=True)
     # Refresh totals + per-stop manifest counts
     trip_doc.reload()
     trip_doc.save()
@@ -432,18 +576,12 @@ def _assign_stop_sequence(trip_doc, manifest_name):
     (forward) or pickup (reverse) location, and store stop_sequence on it so it
     surfaces under the correct driver-app stop card."""
     if not frappe.get_meta("CH Transfer Manifest").has_field("stop_sequence"):
-        return
+        return None
     if not trip_doc.stops:
-        return
-    mf_fields = ["source_store", "source_warehouse", "destination_store", "destination_warehouse"]
-    if _has_manifest_direction_field():
-        mf_fields.insert(0, "direction")
-    mf = frappe.db.get_value("CH Transfer Manifest", manifest_name, mf_fields, as_dict=True)
-    if not mf:
-        return
-    is_reverse = (mf.get("direction") == "Reverse") if _has_manifest_direction_field() else (trip_doc.direction == "Reverse")
-    target_store = mf.get("source_store") if is_reverse else mf.get("destination_store")
-    target_wh = mf.get("source_warehouse") if is_reverse else mf.get("destination_warehouse")
+        return None
+    target = _manifest_target_for_trip(trip_doc, manifest_name)
+    target_store = target.get("store")
+    target_wh = target.get("warehouse")
     seq = None
     # Prefer a store match, then fall back to a warehouse match.
     for s in trip_doc.stops:
@@ -457,6 +595,8 @@ def _assign_stop_sequence(trip_doc, manifest_name):
                 break
     if seq is not None:
         frappe.db.set_value("CH Transfer Manifest", manifest_name, "stop_sequence", seq)
+        return seq
+    return None
 
 
 @frappe.whitelist()
@@ -471,12 +611,93 @@ def detach_manifest(manifest):
     if not current_trip:
         return
     trip_doc = frappe.get_doc("CH Logistics Trip", current_trip)
-    if trip_doc.status in ("Started", "Completed", "Closed"):
+    if trip_doc.status == "Started":
+        _require_ops()
+    if trip_doc.status in ("Completed", "Closed", "Cancelled"):
         frappe.throw(_("Cannot detach manifest from a {0} trip").format(trip_doc.status))
     frappe.db.set_value("CH Transfer Manifest", manifest, "trip", None)
+    if _has_manifest_stop_seq_field():
+        frappe.db.set_value("CH Transfer Manifest", manifest, "stop_sequence", None)
+    _trip_audit(trip_doc, _("Manifest {0} detached by {1}.").format(manifest, frappe.session.user))
     trip_doc.reload()
     trip_doc.save()
     return True
+
+
+@frappe.whitelist()
+def dynamic_insert_stop(trip, manifest=None, store=None, warehouse=None, stop_type=None, notes=None):
+    """Insert a stop into an Assigned/Started trip at nearest feasible position."""
+    _require_ops()
+    doc = frappe.get_doc("CH Logistics Trip", trip)
+    if doc.status not in ("Assigned", "Started"):
+        frappe.throw(_("Dynamic stop insertion is allowed only for Assigned/Started trips."))
+
+    target_store = store
+    target_wh = warehouse
+    resolved_stop_type = stop_type or ("Pickup" if doc.direction == "Reverse" else "Drop")
+
+    if manifest:
+        target = _manifest_target_for_trip(doc, manifest)
+        target_store = target.get("store") or target_store
+        target_wh = target.get("warehouse") or target_wh
+        resolved_stop_type = target.get("stop_type") or resolved_stop_type
+
+    if not target_wh and target_store:
+        target_wh = frappe.db.get_value("CH Store", target_store, "warehouse")
+    if not target_wh:
+        frappe.throw(_("Warehouse is required to insert a stop."))
+
+    for s in sorted(doc.get("stops") or [], key=lambda r: cint(r.get("sequence") or 0)):
+        if _is_stop_terminal(s.get("status")):
+            continue
+        if target_store and s.get("store") == target_store:
+            return {"trip": doc.name, "inserted": False, "sequence": s.sequence, "reason": "existing-store-stop"}
+        if s.get("warehouse") == target_wh:
+            return {"trip": doc.name, "inserted": False, "sequence": s.sequence, "reason": "existing-warehouse-stop"}
+
+    insert_seq = _nearest_insertion_sequence(doc, _store_coords(target_store) or _warehouse_coords(target_wh))
+    _shift_sequences_for_insert(doc, insert_seq)
+    row = doc.append(
+        "stops",
+        {
+            "sequence": insert_seq,
+            "warehouse": target_wh,
+            "store": target_store,
+            "stop_type": resolved_stop_type,
+            "status": "Pending",
+            "notes": notes or _("Inserted on-route by {0}").format(frappe.session.user),
+        },
+    )
+    doc.stops.sort(key=lambda r: cint(r.get("sequence") or 0))
+    _trip_audit(
+        doc,
+        _(
+            "On-route stop inserted by {0}: #{1}, warehouse={2}, store={3}, stop_type={4}."
+        ).format(
+            frappe.session.user,
+            insert_seq,
+            target_wh,
+            target_store or "-",
+            resolved_stop_type,
+        ),
+    )
+    doc.save(ignore_permissions=True)
+
+    if manifest and _has_manifest_trip_field():
+        if frappe.db.get_value("CH Transfer Manifest", manifest, "trip") != doc.name:
+            frappe.db.set_value("CH Transfer Manifest", manifest, "trip", doc.name)
+        if _has_manifest_stop_seq_field():
+            frappe.db.set_value("CH Transfer Manifest", manifest, "stop_sequence", insert_seq)
+
+    return {
+        "trip": doc.name,
+        "inserted": True,
+        "stop_name": row.name,
+        "sequence": insert_seq,
+        "warehouse": target_wh,
+        "store": target_store,
+        "stop_type": resolved_stop_type,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -531,10 +752,18 @@ def stop_arrive(trip, sequence, gps_lat=None, gps_lng=None):
 
 
 @frappe.whitelist()
-def stop_complete(trip, sequence, scan_compliance_pct=None):
+def stop_complete(trip, sequence, scan_compliance_pct=None, override_exceptions=0):
     doc = frappe.get_doc("CH Logistics Trip", trip)
     if doc.status != "Started":
         frappe.throw(_("Trip must be Started before completing stops"))
+
+    _assert_exception_gate(
+        doc,
+        action=_("complete stop #{0}").format(cint(sequence)),
+        stop_sequence=sequence,
+        override_exceptions=override_exceptions,
+    )
+
     matched = False
     for s in doc.stops:
         if s.sequence == cint(sequence):
@@ -795,6 +1024,165 @@ def _require_ops():
     roles = set(frappe.get_roles(frappe.session.user))
     if not (roles & _OPS_ROLES):
         frappe.throw(_("Operations role required"), frappe.PermissionError)
+
+
+def _trip_audit(doc, message: str) -> None:
+    if not message:
+        return
+    try:
+        doc.add_comment("Comment", message)
+    except Exception:
+        frappe.log_error(
+            title=f"trip audit comment failed for {doc.name}",
+            message=frappe.get_traceback(),
+        )
+
+
+def _can_override_exception_gate() -> bool:
+    roles = set(frappe.get_roles(frappe.session.user))
+    return bool(roles & _LOGISTICS_HEAD_ROLES)
+
+
+def _blocking_high_critical_exceptions(doc, stop_sequence=None) -> list[dict]:
+    blocked = []
+    target_seq = cint(stop_sequence) if stop_sequence is not None else None
+    for row in doc.get("exceptions") or []:
+        severity = (row.get("severity") or "").strip()
+        resolution = (row.get("resolution_status") or "Open").strip()
+        if severity not in ("High", "Critical"):
+            continue
+        if resolution in ("Resolved",):
+            continue
+        if target_seq is not None and cint(row.get("stop_sequence") or 0) != target_seq:
+            continue
+        blocked.append(
+            {
+                "severity": severity,
+                "stop_sequence": cint(row.get("stop_sequence") or 0) or None,
+                "exception_type": row.get("exception_type") or _("Unknown"),
+                "resolution_status": resolution or "Open",
+            }
+        )
+    return blocked
+
+
+def _assert_exception_gate(doc, *, action: str, stop_sequence=None, override_exceptions=0):
+    blocked = _blocking_high_critical_exceptions(doc, stop_sequence=stop_sequence)
+    if not blocked:
+        return
+
+    if cint(override_exceptions):
+        if not _can_override_exception_gate():
+            frappe.throw(
+                _("Only Logistics Head / System Manager can override unresolved High/Critical exceptions."),
+                frappe.PermissionError,
+            )
+        _trip_audit(
+            doc,
+            _(
+                "Exception override approved by {0} for action '{1}'. Open critical rows: {2}"
+            ).format(
+                frappe.session.user,
+                action,
+                ", ".join(
+                    f"{b['exception_type']}@#{b['stop_sequence'] or '-'} ({b['severity']}/{b['resolution_status']})"
+                    for b in blocked
+                ),
+            ),
+        )
+        return
+
+    raise_rows = ", ".join(
+        f"{b['exception_type']}@#{b['stop_sequence'] or '-'} ({b['severity']}/{b['resolution_status']})"
+        for b in blocked
+    )
+    frappe.throw(
+        _(
+            "Cannot {0}. Unresolved High/Critical exceptions exist: {1}. "
+            "Resolve them first, or use Logistics Head override."
+        ).format(action, raise_rows),
+        title=_("Open Critical Exceptions"),
+    )
+
+
+def _is_stop_terminal(status: str | None) -> bool:
+    return (status or "").strip() in ("Completed", "Skipped")
+
+
+def _stop_has_been_reached(status: str | None) -> bool:
+    return (status or "").strip() in ("Arrived", "Completed", "Skipped")
+
+
+def _haversine_km(lat1, lng1, lat2, lng2) -> float:
+    lat1, lng1, lat2, lng2 = map(flt, (lat1, lng1, lat2, lng2))
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlmb = math.radians(lng2 - lng1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlmb / 2) ** 2
+    return 2 * 6371.0 * math.asin(math.sqrt(a))
+
+
+def _store_coords(store: str | None):
+    if not store:
+        return None
+    lat, lng = frappe.db.get_value("CH Store", store, ["latitude", "longitude"]) or (None, None)
+    if lat and lng:
+        return (flt(lat), flt(lng))
+    return None
+
+
+def _warehouse_coords(warehouse: str | None):
+    if not warehouse:
+        return None
+    lat, lng = frappe.db.get_value("Warehouse", warehouse, ["custom_latitude", "custom_longitude"]) or (None, None)
+    if lat and lng:
+        return (flt(lat), flt(lng))
+
+    store = (
+        frappe.db.get_value("Warehouse", warehouse, "ch_store")
+        or frappe.db.get_value("CH Store", {"warehouse": warehouse}, "name")
+    )
+    return _store_coords(store)
+
+
+def _stop_coords(stop):
+    if flt(stop.get("gps_lat")) and flt(stop.get("gps_lng")):
+        return (flt(stop.get("gps_lat")), flt(stop.get("gps_lng")))
+    return _store_coords(stop.get("store")) or _warehouse_coords(stop.get("warehouse"))
+
+
+def _trip_live_origin(trip_doc):
+    if trip_doc.driver and frappe.db.has_column("Driver", "current_lat") and frappe.db.has_column("Driver", "current_lng"):
+        row = frappe.db.get_value(
+            "Driver",
+            trip_doc.driver,
+            ["current_lat", "current_lng"],
+            as_dict=True,
+        ) or {}
+        if row.get("current_lat") and row.get("current_lng"):
+            return (flt(row.get("current_lat")), flt(row.get("current_lng")))
+
+    if trip_doc.name:
+        row = frappe.db.get_value(
+            "CH Driver Location",
+            {"trip": trip_doc.name},
+            ["latitude", "longitude"],
+            order_by="captured_at desc",
+            as_dict=True,
+        ) or {}
+        if row.get("latitude") and row.get("longitude"):
+            return (flt(row.get("latitude")), flt(row.get("longitude")))
+
+    reached = sorted(
+        [s for s in (trip_doc.stops or []) if _stop_has_been_reached(s.get("status"))],
+        key=lambda r: cint(r.get("sequence") or 0),
+    )
+    if reached:
+        c = _stop_coords(reached[-1])
+        if c:
+            return c
+
+    return _warehouse_coords(trip_doc.get("hub_warehouse"))
 
 
 @frappe.whitelist()

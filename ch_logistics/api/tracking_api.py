@@ -139,6 +139,10 @@ def ping_location(latitude, longitude, accuracy_m=None, speed_kmh=None,
 	if loc.trip and cint(settings.alert_on_geofence_arrival):
 		_maybe_mark_stop_arrived(loc, cint(settings.geofence_arrival_meters))
 
+	# Keep ETA projections fresh while the driver is moving.
+	if loc.trip:
+		_maybe_recompute_trip_eta(loc.trip)
+
 	return {
 		"ok": True,
 		"name": loc.name,
@@ -339,3 +343,46 @@ def _alert(title: str, driver: str, message: str) -> None:
 		)
 	except Exception:
 		pass
+
+
+def _maybe_recompute_trip_eta(trip: str, min_interval_sec: int = 45) -> None:
+	"""Throttled ETA recompute on GPS pings for active trips.
+
+	Called from ``ping_location``: this keeps stop ETAs near real time without
+	bursting compute on every single heartbeat. Uses Redis cache throttle per trip.
+	"""
+	if not trip:
+		return
+	status = frappe.db.get_value("CH Logistics Trip", trip, "status")
+	if status != "Started":
+		return
+
+	cache = frappe.cache()
+	key = f"ch_logistics:eta_refresh:{trip}"
+	now_ts = int(now_datetime().timestamp())
+	last = cache.get_value(key)
+	try:
+		last_ts = int(last) if last is not None else 0
+	except Exception:
+		last_ts = 0
+	if last_ts and (now_ts - last_ts) < max(cint(min_interval_sec), 5):
+		return
+
+	cache.set_value(key, now_ts, expires_in_sec=max(cint(min_interval_sec) * 3, 180))
+	try:
+		from ch_logistics.api.optimizer import compute_trip_eta
+
+		result = compute_trip_eta(trip)
+		frappe.publish_realtime(
+			event="ch_logistics:trip_eta_refreshed",
+			message={
+				"trip": trip,
+				"updated": cint((result or {}).get("updated") or 0),
+				"final_eta": (result or {}).get("final_eta"),
+			},
+		)
+	except Exception:
+		frappe.log_error(
+			title=f"eta refresh on ping failed for {trip}",
+			message=frappe.get_traceback(),
+		)

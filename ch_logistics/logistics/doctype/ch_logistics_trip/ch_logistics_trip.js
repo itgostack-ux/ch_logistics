@@ -31,6 +31,22 @@ frappe.ui.form.on("CH Logistics Trip", {
 
 		// Recompute live ETA from the driver's current position.
 		if ((status === "Assigned" || status === "Started") && (frm.doc.stops || []).length) {
+			frm.add_custom_button(__("Re-sequence Stops"), () => {
+				const label = status === "Started"
+					? __("Re-sequence remaining pending stops using current driver position?")
+					: __("Re-sequence planned stops now?");
+				frappe.confirm(label, () => {
+					frappe.xcall("ch_logistics.api.optimizer.resequence_trip", { trip: frm.doc.name })
+						.then((r) => {
+							frappe.show_alert({
+								message: __("Resequenced: saved {0} km ({1}%)", [r.distance_saved_km, r.saved_pct]),
+								indicator: "green",
+							}, 8);
+							frm.reload_doc();
+						});
+				});
+			}, __("Actions"));
+
 			frm.add_custom_button(__("Recompute ETA"), () => {
 				frappe.xcall("ch_logistics.api.optimizer.compute_trip_eta", { trip: frm.doc.name })
 					.then((r) => {

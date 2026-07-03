@@ -11,6 +11,7 @@
  */
 
 const _LCC = "ch_logistics.api.logistics_api.";
+const _OPT = "ch_logistics.api.optimizer.";
 
 frappe.pages["logistics-control-tower"].on_page_load = function (wrapper) {
 	const page = frappe.ui.make_app_page({
@@ -977,6 +978,8 @@ class LogisticsCommandCenter {
 		$r.on("click",  "#lcc-side-assign",   () => this._ops_assign_driver());
 		$r.on("click",  "#lcc-side-start",    () => this._ops_trip_action("trip_start"));
 		$r.on("click",  "#lcc-side-complete", () => this._ops_trip_action("trip_complete"));
+		$r.on("click",  "#lcc-side-complete-override", () => this._ops_trip_action("trip_complete", _LCC, { override_exceptions: 1 }));
+		$r.on("click",  "#lcc-side-resequence", () => this._ops_trip_action("resequence_trip", _OPT));
 		$r.on("click",  "#lcc-side-close-trip",()=> this._ops_trip_action("trip_close"));
 		$r.on("click",  "#lcc-side-cancel",   () => this._ops_trip_action("trip_unassign"));
 		$r.on("click",  ".lcc-side-detach",   (e) => this._ops_detach_manifest($(e.currentTarget).data("name")));
@@ -1563,6 +1566,13 @@ class LogisticsCommandCenter {
 		const can_complete = t.status === "Started";
 		const can_close    = t.status === "Completed";
 		const can_unassign = t.status === "Assigned";
+		const can_detach = ["Draft", "Assigned", "Started"].includes(t.status);
+		const can_resequence = ["Assigned", "Started"].includes(t.status);
+		const can_complete_override = can_complete && (
+			frappe.user.has_role("System Manager") ||
+			frappe.user.has_role("Logistics Head") ||
+			frappe.user.has_role("Logistic Head")
+		);
 
 		const mf_by_stop = {};
 		(t.manifests || []).forEach((m) => {
@@ -1575,7 +1585,7 @@ class LogisticsCommandCenter {
 				<div class="lcc-side-mf">
 					<a href="/app/ch-transfer-manifest/${m.name}" target="_blank">${m.name}</a>
 					<span class="lcc-muted">${m.status || ""} · ${m.total_qty || 0}q</span>
-					${can_assign ? `<button class="btn btn-xs btn-default lcc-side-detach" data-name="${m.name}"><i class="fa fa-unlink"></i></button>` : ""}
+					${can_detach ? `<button class="btn btn-xs btn-default lcc-side-detach" data-name="${m.name}"><i class="fa fa-unlink"></i></button>` : ""}
 				</div>`).join("") || `<div class="lcc-muted">${__("No manifests")}</div>`;
 			return `<div class="lcc-side-stop">
 				<div class="lcc-side-stop-head">
@@ -1617,7 +1627,9 @@ class LogisticsCommandCenter {
 			<div class="lcc-side-actions">
 				${can_assign   ? `<button class="btn btn-sm btn-default" id="lcc-side-assign"><i class="fa fa-user-plus"></i> ${__("Assign Driver")}</button>` : ""}
 				${can_start    ? `<button class="btn btn-sm btn-warning" id="lcc-side-start"><i class="fa fa-play"></i> ${__("Start")}</button>` : ""}
+				${can_resequence ? `<button class="btn btn-sm btn-default" id="lcc-side-resequence"><i class="fa fa-random"></i> ${__("Re-sequence")}</button>` : ""}
 				${can_complete ? `<button class="btn btn-sm btn-success" id="lcc-side-complete"><i class="fa fa-check"></i> ${__("Complete")}</button>` : ""}
+				${can_complete_override ? `<button class="btn btn-sm btn-danger" id="lcc-side-complete-override"><i class="fa fa-shield"></i> ${__("Complete (Override Exceptions)")}</button>` : ""}
 				${can_close    ? `<button class="btn btn-sm btn-primary" id="lcc-side-close-trip"><i class="fa fa-archive"></i> ${__("Close")}</button>` : ""}
 				${can_unassign ? `<button class="btn btn-sm btn-default" id="lcc-side-cancel"><i class="fa fa-user-times"></i> ${__("Unassign")}</button>` : ""}
 			</div>
@@ -1627,9 +1639,9 @@ class LogisticsCommandCenter {
 		`;
 	}
 
-	_ops_trip_action(method) {
+	_ops_trip_action(method, prefix = _LCC, extraArgs = {}) {
 		if (!this.active_trip) return;
-		frappe.call({ method: _LCC + method, args: { trip: this.active_trip } })
+		frappe.call({ method: prefix + method, args: { trip: this.active_trip, ...extraArgs } })
 			.then(() => { frappe.show_alert({ message: __("Done"), indicator: "green" }); this._ops_load(); });
 	}
 
@@ -1663,11 +1675,11 @@ class LogisticsCommandCenter {
 		const manifests = Array.from(this.selected_manifests);
 		const opts = [];
 		Object.values(this.board.buckets || {}).flat()
-			.filter((t) => ["Draft","Assigned"].includes(t.status))
+			.filter((t) => ["Draft","Assigned","Started"].includes(t.status))
 			.forEach((t) => opts.push(t.name));
 
 		if (!opts.length) {
-			frappe.msgprint(__("No open trips (Draft/Assigned) available to attach to."));
+			frappe.msgprint(__("No eligible trips (Draft/Assigned/Started) available to attach to."));
 			return;
 		}
 		const d = new frappe.ui.Dialog({
