@@ -1251,7 +1251,9 @@ class CHTransferManifest(Document):
                     if not _si.s_warehouse: continue
                     _avail = frappe.db.sql("SELECT SUM(actual_qty) FROM `tabStock Ledger Entry` WHERE item_code=%s AND warehouse=%s AND is_cancelled=0", (_si.item_code, _si.s_warehouse))[0][0] or 0
                     if flt(_avail) < flt(_si.qty):
-                        frappe.log_error(f"SE {se_doc.name}: {_si.item_code} needs {_si.qty}, available {_avail} in {_si.s_warehouse}", "Manifest SE Insufficient Stock")
+                        detail = f"{se_doc.name}: {_si.item_code} needs {_si.qty}, available {_avail} in {_si.s_warehouse}"
+                        frappe.log_error(detail, "Manifest SE Insufficient Stock")
+                        errors.append(detail)
                         _ok = False
                         break
                 if not _ok:
@@ -1275,30 +1277,45 @@ class CHTransferManifest(Document):
                 ),
             )
         if errors:
-            frappe.msgprint(
-                _("Could not auto-submit {0} Stock Entries: {1}. Please submit manually.").format(
-                    len(errors), ", ".join(errors)
-                ),
-                indicator="orange",
-                alert=True,
+            frappe.throw(
+                _(
+                    "Delivery acceptance cannot complete because {0} linked Stock Entry row(s) "
+                    "could not be submitted: {1}. Fix stock or the transfer document and retry."
+                ).format(len(errors), ", ".join(errors)),
+                title=_("Stock Ledger Not Updated"),
             )
 
     def _create_landed_cost_voucher(self) -> None:
         """GAP-8: Distribute manifest freight cost across items via Landed Cost Voucher.
 
-        Creates a Draft LCV linked to all submitted Stock Entries in this manifest.
+        Creates and submits an LCV linked to all submitted Stock Entries in this manifest.
         The LCV proportionally adjusts item valuation rates so the total landed
         cost (transfer price + freight) is correctly reflected in the stock ledger.
         """
-        if frappe.db.get_value("CH Transfer Manifest", self.name, "custom_landed_cost_voucher"):
-            return  # already created
+        existing_lcv = frappe.db.get_value("CH Transfer Manifest", self.name, "custom_landed_cost_voucher")
+        if existing_lcv:
+            lcv_status = frappe.db.get_value("Landed Cost Voucher", existing_lcv, "docstatus")
+            if lcv_status == 1:
+                return
+            if lcv_status == 0:
+                lcv_doc = frappe.get_doc("Landed Cost Voucher", existing_lcv)
+                lcv_doc.flags.ignore_permissions = True
+                lcv_doc.submit()
+                return
+            frappe.throw(
+                _("Linked Landed Cost Voucher {0} is cancelled. Clear it or create a new LCV before closing.").format(existing_lcv),
+                title=_("Landed Cost Voucher Required"),
+            )
 
         submitted_ses = [
             row.stock_entry for row in self.transfers
             if frappe.db.get_value("Stock Entry", row.stock_entry, "docstatus") == 1
         ]
         if not submitted_ses:
-            return
+            frappe.throw(
+                _("Freight is present, but no submitted Stock Entries are linked to this manifest. Receive stock first."),
+                title=_("Landed Cost Voucher Required"),
+            )
 
         try:
             lcv = frappe.new_doc("Landed Cost Voucher")
@@ -1315,15 +1332,20 @@ class CHTransferManifest(Document):
             freight_account = self.freight_account or frappe.db.get_value(
                 "Company", self.company, "default_expense_account"
             )
-            if freight_account:
-                lcv.append("taxes", {
-                    "expense_account": freight_account,
-                    "description": _("Freight — manifest {0}").format(self.name),
-                    "amount": flt(self.freight_amount),
-                })
+            if not freight_account:
+                frappe.throw(
+                    _("Set a freight account on the manifest or Default Expense Account on Company {0}.").format(self.company),
+                    title=_("Freight Account Required"),
+                )
+            lcv.append("taxes", {
+                "expense_account": freight_account,
+                "description": _("Freight — manifest {0}").format(self.name),
+                "amount": flt(self.freight_amount),
+            })
 
             lcv.flags.ignore_permissions = True
             lcv.insert(ignore_permissions=True)
+            lcv.submit()
             frappe.db.set_value(
                 "CH Transfer Manifest", self.name,
                 "custom_landed_cost_voucher", lcv.name,
@@ -1340,6 +1362,7 @@ class CHTransferManifest(Document):
                 frappe.get_traceback(),
                 f"Landed Cost Voucher creation failed for manifest {self.name}",
             )
+            raise
 
     def _auto_create_damage_claim(self, damage_notes: str, damage_photo: str = None) -> None:
         """Auto-create a CH Delivery Claim when damage is reported on acceptance."""
