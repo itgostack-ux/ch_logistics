@@ -1,6 +1,6 @@
 {
  "actions": [],
- "creation": "2026-04-08 10:00:00.000000",
+ "creation": "2026-04-08 10:00:00",
  "doctype": "DocType",
  "editable_grid": 1,
  "engine": "InnoDB",
@@ -21,19 +21,19 @@
  ],
  "fields": [
   {
+   "description": "License Plate Number \u2014 auto-generated per box (e.g. TM-NNN-B01).",
    "fieldname": "package_label",
    "fieldtype": "Data",
    "in_list_view": 1,
    "label": "Package Label / LPN",
-   "description": "License Plate Number — auto-generated per box (e.g. TM-NNN-B01).",
    "reqd": 1
   },
   {
+   "description": "Number of item units physically packed into this box.",
    "fieldname": "packed_qty",
    "fieldtype": "Int",
    "in_list_view": 1,
-   "label": "Packed Qty",
-   "description": "Number of item units physically packed into this box."
+   "label": "Packed Qty"
   },
   {
    "fieldname": "col_break_1",
@@ -46,10 +46,10 @@
    "label": "Weight (kg)"
   },
   {
+   "description": "For courier dimensional weight, e.g. 30x20x15.",
    "fieldname": "dimensions_cm",
    "fieldtype": "Data",
-   "label": "Dimensions (LxWxH cm)",
-   "description": "For courier dimensional weight, e.g. 30x20x15."
+   "label": "Dimensions (LxWxH cm)"
   },
   {
    "fieldname": "seal_number",
@@ -57,16 +57,16 @@
    "label": "Seal / Tamper Tag"
   },
   {
+   "collapsible": 1,
    "fieldname": "sec_break_meta",
    "fieldtype": "Section Break",
-   "label": "Pack Audit",
-   "collapsible": 1
+   "label": "Pack Audit"
   },
   {
    "fieldname": "packed_by",
    "fieldtype": "Link",
-   "options": "User",
    "label": "Packed By",
+   "options": "User",
    "read_only": 1
   },
   {
@@ -80,15 +80,16 @@
    "read_only": 1
   },
   {
+   "collapsible": 1,
    "fieldname": "sec_break_photo",
    "fieldtype": "Section Break",
-   "label": "Packing Photo",
-   "collapsible": 1
+   "label": "Packing Photo"
   },
   {
    "fieldname": "packing_photo",
    "fieldtype": "Attach Image",
-   "label": "Packing Photo"
+   "label": "Packing Photo",
+   "reqd": 1
   },
   {
    "fieldname": "notes",
@@ -96,17 +97,16 @@
    "label": "Notes"
   }
  ],
- "index_web_pages_for_search": 0,
  "istable": 1,
  "links": [],
- "modified": "2026-04-08 10:00:00.000000",
+ "modified": "2026-07-07 18:51:47.974586",
  "modified_by": "Administrator",
  "module": "Logistics",
  "name": "CH Transfer Package",
  "owner": "Administrator",
  "permissions": [],
+ "row_format": "Dynamic",
  "sort_field": "idx",
  "sort_order": "ASC",
- "states": [],
- "track_changes": 0
+ "states": []
 }
