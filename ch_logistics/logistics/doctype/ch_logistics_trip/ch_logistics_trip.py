@@ -168,13 +168,27 @@ class CHLogisticsTrip(Document):
             order_by="sequence asc",
         )
         default_type = "Pickup" if self.direction == "Reverse" else "Drop"
+        hub_warehouse = frappe.db.get_value("CH Route", self.route, "hub_warehouse")
         for rs in route_stops:
+            stop_type = rs.get("stop_type")
+            if not stop_type:
+                # On a Forward trip the hub is where the load is picked up —
+                # typing it "Drop" (the plain default) breaks the driver
+                # app's Arrive & Pick Up flow at that stop.
+                if (
+                    self.direction != "Reverse"
+                    and hub_warehouse
+                    and rs.warehouse == hub_warehouse
+                ):
+                    stop_type = "Pickup"
+                else:
+                    stop_type = default_type
             self.append("stops", {
                 "sequence": rs.sequence,
                 "route_stop": rs.name,
                 "warehouse": rs.warehouse,
                 "store": rs.store,
-                "stop_type": rs.get("stop_type") or default_type,
+                "stop_type": stop_type,
                 "status": "Pending",
             })
 

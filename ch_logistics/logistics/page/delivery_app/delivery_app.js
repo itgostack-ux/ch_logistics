@@ -1087,17 +1087,51 @@ class DeliveryApp {
             </div>`;
         }
 
-        // Group manifests by stop_sequence for the stop cards.
+        // Group manifests under every stop that serves them. The server
+        // (get_trip_detail) resolves pickup_stop_sequence (source side) and
+        // drop_stop_sequence (destination side) per manifest — raw
+        // stop_sequence only ever pointed at the destination stop, which left
+        // pickup stops with no manifest chips (no Manifest ID, no pickup
+        // photo, and a bare "Arrive" CTA).
         let manifests_by_stop = {};
-        for (let m of t.manifests || []) {
-            let key = m.stop_sequence || 0;
+        const _push_stop_manifest = (key, m) => {
+            if (!key) return;
             (manifests_by_stop[key] = manifests_by_stop[key] || []).push(m);
+        };
+        for (let m of t.manifests || []) {
+            const pickup_seq = m.pickup_stop_sequence;
+            const drop_seq = m.drop_stop_sequence || m.stop_sequence;
+            _push_stop_manifest(pickup_seq, m);
+            if (drop_seq && drop_seq !== pickup_seq) _push_stop_manifest(drop_seq, m);
+            if (!pickup_seq && !drop_seq) _push_stop_manifest(m.stop_sequence || 0, m);
         }
 
         let stops_html = (t.stops || []).map((s) => {
             let st_cls = (s.status || "").toLowerCase().replace(/\s+/g, "-");
             let manifests = manifests_by_stop[s.sequence] || [];
             let active_manifest_rows = manifests.filter((m) => ["Assigned", "Pickup Started", "In Transit"].includes(m.status));
+            const _proof_line = (m) => {
+                // Keep the captured proof visible on the stop card: once the
+                // combined Arrive flow (or the manifest-level Start Pickup)
+                // runs, the driver should still see WHAT was captured, where.
+                const bits = [];
+                if (m.pickup_photo) {
+                    const when = m.pickup_datetime ? ` ${frappe.datetime.str_to_user(m.pickup_datetime)}` : "";
+                    bits.push(`<a href="${frappe.utils.escape_html(m.pickup_photo)}" target="_blank" rel="noopener">
+                        <i class="fa fa-camera"></i> ${__("Pickup photo")}</a>${frappe.utils.escape_html(when)}`);
+                }
+                if (m.delivery_photo) {
+                    const when = m.delivery_datetime ? ` ${frappe.datetime.str_to_user(m.delivery_datetime)}` : "";
+                    bits.push(`<a href="${frappe.utils.escape_html(m.delivery_photo)}" target="_blank" rel="noopener">
+                        <i class="fa fa-camera"></i> ${__("Delivery photo")}</a>${frappe.utils.escape_html(when)}`);
+                }
+                if (m.receiver_name) {
+                    bits.push(`<i class="fa fa-user"></i> ${frappe.utils.escape_html(m.receiver_name)}`);
+                }
+                return bits.length
+                    ? `<div class="da-stop-manifest-proof text-muted" style="font-size:11px;padding:2px 8px 6px;">${bits.join(" &middot; ")}</div>`
+                    : "";
+            };
             let manifests_html = manifests.map((m) => `
                 <div class="da-stop-manifest da-stop-manifest-link"
                      data-name="${frappe.utils.escape_html(m.name)}">
@@ -1106,7 +1140,7 @@ class DeliveryApp {
                     ${["Delivered", "Received", "Partially Received"].includes(m.status)
                         ? `<button class="btn btn-xs btn-success da-stop-manifest-close-btn" data-name="${frappe.utils.escape_html(m.name)}"><i class="fa fa-archive"></i> ${__("Close")}</button>`
                         : ""}
-                </div>`).join("");
+                </div>${_proof_line(m)}`).join("");
 
             let can_arrive = (t.status === "Started" && s.status === "Pending");
             let can_complete = (t.status === "Started" && s.status === "Arrived");
@@ -1714,12 +1748,15 @@ class DeliveryApp {
         return (t.manifests || []).filter((m) => {
             let matches = false;
             if (stop_type === "pickup" || stop_type === "pickup+drop") {
-                // Forward trips: pickup is the manifest's source.
-                if (stop && stop.warehouse && m.source_warehouse === stop.warehouse) matches = true;
-                if (stop && stop.store && m.source_store === stop.store) matches = true;
+                // Server-resolved pickup stop (get_trip_detail) wins; the
+                // source warehouse/store checks remain as legacy fallbacks.
+                if (m.pickup_stop_sequence && cint(m.pickup_stop_sequence) === cint(seq)) matches = true;
+                if (!matches && stop && stop.warehouse && m.source_warehouse === stop.warehouse) matches = true;
+                if (!matches && stop && stop.store && m.source_store === stop.store) matches = true;
             }
             if (!matches && (stop_type === "drop" || stop_type === "pickup+drop")) {
-                if (cint(m.stop_sequence) === cint(seq)) matches = true;
+                if (m.drop_stop_sequence && cint(m.drop_stop_sequence) === cint(seq)) matches = true;
+                if (!matches && cint(m.stop_sequence) === cint(seq)) matches = true;
                 // Fallback for trips that pre-date stop_sequence assignment.
                 if (!matches) {
                     if (stop && stop.warehouse && m.destination_warehouse === stop.warehouse) matches = true;
@@ -1819,11 +1856,45 @@ class DeliveryApp {
         const candidates = this._gather_stop_manifests(seq, ["Assigned"]);
         const stop = this._find_stop(seq) || {};
         if (!candidates.length) {
-            // Nothing to pick up here — just record arrival and let the
-            // driver use Complete Stop. Likely the stop is already partly
-            // worked through the manifest flow.
+            // Nothing left to pick up here. If every manifest at this stop
+            // was already picked up (manifest-level Start Pickup), say so
+            // and close the stop out in one tap — the old silent "arrival
+            // recorded" ping made drivers think the pickup photo / manifest
+            // scan had been skipped.
+            const here = this._gather_stop_manifests(seq, []);
+            const picked = here.filter((m) =>
+                ["In Transit", "Delivered", "Received", "Partially Received", "Closed"].includes(m.status));
+            if (here.length && picked.length === here.length) {
+                return this._record_stop_arrival(seq)
+                    .then(() => this._call_promise(TRIP_API + "stop_complete", {
+                        trip: this.active_trip,
+                        sequence: seq,
+                        scan_compliance_pct: 100,
+                    }))
+                    .then(() => {
+                        frappe.msgprint({
+                            title: __("Pickup Already Recorded"),
+                            indicator: "green",
+                            message: __(
+                                "Manifest(s) <b>{0}</b> at this stop were already picked up via the manifest flow — " +
+                                "the pickup photo and QR scan are stored on each manifest (tap its card to view). " +
+                                "Stop marked Completed.",
+                                [picked.map((m) => m.name).join(", ")]
+                            ),
+                        });
+                        this.show_trip_detail(this.active_trip);
+                        this.load_data();
+                    });
+            }
+            // No manifest could be matched to this stop at all — record the
+            // arrival but tell the driver why no pickup dialog opened.
             return this._record_stop_arrival(seq).then(() => {
-                frappe.show_alert({ message: __("Stop arrival recorded"), indicator: "green" });
+                frappe.show_alert({
+                    message: here.length
+                        ? __("Arrival recorded — no manifest here is awaiting pickup")
+                        : __("Arrival recorded — no manifest is linked to this stop"),
+                    indicator: here.length ? "green" : "orange",
+                });
                 this.show_trip_detail(this.active_trip);
             });
         }

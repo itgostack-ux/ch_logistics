@@ -1632,58 +1632,134 @@ class CHTransferManifest(Document):
     _STOP_TERMINAL = {"Completed", "Skipped", "Exception"}
 
     def _cascade_stop_status_to_trip(self):
-        """Advance the parent trip's stop.status based on all peer manifests
-        at the same stop_sequence.
+        """Advance the parent trip's stop statuses based on peer manifests.
 
-        - Drop / Pickup+Drop stop → Completed once every peer manifest has
-          reached one of ``_MANIFEST_DROP_DONE``.
-        - Pickup stop → Completed once every peer manifest has reached
-          one of ``_MANIFEST_PICKUP_DONE``.
+        Two stops can serve one manifest: the PICKUP stop at its source and
+        the DROP stop at its destination. ``stop_sequence`` records only the
+        delivery side (forward trips), so the pickup stop must be resolved by
+        matching the manifest's source store/warehouse against the trip's
+        stops — otherwise a manifest-level ``start_pickup`` never completes
+        the pickup stop, and the driver is shown a bare "Arrive" that skips
+        straight to the scan-compliance prompt.
+
+        - Pickup / Pickup+Drop stop at the source → Completed once every
+          peer manifest picking up there reached ``_MANIFEST_PICKUP_DONE``.
+        - Drop / Pickup+Drop stop at the destination → Completed once every
+          peer manifest delivering there reached ``_MANIFEST_DROP_DONE``.
 
         Stops already in a terminal state (Completed / Skipped / Exception)
         are left alone so an explicit driver action wins over the cascade.
         """
         trip_name = self.get("trip")
-        seq = self.get("stop_sequence")
-        if not trip_name or not seq:
+        if not trip_name:
             return
         try:
             trip = frappe.get_doc("CH Logistics Trip", trip_name)
-            stop = next((s for s in (trip.stops or []) if s.sequence == seq), None)
-            if not stop or (stop.status or "Pending") in self._STOP_TERMINAL:
+            if not trip.stops:
                 return
 
             peers = frappe.get_all(
                 "CH Transfer Manifest",
-                filters={
-                    "trip": trip_name,
-                    "stop_sequence": seq,
-                    "docstatus": ["<", 2],
-                },
-                fields=["name", "status"],
+                filters={"trip": trip_name, "docstatus": ["<", 2]},
+                fields=[
+                    "name", "status", "stop_sequence",
+                    "source_store", "source_warehouse",
+                    "destination_store", "destination_warehouse",
+                ],
             )
             if not peers:
                 return
 
-            stype = (stop.stop_type or "Drop")
-            if stype == "Pickup":
-                required = self._MANIFEST_PICKUP_DONE
-            else:  # Drop or Pickup+Drop
-                required = self._MANIFEST_DROP_DONE
-            all_done = all((p.status or "Draft") in required for p in peers)
-            if not all_done:
-                return
+            wh_by_store = self._store_warehouse_map(trip.stops, peers)
 
-            stop.status = "Completed"
-            if not stop.ata:
-                stop.ata = now_datetime()
-            trip.flags.ignore_validate_update_after_submit = True
-            trip.save(ignore_permissions=True)
+            changed = False
+            for stop in trip.stops:
+                if (stop.status or "Pending") in self._STOP_TERMINAL:
+                    continue
+                stype = (stop.stop_type or "Drop").strip().lower()
+                if stype == "pickup":
+                    sides = [("source", self._MANIFEST_PICKUP_DONE)]
+                elif stype == "pickup+drop":
+                    sides = [
+                        ("source", self._MANIFEST_PICKUP_DONE),
+                        ("destination", self._MANIFEST_DROP_DONE),
+                    ]
+                else:
+                    sides = [("destination", self._MANIFEST_DROP_DONE)]
+
+                stop_peers = []
+                required_by_name = {}
+                for side, required in sides:
+                    for p in peers:
+                        if self._stop_serves_manifest(stop, p, side, wh_by_store):
+                            stop_peers.append(p)
+                            # Pickup+Drop: the stricter (drop) requirement wins
+                            # when the same manifest matches both sides.
+                            prev = required_by_name.get(p.name)
+                            if prev is None or required is self._MANIFEST_DROP_DONE:
+                                required_by_name[p.name] = required
+                if not stop_peers:
+                    continue
+                all_done = all(
+                    (p.status or "Draft") in required_by_name[p.name]
+                    for p in stop_peers
+                )
+                if not all_done:
+                    continue
+
+                stop.status = "Completed"
+                if not stop.ata:
+                    stop.ata = now_datetime()
+                changed = True
+
+            if changed:
+                trip.flags.ignore_validate_update_after_submit = True
+                trip.save(ignore_permissions=True)
         except Exception:
             frappe.log_error(
                 frappe.get_traceback(),
                 f"trip stop cascade failed from manifest {self.name}",
             )
+
+    @staticmethod
+    def _store_warehouse_map(stops, manifests) -> dict:
+        """CH Store → Warehouse for every store referenced by stops/manifests,
+        so store-only and warehouse-only rows still match each other."""
+        names = {s.store for s in stops if s.get("store")}
+        for m in manifests:
+            for key in ("source_store", "destination_store"):
+                if m.get(key):
+                    names.add(m[key])
+        if not (names and frappe.db.exists("DocType", "CH Store")):
+            return {}
+        return {
+            r.name: r.warehouse
+            for r in frappe.get_all(
+                "CH Store",
+                filters={"name": ["in", list(names)]},
+                fields=["name", "warehouse"],
+            )
+            if r.warehouse
+        }
+
+    @staticmethod
+    def _stop_serves_manifest(stop, manifest, side, wh_by_store) -> bool:
+        """True when `stop` is the pickup (side='source') or delivery
+        (side='destination') location of `manifest`."""
+        store = manifest.get(f"{side}_store")
+        warehouse = manifest.get(f"{side}_warehouse")
+        if side == "destination" and manifest.get("stop_sequence") \
+                and cint(manifest.get("stop_sequence")) == cint(stop.sequence):
+            return True
+        if store and stop.get("store") and store == stop.get("store"):
+            return True
+        if warehouse and stop.get("warehouse") and warehouse == stop.get("warehouse"):
+            return True
+        if warehouse and stop.get("store") and wh_by_store.get(stop.get("store")) == warehouse:
+            return True
+        if store and stop.get("warehouse") and wh_by_store.get(store) == stop.get("warehouse"):
+            return True
+        return False
 
     # ── Recall / Reversal ───────────────────────────────────────────────
 

@@ -864,6 +864,74 @@ def get_driver_trips(driver=None, include_closed_days=0):
     return {"active": active, "history": history}
 
 
+def _annotate_manifest_stop_links(stops, manifests):
+    """Stamp ``pickup_stop_sequence`` / ``drop_stop_sequence`` on each manifest
+    dict by matching its source / destination against the trip's stops.
+
+    Matching is tolerant of store-vs-warehouse asymmetry: a stop that only
+    carries a CH Store still matches a manifest that only carries the store's
+    warehouse (and vice versa) via the CH Store → Warehouse link.
+    """
+    if not stops or not manifests:
+        return
+
+    # One lookup for every CH Store referenced on either side.
+    store_names = set()
+    for s in stops:
+        if s.get("store"):
+            store_names.add(s["store"])
+    for m in manifests:
+        for key in ("source_store", "destination_store"):
+            if m.get(key):
+                store_names.add(m[key])
+    wh_by_store = {}
+    if store_names and frappe.db.exists("DocType", "CH Store"):
+        for r in frappe.get_all(
+            "CH Store",
+            filters={"name": ["in", list(store_names)]},
+            fields=["name", "warehouse"],
+        ):
+            if r.warehouse:
+                wh_by_store[r.name] = r.warehouse
+
+    def _matches(stop, store, warehouse):
+        s_store, s_wh = stop.get("store"), stop.get("warehouse")
+        if store and s_store and store == s_store:
+            return True
+        if warehouse and s_wh and warehouse == s_wh:
+            return True
+        if warehouse and s_store and wh_by_store.get(s_store) == warehouse:
+            return True
+        if store and s_wh and wh_by_store.get(store) == s_wh:
+            return True
+        return False
+
+    def _find(store, warehouse, preferred_types):
+        if not (store or warehouse):
+            return None
+        # Prefer stops typed for this side (Pickup for source, Drop for
+        # destination), then fall back to any location match so legacy
+        # routes with mis-typed stops still resolve.
+        for only_preferred in (True, False):
+            for stop in stops:
+                stype = (stop.get("stop_type") or "").strip().lower()
+                if only_preferred and stype not in preferred_types:
+                    continue
+                if _matches(stop, store, warehouse):
+                    return stop.get("sequence")
+        return None
+
+    for m in manifests:
+        m["pickup_stop_sequence"] = _find(
+            m.get("source_store"), m.get("source_warehouse"),
+            ("pickup", "pickup+drop"),
+        )
+        m["drop_stop_sequence"] = _find(
+            m.get("destination_store"), m.get("destination_warehouse"),
+            ("drop", "pickup+drop"),
+        ) or m.get("stop_sequence")
+
+
 @frappe.whitelist()
 def get_trip_detail(trip):
     """Return a Trip with stops, attached manifests, and open exceptions."""
@@ -944,6 +1012,11 @@ def get_trip_detail(trip):
         "source_warehouse", "destination_warehouse",
         "source_store", "destination_store",
         "total_stock_entries", "total_items", "total_qty",
+        # Proof-of-handling — the driver app renders these on the stop
+        # cards so pickup photo / delivery photo stay visible after the
+        # combined Arrive flows run.
+        "pickup_photo", "pickup_datetime",
+        "delivery_photo", "delivery_datetime", "receiver_name",
     ]
     if _has_box_count:
         manifest_fields.append("box_count")
@@ -970,6 +1043,12 @@ def get_trip_detail(trip):
     )
     if not _has_manifest_trip_field():
         manifests = []
+
+    # Resolve, per manifest, WHICH stop serves its pickup (source) and which
+    # its delivery (destination). ``stop_sequence`` alone points at only one
+    # side (destination for forward trips), so the driver app could never
+    # list a manifest — or its pickup photo / QR — under the pickup stop.
+    _annotate_manifest_stop_links(stops, manifests)
 
     exceptions = []
     for e in doc.exceptions:
