@@ -11,8 +11,6 @@ channels are available, the way a mature last-mile stack decouples the event
 Every channel is best-effort and isolated — a failing transport never breaks
 the operational flow that triggered the notification.
 """
-import json
-
 import frappe
 from frappe.utils import now_datetime
 
@@ -83,33 +81,17 @@ def _notify_inapp(user, title, body, reference):
 
 
 def _send_fcm(driver, title, body, data):
-    """Best-effort FCM legacy-key send to all active device tokens. Returns the
-    number of tokens targeted. No-op (returns 0) until a server key is set."""
-    settings = frappe.get_cached_doc("CH Logistics Settings")
-    server_key = settings.get_password("fcm_server_key", raise_exception=False) if settings else None
-    if not server_key:
-        return 0
+    """Push to all of the driver's active device tokens via the shared FCM
+    transport (Firebase Admin SDK, HTTP v1). Returns the number of tokens
+    successfully delivered to; 0 (no-op) until Firebase credentials are set.
+    Tokens FCM reports as permanently invalid are deactivated."""
     tokens = active_tokens(driver)
     if not tokens:
         return 0
 
-    import requests  # lazy import — only needed on the FCM path
+    from ch_logistics.api.fcm import send_to_tokens, _deactivate_invalid
 
-    payload = {
-        "registration_ids": tokens,
-        "notification": {"title": title, "body": body},
-        "data": data or {},
-        "priority": "high",
-    }
-    resp = requests.post(
-        "https://fcm.googleapis.com/fcm/send",
-        data=json.dumps(payload),
-        headers={"Authorization": f"key={server_key}",
-                 "Content-Type": "application/json"},
-        timeout=10,
-    )
-    if resp.status_code >= 400:
-        frappe.log_error(title="FCM send non-200",
-                         message=f"{resp.status_code}: {resp.text[:500]}")
-        return 0
-    return len(tokens)
+    res = send_to_tokens(tokens, title, body, data)
+    if res.get("failed"):
+        _deactivate_invalid("CH Driver Device", res["failed"])
+    return res.get("sent", 0)

@@ -20,6 +20,7 @@
   "geofence_radius_m",
   "push_section",
   "push_provider",
+  "fcm_service_account_file",
   "column_break_push",
   "fcm_project_id",
   "fcm_server_key",
@@ -132,6 +133,12 @@
    "options": "Frappe Web Push\nFCM\nDisabled"
   },
   {
+   "description": "Upload the Firebase service-account JSON (Admin SDK, HTTP v1). Stored as a private file; never commit it to Git.",
+   "fieldname": "fcm_service_account_file",
+   "fieldtype": "Attach",
+   "label": "Firebase Service Account JSON"
+  },
+  {
    "fieldname": "column_break_push",
    "fieldtype": "Column Break"
   },
@@ -141,9 +148,10 @@
    "label": "FCM Project ID"
   },
   {
+   "description": "Legacy FCM server key (deprecated by Google in 2024). Retained for reference only; the service-account JSON above is used.",
    "fieldname": "fcm_server_key",
    "fieldtype": "Password",
-   "label": "FCM Server Key"
+   "label": "FCM Server Key (legacy)"
   },
   {
    "fieldname": "digest_section",
