@@ -57,6 +57,7 @@ def _ensure_store(name, warehouse):
         return name
     s = frappe.new_doc("CH Store")
     s.store_name = name
+    s.company = _company()
     s.warehouse = warehouse
     s.insert(ignore_permissions=True)
     return s.name
