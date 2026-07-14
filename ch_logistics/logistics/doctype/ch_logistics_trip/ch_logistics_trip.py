@@ -19,12 +19,22 @@ _ALLOWED_STATUS_TRANSITIONS = {
 # Manifest statuses that block trip lifecycle transitions -------------------
 # A trip carries multiple shipments (one per request/manifest). The driver can
 # only mark the trip Completed once every shipment has at least been Delivered,
-# and the trip can be Closed once every shipment is in a terminal logistics
-# state (Delivered / Closed / Cancelled).
+# and the trip can be Closed once every shipment is in a terminal settled
+# state (Received / Partially Received / Closed / Cancelled / Returned).
 _MANIFEST_PREDELIVERY = {
     "Draft", "Packed", "Assigned", "Pickup Started", "In Transit", "Recall Initiated",
 }
-_MANIFEST_UNSETTLED = _MANIFEST_PREDELIVERY
+# Terminal states that indicate the shipment has been reconciled and no
+# further logistics action is required. Anything outside this set — including
+# "Delivered" (goods handed over but not yet booked into the receiving
+# warehouse) and "Rejected" (refused by the receiving location and awaiting
+# a decision) — must block trip close.
+_MANIFEST_SETTLED = {
+    "Partially Received", "Received", "Closed", "Cancelled", "Returned",
+}
+_MANIFEST_UNSETTLED = (
+    _MANIFEST_PREDELIVERY | {"Delivered", "Rejected"}
+)
 
 
 class CHLogisticsTrip(Document):
@@ -235,8 +245,9 @@ class CHLogisticsTrip(Document):
             unsettled = self._blocking_manifests(_MANIFEST_UNSETTLED)
             if unsettled:
                 frappe.throw(_(
-                    "Cannot close trip {0}. These shipments are not yet delivered/closed/cancelled: {1}. "
-                    "Settle each shipment first, then close the trip."
+                    "Cannot close trip {0}. These shipments are not yet settled "
+                    "(Received / Partially Received / Closed / Cancelled / Returned): {1}. "
+                    "Reconcile each shipment first, then close the trip."
                 ).format(self.name, ", ".join(unsettled)))
             self.status = "Closed"
         finally:
