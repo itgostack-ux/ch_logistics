@@ -4,17 +4,29 @@
  "doctype": "Page",
  "icon": "fa fa-sitemap",
  "idx": 0,
- "modified": "2026-05-26 00:00:00",
+ "modified": "2026-07-17 12:00:00.000000",
  "module": "Logistics",
  "name": "logistics-control-tower",
  "page_name": "logistics-control-tower",
  "roles": [
-  {"role": "System Manager"},
-  {"role": "Operations Manager"},
-  {"role": "Delivery Manager"},
-  {"role": "Delivery User"},
-  {"role": "Stock Manager"},
-  {"role": "Stock User"}
+  {
+   "role": "System Manager"
+  },
+  {
+   "role": "Operations Manager"
+  },
+  {
+   "role": "Delivery Manager"
+  },
+  {
+   "role": "Delivery User"
+  },
+  {
+   "role": "Stock Manager"
+  },
+  {
+   "role": "Stock User"
+  }
  ],
  "standard": "Yes",
  "system_page": 0,
