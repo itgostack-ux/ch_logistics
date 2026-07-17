@@ -18,19 +18,29 @@ def _enabled():
     return v is None or cint(v) == 1
 
 
-def _recipients():
+def _recipients(company=None):
+    """Logistics managers — scoped to `company` when given (fail-closed via
+    ch_erp15's notification router); explicit settings recipients always kept."""
     valid = set()
-    role_users = frappe.get_all(
-        "Has Role",
-        filters={"role": ["in", ["Delivery Manager", "Stock Manager"]], "parenttype": "User"},
-        pluck="parent",
-    )
-    for u in set(role_users):
-        if not u or u in ("Administrator", "Guest"):
-            continue
-        info = frappe.db.get_value("User", u, ["enabled", "email"], as_dict=True)
-        if info and info.enabled and info.email:
-            valid.add(info.email)
+    if company:
+        try:
+            from ch_erp15.ch_erp15.notification_router import scoped_role_emails
+
+            valid.update(scoped_role_emails(["Delivery Manager", "Stock Manager"], company=company))
+        except ImportError:
+            company = None  # router unavailable — fall back to role-wide below
+    if not company:
+        role_users = frappe.get_all(
+            "Has Role",
+            filters={"role": ["in", ["Delivery Manager", "Stock Manager"]], "parenttype": "User"},
+            pluck="parent",
+        )
+        for u in set(role_users):
+            if not u or u in ("Administrator", "Guest"):
+                continue
+            info = frappe.db.get_value("User", u, ["enabled", "email"], as_dict=True)
+            if info and info.enabled and info.email:
+                valid.add(info.email)
     extra = frappe.db.get_single_value("CH Logistics Settings", "digest_recipients") or ""
     for e in extra.replace("\n", ",").split(","):
         if e.strip():
@@ -138,12 +148,14 @@ def send_logistics_daily_digest():
     honouring the single active-company model end-to-end."""
     if not _enabled():
         return {"sent": False, "reason": "disabled"}
-    recipients = _recipients()
-    if not recipients:
-        return {"sent": False, "reason": "no-recipients"}
 
     sent = []
+    all_recipients = {}
     for company in _active_companies():
+        recipients = _recipients(company)
+        if not recipients:
+            continue
+        all_recipients[company] = recipients
         m = _metrics(company)
         frappe.sendmail(
             recipients=recipients,
@@ -152,7 +164,9 @@ def send_logistics_daily_digest():
             now=False,
         )
         sent.append(company)
-    return {"sent": bool(sent), "companies": sent, "recipients": recipients}
+    if not sent:
+        return {"sent": False, "reason": "no-recipients"}
+    return {"sent": True, "companies": sent, "recipients": all_recipients}
 
 
 @frappe.whitelist()
