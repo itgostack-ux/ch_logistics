@@ -106,6 +106,5 @@ def current_driver():
 
 
 def is_ops_user():
-    roles = set(frappe.get_roles(frappe.session.user))
-    return bool({"System Manager", "Delivery Manager", "Stock Manager",
-                 "Operations Manager"} & roles)
+    from ch_logistics import roles as role_registry
+    return role_registry.user_has("report_ops")

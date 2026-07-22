@@ -27,7 +27,6 @@ from frappe.utils import cint, flt, now_datetime, add_to_date
 EARTH_KM = 6371.0
 DEFAULT_URBAN_SPEED_KMH = 24.0
 DEFAULT_DWELL_MIN = 5
-_RESEQUENCE_OVERRIDE_ROLES = {"System Manager", "Logistics Head", "Logistic Head", "Operations Manager"}
 
 
 # ── geo helpers ────────────────────────────────────────────────────────────
@@ -308,12 +307,8 @@ def resequence_trip(trip: str) -> dict:
     if doc.status != "Started":
         frappe.throw(_("Can resequence only Draft/Assigned/Started trips."))
 
-    roles = set(frappe.get_roles(frappe.session.user))
-    if not (roles & _RESEQUENCE_OVERRIDE_ROLES):
-        frappe.throw(
-            _("Only Operations Manager / Logistics Head / System Manager can resequence a Started trip."),
-            frappe.PermissionError,
-        )
+    from ch_logistics import roles as role_registry
+    role_registry.require("resequence_override", _("resequence a Started trip"))
 
     reached = [
         s for s in (doc.stops or [])

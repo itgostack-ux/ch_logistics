@@ -12,16 +12,24 @@ from frappe.utils import cint, flt, now_datetime
 import json
 
 from ch_logistics.api import driver_status as ds
+from ch_logistics import roles as role_registry
+from ch_logistics import scope_guard
 
 
 _TRIP_CLOSE_TERMINAL_MANIFEST_STATUSES = {"Closed", "Delivered", "Cancelled"}
-_LOGISTICS_HEAD_ROLES = {"System Manager", "Logistics Head", "Logistic Head"}
 
 # Manifest statuses considered "attachable to a trip" in the Logistics
 # Control Tower Operations tab.  Mirrors how TMS dispatcher consoles
 # (Oracle WMS, SAP TM, Manhattan WMS) only surface freight that is
 # packed/ready-to-load — anything already in motion or terminal is hidden.
-_OPS_ATTACHABLE_MANIFEST_STATUSES = ("Draft", "Packed")
+# Draft is deliberately excluded: a manifest must be submitted (Packed)
+# before it can ride a trip.
+_OPS_ATTACHABLE_MANIFEST_STATUSES = ("Packed",)
+
+# Statuses a manifest may hold at the moment it is attached to a trip.
+# Rejected is allowed so dispatch can re-plan a bounced shipment onto a
+# fresh trip; anything already moving or terminal is refused.
+_ATTACHABLE_MANIFEST_STATUSES = {"Packed", "Assigned", "Rejected"}
 
 
 # ---------------------------------------------------------------------------
@@ -52,7 +60,12 @@ def trip_create(trip_date, company, route=None, driver=None, vehicle=None,
                 planned_start=None, planned_end=None, direction="Forward",
                 manifests=None):
     """Create a CH Logistics Trip, optionally pre-populating stops from route
-    and attaching a list of CH Transfer Manifest names."""
+    and attaching a list of CH Transfer Manifest names.
+
+    When manifests are given but no route, the trip's hub + stops are seeded
+    from the manifests themselves so the trip↔manifest warehouse-match
+    validation in _attach_manifests holds by construction."""
+    scope_guard.assert_scope(company=company)
     doc = frappe.new_doc("CH Logistics Trip")
     doc.trip_date = trip_date
     doc.company = company
@@ -74,9 +87,65 @@ def trip_create(trip_date, company, route=None, driver=None, vehicle=None,
     doc.insert()
 
     if manifests:
+        if isinstance(manifests, str):
+            manifests = frappe.parse_json(manifests)
+        if not (doc.get("stops") or []):
+            _seed_stops_from_manifests(doc, manifests)
         _attach_manifests(doc.name, manifests)
 
     return doc.name
+
+
+def _seed_stops_from_manifests(trip_doc, manifests) -> None:
+    """Build the trip's hub + stops from its initial manifests.
+
+    Forward manifests: hub = common source, one Drop stop per destination.
+    Reverse manifests: one Pickup stop per source, hub = common destination.
+    Mirrors club_transfers_into_trip so the Control Tower "Create & Attach"
+    dialog (no route picked) keeps working under the warehouse-match gate.
+    """
+    if not manifests:
+        return
+    seq = 0
+    seen_targets = set()
+    hub_candidates = []
+    for manifest_name in manifests:
+        target = _manifest_target_for_trip(trip_doc, manifest_name)
+        mf = frappe.db.get_value(
+            "CH Transfer Manifest", manifest_name,
+            ["source_store", "source_warehouse", "destination_store", "destination_warehouse"],
+            as_dict=True,
+        ) or {}
+        # The side NOT served by a stop is the hub side.
+        if target.get("stop_type") == "Pickup":
+            hub_candidates.append(mf.get("destination_warehouse"))
+        else:
+            hub_candidates.append(mf.get("source_warehouse"))
+
+        target_store = target.get("store")
+        target_wh = target.get("warehouse")
+        if not target_wh and target_store:
+            target_wh = frappe.db.get_value("CH Store", target_store, "warehouse")
+        key = target_store or target_wh
+        if not key or key in seen_targets:
+            continue
+        seen_targets.add(key)
+        seq += 1
+        trip_doc.append("stops", {
+            "sequence": seq,
+            "warehouse": target_wh,
+            "store": target_store,
+            "stop_type": target.get("stop_type") or "Drop",
+            "status": "Pending",
+        })
+
+    if not trip_doc.get("hub_warehouse"):
+        hub = next((h for h in hub_candidates if h), None)
+        if hub:
+            trip_doc.hub_warehouse = hub
+    if seq:
+        trip_doc.flags.ignore_mandatory = True
+        trip_doc.save(ignore_permissions=True)
 
 
 @frappe.whitelist()
@@ -318,8 +387,7 @@ def trip_complete(trip, override_exceptions=0):
 @frappe.whitelist()
 def trip_close(trip, close_as_head=0):
     doc = frappe.get_doc("CH Logistics Trip", trip)
-    roles = set(frappe.get_roles(frappe.session.user))
-    allow_head_override = cint(close_as_head) and bool(roles & _LOGISTICS_HEAD_ROLES)
+    allow_head_override = cint(close_as_head) and role_registry.user_has("head_override")
 
     if allow_head_override:
         _close_trip_as_logistics_head(doc)
@@ -520,6 +588,90 @@ def _ensure_dynamic_stop_for_manifest(trip_doc, manifest_name: str):
     return insert_seq
 
 
+def _trip_serviced_locations(trip_doc) -> tuple[set, set]:
+    """(warehouses, stores) this trip touches: hub + every stop, with each
+    stop's CH Store resolved to its warehouse as well."""
+    warehouses, stores = set(), set()
+    if trip_doc.get("hub_warehouse"):
+        warehouses.add(trip_doc.hub_warehouse)
+    for s in trip_doc.get("stops") or []:
+        if s.get("warehouse"):
+            warehouses.add(s.warehouse)
+        if s.get("store"):
+            stores.add(s.store)
+            store_wh = frappe.db.get_value("CH Store", s.store, "warehouse")
+            if store_wh:
+                warehouses.add(store_wh)
+    return warehouses, stores
+
+
+def _validate_manifest_attachable(trip_doc, manifest_name: str, mf: dict) -> None:
+    """Gate a manifest → trip attachment.
+
+    1. Status gate: Draft manifests (not yet submitted/packed) and manifests
+       in motion / terminal states are refused.
+    2. Warehouse-match gate: BOTH the manifest's source and destination must
+       be locations the trip actually serves (hub warehouse or a stop).
+       Exception: on a Started trip the destination may be new — the ops-gated
+       dynamic-stop insertion creates the stop for it (on-route add).
+    """
+    status = (mf.get("status") or "Draft").strip() or "Draft"
+    if status == "Draft":
+        frappe.throw(
+            _("Manifest {0} is still in <b>Draft</b>. Submit it (status Packed) "
+              "before assigning it to a trip.").format(manifest_name),
+            title=_("Manifest Not Ready"),
+        )
+    if status not in _ATTACHABLE_MANIFEST_STATUSES:
+        frappe.throw(
+            _("Manifest {0} has status <b>{1}</b> and cannot be attached to a trip. "
+              "Attachable statuses: {2}.").format(
+                manifest_name, status, ", ".join(sorted(_ATTACHABLE_MANIFEST_STATUSES))),
+            title=_("Manifest Not Attachable"),
+        )
+
+    warehouses, stores = _trip_serviced_locations(trip_doc)
+    if not warehouses and not stores:
+        frappe.throw(
+            _("Trip {0} has no hub warehouse or stops yet. Pick a route or add "
+              "stops before attaching manifests, so the manifest's source and "
+              "destination can be validated against the trip.").format(trip_doc.name),
+            title=_("Trip Has No Route"),
+        )
+
+    def _served(warehouse, store) -> bool:
+        if warehouse and warehouse in warehouses:
+            return True
+        if store:
+            if store in stores:
+                return True
+            store_wh = frappe.db.get_value("CH Store", store, "warehouse")
+            if store_wh and store_wh in warehouses:
+                return True
+        return False
+
+    if not _served(mf.get("source_warehouse"), mf.get("source_store")):
+        frappe.throw(
+            _("Manifest {0} source ({1}) does not match this trip — the trip's "
+              "hub/stops do not include it. Attach the manifest to a trip that "
+              "serves its source warehouse, or correct the trip's route/stops.").format(
+                manifest_name,
+                mf.get("source_store") or mf.get("source_warehouse") or "—"),
+            title=_("Source Warehouse Mismatch"),
+        )
+    if not _served(mf.get("destination_warehouse"), mf.get("destination_store")):
+        if trip_doc.status == "Started":
+            return  # ops-gated on-route add: dynamic stop is inserted below
+        frappe.throw(
+            _("Manifest {0} destination ({1}) does not match this trip — no "
+              "stop serves it. Add a stop for the destination or attach the "
+              "manifest to the correct trip.").format(
+                manifest_name,
+                mf.get("destination_store") or mf.get("destination_warehouse") or "—"),
+            title=_("Destination Warehouse Mismatch"),
+        )
+
+
 def _attach_manifests(trip, manifests):
     if not _has_manifest_trip_field():
         frappe.throw(
@@ -532,6 +684,10 @@ def _attach_manifests(trip, manifests):
     if not manifests:
         return
     trip_doc = frappe.get_doc("CH Logistics Trip", trip)
+    # Internal recompute saves below must not re-litigate desk-form
+    # mandatories (driver/vehicle/planned times) on a system-planned Draft
+    # trip that has no carrier bound yet.
+    trip_doc.flags.ignore_mandatory = True
     if trip_doc.status in ("Closed", "Cancelled"):
         frappe.throw(_("Cannot attach manifests to a {0} trip").format(trip_doc.status))
     if trip_doc.status == "Started":
@@ -539,11 +695,22 @@ def _attach_manifests(trip, manifests):
 
     dynamically_inserted = []
     for manifest_name in manifests:
-        current_trip = frappe.db.get_value("CH Transfer Manifest", manifest_name, "trip")
+        mf = frappe.db.get_value(
+            "CH Transfer Manifest",
+            manifest_name,
+            ["name", "status", "trip", "company", "source_store", "source_warehouse",
+             "destination_store", "destination_warehouse"],
+            as_dict=True,
+        )
+        if not mf:
+            frappe.throw(_("Manifest {0} not found").format(manifest_name))
+        current_trip = mf.get("trip")
         if current_trip and current_trip != trip:
             frappe.throw(
                 _("Manifest {0} is already attached to trip {1}").format(manifest_name, current_trip)
             )
+        scope_guard.assert_manifest_scope(mf)
+        _validate_manifest_attachable(trip_doc, manifest_name, mf)
         frappe.db.set_value("CH Transfer Manifest", manifest_name, "trip", trip)
         seq = _assign_stop_sequence(trip_doc, manifest_name)
         if seq is None and trip_doc.status == "Started":
@@ -563,6 +730,7 @@ def _attach_manifests(trip, manifests):
         trip_doc.save(ignore_permissions=True)
     # Refresh totals + per-stop manifest counts
     trip_doc.reload()
+    trip_doc.flags.ignore_mandatory = True
     trip_doc.save()
     # If the trip already has a driver, pull every just-attached pre-pickup
     # manifest onto that driver as well. Without this, attach-after-assign
@@ -610,7 +778,9 @@ def detach_manifest(manifest):
     current_trip = frappe.db.get_value("CH Transfer Manifest", manifest, "trip")
     if not current_trip:
         return
+    scope_guard.assert_manifest_scope(manifest)
     trip_doc = frappe.get_doc("CH Logistics Trip", current_trip)
+    trip_doc.flags.ignore_mandatory = True
     if trip_doc.status == "Started":
         _require_ops()
     if trip_doc.status in ("Completed", "Closed", "Cancelled"):
@@ -620,6 +790,7 @@ def detach_manifest(manifest):
         frappe.db.set_value("CH Transfer Manifest", manifest, "stop_sequence", None)
     _trip_audit(trip_doc, _("Manifest {0} detached by {1}.").format(manifest, frappe.session.user))
     trip_doc.reload()
+    trip_doc.flags.ignore_mandatory = True
     trip_doc.save()
     return True
 
@@ -820,8 +991,7 @@ def get_driver_trips(driver=None, include_closed_days=0):
     Driver record). Active trips are returned first; closed/cancelled trips
     within ``include_closed_days`` follow."""
     driver = driver or _resolve_current_driver()
-    user_roles = set(frappe.get_roles(frappe.session.user))
-    is_ops = bool({"System Manager", "Operations Manager", "Delivery Manager"} & user_roles)
+    is_ops = role_registry.user_has("ops_control")
     if not driver and not is_ops:
         return []
 
@@ -1090,19 +1260,8 @@ def get_trip_detail(trip):
 # ---------------------------------------------------------------------------
 # Ops Control Tower endpoints (consumed by /app/logistics-control-tower)
 # ---------------------------------------------------------------------------
-_OPS_ROLES = {
-    "System Manager",
-    "Operations Manager",
-    "Delivery Manager",
-    "Logistics Head",
-    "Logistic Head",
-}
-
-
 def _require_ops():
-    roles = set(frappe.get_roles(frappe.session.user))
-    if not (roles & _OPS_ROLES):
-        frappe.throw(_("Operations role required"), frappe.PermissionError)
+    role_registry.require("ops_control", _("perform operations-console actions"))
 
 
 def _trip_audit(doc, message: str) -> None:
@@ -1118,8 +1277,7 @@ def _trip_audit(doc, message: str) -> None:
 
 
 def _can_override_exception_gate() -> bool:
-    roles = set(frappe.get_roles(frappe.session.user))
-    return bool(roles & _LOGISTICS_HEAD_ROLES)
+    return role_registry.user_has("head_override")
 
 
 def _blocking_high_critical_exceptions(doc, stop_sequence=None) -> list[dict]:
@@ -1213,9 +1371,15 @@ def _store_coords(store: str | None):
 def _warehouse_coords(warehouse: str | None):
     if not warehouse:
         return None
-    lat, lng = frappe.db.get_value("Warehouse", warehouse, ["custom_latitude", "custom_longitude"]) or (None, None)
-    if lat and lng:
-        return (flt(lat), flt(lng))
+    # Geo custom fields are installed by patch v0_0_4 — tolerate their
+    # absence (e.g. a prod restore that lost Custom Fields) instead of
+    # crashing every coord lookup with an unknown-column error.
+    if frappe.db.has_column("Warehouse", "custom_latitude"):
+        lat, lng = frappe.db.get_value(
+            "Warehouse", warehouse, ["custom_latitude", "custom_longitude"]
+        ) or (None, None)
+        if lat and lng:
+            return (flt(lat), flt(lng))
 
     store = (
         frappe.db.get_value("Warehouse", warehouse, "ch_store")
@@ -2193,9 +2357,14 @@ def start_stop_pickup(trip, sequence, scanned_qr, pickup_photo,
             skipped.append({"name": r.name, "reason": str(exc)})
 
     if started:
+        # start_pickup's driver/stop cascade may save the trip — reload the
+        # handle before stamping so we never save a stale doc.
+        trip_doc.reload()
+        stop = _get_trip_stop(trip_doc, stop.sequence)
         stop.pickup_scanned_at = now_datetime()
         stop.pickup_scanned_by = frappe.session.user
         stop.status = "Arrived"
+        trip_doc.flags.ignore_mandatory = True
         trip_doc.save(ignore_permissions=True)
 
     return {
@@ -2258,11 +2427,17 @@ def complete_stop_delivery(trip, sequence, scanned_qr, delivery_photo,
             skipped.append({"name": r.name, "reason": str(exc)})
 
     if delivered:
+        # complete_delivery's stop-status cascade saves the trip itself, so
+        # our pre-loop handle is stale — reload before stamping the stop or
+        # the save dies with TimestampMismatchError.
+        trip_doc.reload()
+        stop = _get_trip_stop(trip_doc, stop.sequence)
         stop.delivery_scanned_at = now_datetime()
         stop.delivery_scanned_by = frappe.session.user
         stop.status = "Completed"
         if not stop.get("ata"):
             stop.ata = now_datetime()
+        trip_doc.flags.ignore_mandatory = True
         trip_doc.save(ignore_permissions=True)
 
     return {
@@ -2414,8 +2589,9 @@ def club_transfers_into_trip(source_warehouse, trip_date=None, company=None,
     * ``manifests`` (optional): explicit list of manifest names. When given,
       only those are clubbed.
     * Otherwise: every CH Transfer Manifest whose source_warehouse matches
-      and whose status is Draft or Packed (the dispatcher-attachable set
-      mirrored by Operations Tab) and which is not yet on a trip.
+      and whose status is Packed (the dispatcher-attachable set mirrored by
+      Operations Tab — Draft manifests must be submitted first) and which is
+      not yet on a trip.
     * ``trip_date`` (optional): when scanning by status, restricts to the
       given date. Defaults to today.
     * ``enforce_single_destination`` (default False): when True, refuses
@@ -2426,6 +2602,8 @@ def club_transfers_into_trip(source_warehouse, trip_date=None, company=None,
     if not _has_manifest_trip_field():
         frappe.throw(_("CH Transfer Manifest is missing the 'trip' field. Run bench migrate."),
                      title=_("Schema Mismatch"))
+
+    scope_guard.assert_scope(warehouse=source_warehouse)
 
     if isinstance(manifests, str):
         try:
@@ -2453,7 +2631,8 @@ def club_transfers_into_trip(source_warehouse, trip_date=None, company=None,
                           order_by="creation asc")
     if not pool:
         frappe.throw(
-            _("No attachable manifests found from {0}. They must be Draft/Packed and not already on a trip.")
+            _("No attachable manifests found from {0}. They must be submitted "
+              "(status Packed) and not already on a trip.")
                 .format(source_warehouse),
             title=_("Nothing to Club"),
         )
@@ -2484,7 +2663,10 @@ def club_transfers_into_trip(source_warehouse, trip_date=None, company=None,
             title=_("Mixed Destinations"),
         )
 
-    # Create the trip.
+    # Create the trip. System-generated Draft — driver/vehicle/planned times
+    # are bound right after via assign_driver (or later by dispatch), so the
+    # desk-form mandatory rule is relaxed here (matches how a TMS plans a
+    # tour before carrier assignment).
     trip = frappe.new_doc("CH Logistics Trip")
     trip.trip_date = trip_date
     trip.company = company
@@ -2492,7 +2674,9 @@ def club_transfers_into_trip(source_warehouse, trip_date=None, company=None,
     trip.hub_warehouse = source_warehouse
     if vehicle:
         trip.vehicle = vehicle
-    trip.insert(ignore_permissions=True)
+    if driver:
+        trip.driver = driver
+    trip.insert(ignore_permissions=True, ignore_mandatory=True)
 
     # One stop per destination.
     for idx, key in enumerate(order, start=1):

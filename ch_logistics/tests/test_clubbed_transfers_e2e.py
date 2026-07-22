@@ -64,8 +64,10 @@ def _ensure_warehouse(name, abbr):
 
 
 def _ensure_store(name, warehouse):
-    if frappe.db.exists("CH Store", name):
-        return name
+    # CH Store autonames by store code — look up by store_name.
+    existing = frappe.db.get_value("CH Store", {"store_name": name, "company": _company()})
+    if existing:
+        return existing
     s = frappe.new_doc("CH Store")
     s.store_name = name
     s.company = _company()
@@ -147,7 +149,7 @@ def _teardown():
         except Exception:
             pass
     for s in frappe.get_all("CH Store",
-                            filters={"name": ["like", f"{_TAG}-%"]},
+                            filters={"store_name": ["like", f"{_TAG}-%"]},
                             pluck="name"):
         try:
             frappe.delete_doc("CH Store", s, force=1,

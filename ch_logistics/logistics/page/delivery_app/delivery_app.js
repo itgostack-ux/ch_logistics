@@ -141,6 +141,13 @@ class DeliveryApp {
         this.$body.on("click", "#da-trip-complete-btn", () => this.do_trip_complete());
         this.$body.on("click", "#da-trip-exception-btn", () => this.do_trip_exception());
         this.$body.on("click", "#da-manifest-close-btn", () => this.do_manifest_close(this.active_manifest));
+        this.$body.on("click", ".da-stop-manifest-reject-btn", (e) => {
+            e.stopPropagation();
+            // Trip-level manifest rejection: bounce ONE shipment off the trip
+            // without rejecting the whole trip (that stays #da-trip-reject-btn).
+            this.active_manifest = $(e.currentTarget).data("name");
+            this.do_reject({ from_trip: true });
+        });
         this.$body.on("click", ".da-stop-manifest-close-btn", (e) => {
             e.stopPropagation();
             let name = $(e.currentTarget).data("name");
@@ -730,12 +737,17 @@ class DeliveryApp {
         d.show();
     }
 
-    do_reject() {
+    do_reject(opts = {}) {
         // Status-aware rejection: carrier-grade ERPs (Delhivery / BlueDart /
         // Ekart / FedEx / Oracle TMS) use different reason codes for pickup
         // failure versus mid-trip delivery failure. We mirror that split
         // so dispatch can route the recovery action correctly.
+        // opts.from_trip: invoked from a trip-detail manifest chip — the
+        // manifest is resolved from the trip payload and the trip view is
+        // refreshed afterwards instead of the manifest view.
         let manifest = (this.manifests || []).find(m => m.name === this.active_manifest)
+                       || ((this._trip_detail && this._trip_detail.manifests) || [])
+                              .find(m => m.name === this.active_manifest)
                        || { status: "Assigned" };
         let in_transit = manifest.status === "In Transit";
         let reasons = in_transit ? [
@@ -793,7 +805,11 @@ class DeliveryApp {
                                 : __("Manifest rejected. Dispatcher notified."),
                             indicator: "orange",
                         });
-                        this.show_manifest_detail(this.active_manifest);
+                        if (opts.from_trip && this.active_trip) {
+                            this.show_trip_detail(this.active_trip);
+                        } else {
+                            this.show_manifest_detail(this.active_manifest);
+                        }
                         this.load_data();
                     },
                 });
@@ -1139,6 +1155,9 @@ class DeliveryApp {
                     <span class="da-card-status da-status-${(m.status || "").toLowerCase().replace(/\s+/g, "-")}">${frappe.utils.escape_html(m.status)}</span>
                     ${["Delivered", "Received", "Partially Received"].includes(m.status)
                         ? `<button class="btn btn-xs btn-success da-stop-manifest-close-btn" data-name="${frappe.utils.escape_html(m.name)}"><i class="fa fa-archive"></i> ${__("Close")}</button>`
+                        : ""}
+                    ${["Assigned", "Pickup Started", "In Transit"].includes(m.status)
+                        ? `<button class="btn btn-xs btn-danger da-stop-manifest-reject-btn" data-name="${frappe.utils.escape_html(m.name)}"><i class="fa fa-ban"></i> ${__("Reject")}</button>`
                         : ""}
                 </div>${_proof_line(m)}`).join("");
 

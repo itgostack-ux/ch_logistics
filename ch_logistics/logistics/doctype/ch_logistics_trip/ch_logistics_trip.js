@@ -4,6 +4,19 @@
 
 frappe.ui.form.on("CH Logistics Trip", {
 	refresh(frm) {
+		// Resolve role capabilities server-side (CH Logistics Settings → Role
+		// Matrix) once, then paint the buttons. Cosmetic only — trip_close
+		// re-checks head_override on the server.
+		if (frm._ch_caps === undefined) {
+			frm._ch_caps = null;
+			frappe.xcall("ch_logistics.roles.get_my_capabilities")
+				.then((caps) => {
+					frm._ch_caps = caps || {};
+					frm.clear_custom_buttons();
+					frm.trigger("setup_status_buttons");
+				})
+				.catch(() => { frm._ch_caps = {}; });
+		}
 		frm.trigger("setup_status_buttons");
 		frm.trigger("set_status_indicator");
 	},
@@ -12,7 +25,7 @@ frappe.ui.form.on("CH Logistics Trip", {
 		if (frm.is_new()) return;
 
 		const status = frm.doc.status;
-		const is_logistics_head = frappe.user.has_role("Logistics Head") || frappe.user.has_role("Logistic Head");
+		const is_logistics_head = !!(frm._ch_caps || {}).head_override;
 
 		// Route optimization — only before the driver starts executing.
 		if ((status === "Draft" || status === "Assigned") && (frm.doc.stops || []).length > 1) {

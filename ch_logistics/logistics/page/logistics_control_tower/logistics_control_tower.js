@@ -51,6 +51,13 @@ class LogisticsCommandCenter {
 		this._map = null;
 		this.map_open = false;
 
+		// Server-resolved role capabilities (CH Logistics Settings → Role
+		// Matrix). Cosmetic UI gating only — every endpoint re-checks.
+		this._capabilities = {};
+		frappe.xcall("ch_logistics.roles.get_my_capabilities")
+			.then((caps) => { this._capabilities = caps || {}; })
+			.catch(() => {});
+
 		this._boot();
 	}
 
@@ -1202,7 +1209,7 @@ class LogisticsCommandCenter {
 		if (!list.length) {
 			const empty_msg = want
 				? __("No {0} manifests right now.", [want])
-				: __("No manifests waiting to be attached. (Only Draft / Packed manifests appear here — anything already in motion is hidden.)");
+				: __("No manifests waiting to be attached. (Only submitted Packed manifests appear here — Drafts must be submitted first; anything already in motion is hidden.)");
 			$b.html(`<div class="lcc-empty"><i class="fa fa-check-circle"></i> ${empty_msg}</div>`);
 			return;
 		}
@@ -1246,7 +1253,7 @@ class LogisticsCommandCenter {
 					<i class="fa fa-qrcode"></i> ${__("Bundle & Print Pickup QR")}
 				</button>
 				<span class="lcc-ops-bar-spacer"></span>
-				<span class="lcc-muted lcc-ops-bar-hint">${__("Only open manifests (Draft / Packed) are listed. Use the icons on the right to print labels, transfer receipts and e-Way Bills before dispatch.")}</span>
+				<span class="lcc-muted lcc-ops-bar-hint">${__("Only submitted (Packed) manifests are listed — submit Draft manifests to see them here. Use the icons on the right to print labels, transfer receipts and e-Way Bills before dispatch.")}</span>
 			</div>
 			<div class="lcc-table-wrap"><table class="lcc-table">
 				<thead><tr>
@@ -1568,11 +1575,9 @@ class LogisticsCommandCenter {
 		const can_unassign = t.status === "Assigned";
 		const can_detach = ["Draft", "Assigned", "Started"].includes(t.status);
 		const can_resequence = ["Assigned", "Started"].includes(t.status);
-		const can_complete_override = can_complete && (
-			frappe.user.has_role("System Manager") ||
-			frappe.user.has_role("Logistics Head") ||
-			frappe.user.has_role("Logistic Head")
-		);
+		// Server-resolved capability (CH Logistics Settings → Role Matrix);
+		// cosmetic only — trip_close re-checks head_override server-side.
+		const can_complete_override = can_complete && !!(this._capabilities || {}).head_override;
 
 		const mf_by_stop = {};
 		(t.manifests || []).forEach((m) => {

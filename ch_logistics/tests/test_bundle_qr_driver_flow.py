@@ -64,8 +64,10 @@ def _ensure_warehouse(name, abbr):
 
 
 def _ensure_store(name, warehouse):
-    if frappe.db.exists("CH Store", name):
-        return name
+    # CH Store autonames by store code — look up by store_name.
+    existing = frappe.db.get_value("CH Store", {"store_name": name, "company": _company()})
+    if existing:
+        return existing
     s = frappe.new_doc("CH Store")
     s.store_name = name
     s.company = _company()
@@ -82,10 +84,12 @@ def _ensure_stub_stock_entry(source_wh):
     in the database and reuse it across every manifest. This mirrors
     what the dispatcher tests in _e2e_pos_multi_pickup.py do.
     """
-    se = frappe.db.get_value("Stock Entry", {"docstatus": 1}, "name")
+    se = frappe.db.get_value(
+        "Stock Entry", {"docstatus": 1, "stock_entry_type": "Material Transfer"}, "name")
     if not se:
         # No SE on this site yet — fall back to any non-cancelled one.
-        se = frappe.db.get_value("Stock Entry", {"docstatus": ["<", 2]}, "name")
+        se = frappe.db.get_value(
+            "Stock Entry", {"docstatus": ["<", 2], "stock_entry_type": "Material Transfer"}, "name")
     if not se:
         raise RuntimeError(
             "No Stock Entry exists on this site; this E2E expects at least one "
@@ -131,7 +135,7 @@ def _teardown():
         except Exception:
             pass
     for s in frappe.get_all("CH Store",
-                            filters={"name": ["like", f"{_TAG}-%"]},
+                            filters={"store_name": ["like", f"{_TAG}-%"]},
                             pluck="name"):
         try:
             frappe.delete_doc("CH Store", s, force=1,

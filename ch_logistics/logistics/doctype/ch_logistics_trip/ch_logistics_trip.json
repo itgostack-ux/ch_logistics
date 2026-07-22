@@ -119,13 +119,13 @@
    "fieldname": "planned_start",
    "fieldtype": "Datetime",
    "label": "Planned Start",
-   "reqd": 1
+   "mandatory_depends_on": "eval:doc.status==\"Started\""
   },
   {
    "fieldname": "planned_end",
    "fieldtype": "Datetime",
    "label": "Planned End",
-   "reqd": 1
+   "mandatory_depends_on": "eval:doc.status==\"Started\""
   },
   {
    "fieldname": "sec_assignment",
@@ -139,8 +139,8 @@
    "in_standard_filter": 1,
    "label": "Driver",
    "options": "Driver",
-   "reqd": 1,
-   "search_index": 1
+   "search_index": 1,
+   "mandatory_depends_on": "eval:doc.status==\"Started\""
   },
   {
    "fieldname": "driver_name",
@@ -165,7 +165,7 @@
    "fieldtype": "Link",
    "label": "Vehicle",
    "options": "Vehicle",
-   "reqd": 1
+   "mandatory_depends_on": "eval:doc.status==\"Started\""
   },
   {
    "fieldname": "vehicle_number",
@@ -250,7 +250,7 @@
   }
  ],
  "links": [],
- "modified": "2026-05-26 00:00:00.000000",
+ "modified": "2026-07-22 12:00:00.000000",
  "modified_by": "Administrator",
  "module": "Logistics",
  "name": "CH Logistics Trip",

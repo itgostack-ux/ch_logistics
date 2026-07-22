@@ -18,6 +18,11 @@ def _enabled():
     return v is None or cint(v) == 1
 
 
+def _digest_roles():
+    from ch_logistics.roles import get_roles_for
+    return get_roles_for("digest_recipients")
+
+
 def _recipients(company=None):
     """Logistics managers — scoped to `company` when given (fail-closed via
     ch_erp15's notification router); explicit settings recipients always kept."""
@@ -26,13 +31,13 @@ def _recipients(company=None):
         try:
             from ch_erp15.ch_erp15.notification_router import scoped_role_emails
 
-            valid.update(scoped_role_emails(["Delivery Manager", "Stock Manager"], company=company))
+            valid.update(scoped_role_emails(sorted(_digest_roles()), company=company))
         except ImportError:
             company = None  # router unavailable — fall back to role-wide below
     if not company:
         role_users = frappe.get_all(
             "Has Role",
-            filters={"role": ["in", ["Delivery Manager", "Stock Manager"]], "parenttype": "User"},
+            filters={"role": ["in", sorted(_digest_roles())], "parenttype": "User"},
             pluck="parent",
         )
         for u in set(role_users):
@@ -172,7 +177,8 @@ def send_logistics_daily_digest():
 @frappe.whitelist()
 def preview_digest(company=None):
     """Render the digest HTML without sending — for a quick admin preview."""
-    frappe.only_for(["System Manager", "Delivery Manager"])
+    from ch_logistics import roles as role_registry
+    role_registry.require("digest_preview", "preview the logistics digest")
     company = company or frappe.defaults.get_user_default("Company")
     return {"recipients": _recipients(), "enabled": _enabled(),
             "company": company, "html": _html(_metrics(company), company=company)}

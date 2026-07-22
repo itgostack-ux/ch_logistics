@@ -48,10 +48,12 @@ class CHManifestRejection(Document):
 		except Exception:
 			notify_driver = None
 
-		# Build dispatcher list — any user with Logistics Manager role
+		# Build dispatcher list — central registry (rejection_dispatcher_notify)
+		from ch_logistics.roles import get_roles_for
+
 		dispatchers = frappe.get_all(
 			"Has Role",
-			filters={"role": "Logistics Manager", "parenttype": "User"},
+			filters={"role": ["in", sorted(get_roles_for("rejection_dispatcher_notify"))], "parenttype": "User"},
 			pluck="parent",
 		)
 		for user in dispatchers:

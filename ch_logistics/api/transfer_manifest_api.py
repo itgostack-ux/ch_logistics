@@ -15,49 +15,16 @@ from frappe.utils import now_datetime, cint, flt
 
 
 # ── Role gating (Phase B — Outward / Inward governance) ─────────────────────
-# Maps each transition to the roles allowed to perform it. System Manager
-# always bypasses. Keep in sync with the role list in ch_transfer_manifest.json.
-_STAGE_ROLES = {
-    # Outward stages — source-store dispatch lane
-    "assign_driver":     {"Delivery Manager", "Stock Manager", "Store Manager"},
-    "start_pickup":      {"Delivery Manager", "Delivery User", "Stock Manager"},
-    "mark_reached_destination": {"Delivery Manager", "Delivery User", "Stock Manager"},
-    "reject_manifest":   {"Delivery Manager", "Delivery User", "Stock Manager"},
-    "complete_delivery": {"Delivery User", "Delivery Manager"},
-    "driver_close_manifest": {"Delivery User", "Delivery Manager"},
-    # Inward stages — destination-store receipt lane
-    "accept_delivery":   {"Store Manager", "Stock Manager"},
-    "close_manifest":    {"Store Manager", "Stock Manager"},
-    # Reversal — manager-only
-    "initiate_recall":   {"Stock Manager", "Delivery Manager", "Store Manager"},
-    "confirm_return":    {"Stock Manager", "Delivery Manager"},
-}
+# Stage → allowed-roles mapping lives in the central registry
+# (ch_logistics.roles), overridable per-site via CH Logistics Settings →
+# Role Matrix. System Manager / Administrator always bypass.
+from ch_logistics import roles as role_registry
+from ch_logistics import scope_guard
 
 
 def _require_stage_role(stage: str) -> None:
-    """Raise PermissionError if current user lacks any role required for `stage`.
-
-    System Manager and Administrator always bypass.
-    """
-    user = frappe.session.user
-    if user == "Administrator":
-        return
-    user_roles = set(frappe.get_roles(user))
-    if "System Manager" in user_roles:
-        return
-    needed = _STAGE_ROLES.get(stage, set())
-    if not needed:
-        return
-    if user_roles & needed:
-        return
-    frappe.throw(
-        _("You do not have the required role to <b>{0}</b>. Required: {1}").format(
-            stage.replace("_", " ").title(),
-            ", ".join(sorted(needed)),
-        ),
-        frappe.PermissionError,
-        title=_("Transfer Manifest — Role Required"),
-    )
+    """Raise PermissionError if current user lacks any role required for `stage`."""
+    role_registry.require(stage)
 
 
 # ── Manifest CRUD ────────────────────────────────────────────────────────────
@@ -77,6 +44,8 @@ def create_manifest(stock_entries, source_warehouse=None, destination_warehouse=
         se = frappe.get_doc("Stock Entry", stock_entries[0])
         source_warehouse = source_warehouse or se.from_warehouse
         destination_warehouse = destination_warehouse or se.to_warehouse
+
+    scope_guard.assert_scope(store=source_store, warehouse=source_warehouse)
 
     doc = frappe.new_doc("CH Transfer Manifest")
     doc.source_warehouse = source_warehouse
@@ -168,6 +137,7 @@ def assign_driver(manifest, driver, courier_partner=None, vehicle_number=None,
                   tracking_number=None, estimated_delivery_date=None,
                   vehicle=None, external_booking_id=None) -> dict:
     _require_stage_role("assign_driver")
+    scope_guard.assert_manifest_scope(manifest)
     doc = frappe.get_doc("CH Transfer Manifest", manifest)
     doc.check_permission("write")
     doc.assign_driver(
@@ -991,9 +961,7 @@ def get_driver_assignments() -> list:
     Each row carries a ``bucket`` field so the driver app can group them
     under \"To Pick Up\", \"In Transit\", and \"Awaiting Receipt\".
     """
-    user = frappe.session.user
-    user_roles = frappe.get_roles(user)
-    is_ops = bool({"System Manager", "Delivery Manager", "Delivery User"} & set(user_roles))
+    is_ops = role_registry.user_has("ops_view")
 
     # Resolve current user → Driver via the shared chain (User.user, then
     # Employee.user_id → Driver.employee, then Administrator auto-provision).
@@ -1051,9 +1019,7 @@ def get_driver_assignments() -> list:
 @frappe.whitelist()
 def get_delivery_history() -> list:
     """Return recently delivered/received manifests for current driver."""
-    user = frappe.session.user
-    user_roles = frappe.get_roles(user)
-    is_ops = bool({"System Manager", "Delivery Manager", "Delivery User"} & set(user_roles))
+    is_ops = role_registry.user_has("ops_view")
 
     from ch_logistics.api.driver_resolver import resolve_current_driver
     driver = resolve_current_driver(throw=False)

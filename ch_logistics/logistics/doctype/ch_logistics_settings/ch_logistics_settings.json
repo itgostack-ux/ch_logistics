@@ -27,7 +27,10 @@
   "digest_section",
   "daily_digest_enabled",
   "column_break_digest",
-  "digest_recipients"
+  "digest_recipients",
+  "access_control_section",
+  "enforce_store_scope",
+  "role_matrix"
  ],
  "fields": [
   {
@@ -174,12 +177,31 @@
    "fieldname": "digest_recipients",
    "fieldtype": "Small Text",
    "label": "Extra Digest Recipients"
+  },
+  {
+   "fieldname": "access_control_section",
+   "fieldtype": "Section Break",
+   "label": "Access Control"
+  },
+  {
+   "default": "0",
+   "description": "When enabled, dispatcher actions (trip create, manifest attach/detach, driver assignment, clubbing) are fail-closed checked against CH User Scope via the central ch_erp15 scope guard — same behaviour as POS and GoFix. Load a CH User Scope row for every dispatcher BEFORE enabling, or they will be blocked (System Manager bypasses; drivers are unaffected).",
+   "fieldname": "enforce_store_scope",
+   "fieldtype": "Check",
+   "label": "Enforce Store Scope on Dispatcher Actions"
+  },
+  {
+   "description": "Role → function mapping for every logistics gate (manifest stage transitions, ops console, overrides, digests). Rows here OVERRIDE the shipped defaults for that function; leave a function unlisted to keep its default. Defaults are seeded on migrate and can be edited or deleted freely.",
+   "fieldname": "role_matrix",
+   "fieldtype": "Table",
+   "label": "Role Matrix",
+   "options": "CH Logistics Role Rule"
   }
  ],
  "index_web_pages_for_search": 0,
  "issingle": 1,
  "links": [],
- "modified": "2026-06-22 00:00:00.000000",
+ "modified": "2026-07-22 00:00:00.000000",
  "module": "Logistics",
  "name": "CH Logistics Settings",
  "owner": "Administrator",

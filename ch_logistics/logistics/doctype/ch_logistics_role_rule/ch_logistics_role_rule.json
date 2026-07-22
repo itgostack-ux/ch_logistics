@@ -1,0 +1,43 @@
+{
+ "actions": [],
+ "creation": "2026-07-22 00:00:00.000000",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "function_key",
+  "role"
+ ],
+ "fields": [
+  {
+   "columns": 5,
+   "description": "The logistics capability this row grants. Stage keys gate manifest lifecycle transitions; the others gate ops-console / override / report behaviour.",
+   "fieldname": "function_key",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "label": "Function",
+   "options": "assign_driver\nstart_pickup\nmark_reached_destination\nreject_manifest\ncomplete_delivery\ndriver_close_manifest\naccept_delivery\nclose_manifest\ninitiate_recall\nconfirm_return\nops_control\nops_view\nhead_override\nresequence_override\napp_access\nreport_ops\ndigest_recipients\ndigest_preview\nrejection_dispatcher_notify",
+   "reqd": 1
+  },
+  {
+   "columns": 5,
+   "fieldname": "role",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "Role",
+   "options": "Role",
+   "reqd": 1
+  }
+ ],
+ "index_web_pages_for_search": 0,
+ "istable": 1,
+ "links": [],
+ "modified": "2026-07-22 00:00:00.000000",
+ "module": "Logistics",
+ "name": "CH Logistics Role Rule",
+ "owner": "Administrator",
+ "permissions": [],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": []
+}
