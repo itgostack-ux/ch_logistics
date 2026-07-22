@@ -308,7 +308,7 @@ def resequence_trip(trip: str) -> dict:
         frappe.throw(_("Can resequence only Draft/Assigned/Started trips."))
 
     from ch_logistics import roles as role_registry
-    role_registry.require("resequence_override", _("resequence a Started trip"))
+    role_registry.require("resequence_override", frappe._("resequence a Started trip"))
 
     reached = [
         s for s in (doc.stops or [])

@@ -1846,6 +1846,14 @@ class CHTransferManifest(Document):
 
             self.status = "Returned"
             self.flags.ignore_validate_update_after_submit = True
+            # _reverse_stock_entries may have CANCELLED the linked SEs (the
+            # clean-cancel path) — link validation would now refuse to save a
+            # manifest referencing a cancelled document. That link is the
+            # intended audit trail of the recall, so skip link validation for
+            # this save only. Without this, confirm_return crashed whenever
+            # the SE cancel succeeded (it only worked via the reverse-SE
+            # fallback path).
+            self.flags.ignore_links = True
             self.save()
 
             self.add_comment(

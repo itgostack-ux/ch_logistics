@@ -45,12 +45,11 @@ import frappe
 from frappe import _
 
 # Roles that bypass every logistics gate (matches ch_erp15.scope._BYPASS_ROLES).
-BYPASS_ROLES = {"System Manager", "Administrator"}
-
 # Shipped defaults — exactly the pre-centralisation behaviour of each call
 # site. "Logistic Head" (legacy misspelling) is retained as an accepted
 # alias so any site that hand-created the misspelt role keeps working.
 DEFAULT_ROLE_MATRIX: dict[str, set[str]] = {
+    "bypass": {"System Manager"},
     # Outward stages — source-store dispatch lane
     "assign_driver": {"Delivery Manager", "Stock Manager", "Store Manager"},
     "start_pickup": {"Delivery Manager", "Delivery User", "Stock Manager"},
@@ -111,10 +110,8 @@ def get_roles_for(function_key: str) -> set[str]:
 def user_has(function_key: str, user: str | None = None) -> bool:
     """True when `user` may exercise `function_key` (bypass roles included)."""
     user = user or frappe.session.user
-    if user == "Administrator":
-        return True
     user_roles = set(frappe.get_roles(user))
-    if user_roles & BYPASS_ROLES:
+    if user_roles & get_roles_for("bypass"):
         return True
     needed = get_roles_for(function_key)
     if not needed:

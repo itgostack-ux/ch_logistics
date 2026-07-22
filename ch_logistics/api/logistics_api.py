@@ -787,7 +787,8 @@ def detach_manifest(manifest):
         frappe.throw(_("Cannot detach manifest from a {0} trip").format(trip_doc.status))
     frappe.db.set_value("CH Transfer Manifest", manifest, "trip", None)
     if _has_manifest_stop_seq_field():
-        frappe.db.set_value("CH Transfer Manifest", manifest, "stop_sequence", None)
+        # Int column is NOT NULL — writing None raises IntegrityError.
+        frappe.db.set_value("CH Transfer Manifest", manifest, "stop_sequence", 0)
     _trip_audit(trip_doc, _("Manifest {0} detached by {1}.").format(manifest, frappe.session.user))
     trip_doc.reload()
     trip_doc.flags.ignore_mandatory = True
