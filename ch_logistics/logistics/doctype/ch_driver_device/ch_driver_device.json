@@ -140,8 +140,16 @@
    "write": 1
   },
   {
+   "create": 1,
    "read": 1,
-   "role": "Delivery User"
+   "role": "Delivery User",
+   "write": 1
+  },
+  {
+   "create": 1,
+   "read": 1,
+   "role": "Logistics User",
+   "write": 1
   }
  ],
  "sort_field": "modified",

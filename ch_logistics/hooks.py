@@ -54,6 +54,22 @@ doc_events = {
 	},
 }
 
+permission_query_conditions = {
+	"CH Logistics Trip": "ch_logistics.api.permissions.trip_query_condition",
+	"CH Driver Device": "ch_logistics.api.permissions.driver_device_query_condition",
+	"CH Driver Break Log": "ch_logistics.api.permissions.driver_break_query_condition",
+	"CH Driver Location": "ch_logistics.api.permissions.driver_location_query_condition",
+	"CH Manifest Rejection": "ch_logistics.api.permissions.manifest_rejection_query_condition",
+}
+
+has_permission = {
+	"CH Logistics Trip": "ch_logistics.api.permissions.has_trip_permission",
+	"CH Driver Device": "ch_logistics.api.permissions.has_driver_device_permission",
+	"CH Driver Break Log": "ch_logistics.api.permissions.has_driver_break_permission",
+	"CH Driver Location": "ch_logistics.api.permissions.has_driver_location_permission",
+	"CH Manifest Rejection": "ch_logistics.api.permissions.has_manifest_rejection_permission",
+}
+
 # --------------------------------------------------------------------------
 # Scheduler
 # --------------------------------------------------------------------------

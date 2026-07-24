@@ -65,7 +65,7 @@
    "fieldtype": "Select",
    "in_list_view": 1,
    "label": "Reason",
-   "options": "Material Not Ready\nWrong Package\nStore Closed\nDamaged Package\nReceiver Unavailable\nAddress Not Found\nOther",
+   "options": "Material Not Ready\nWrong Package\nStore Closed\nDamaged Package\nCustomer Not Available\nAddress Not Found\nReceiver Refused\nDamaged in Transit\nVehicle Breakdown\nOther",
    "reqd": 1
   },
   {
@@ -208,6 +208,28 @@
    "read": 1,
    "role": "Logistics User",
    "submit": 1
+  },
+  {
+   "create": 1,
+   "read": 1,
+   "role": "Delivery User",
+   "submit": 1
+  },
+  {
+   "create": 1,
+   "read": 1,
+   "report": 1,
+   "role": "Delivery Manager",
+   "submit": 1,
+   "write": 1
+  },
+  {
+   "create": 1,
+   "read": 1,
+   "report": 1,
+   "role": "Stock Manager",
+   "submit": 1,
+   "write": 1
   }
  ],
  "sort_field": "modified",

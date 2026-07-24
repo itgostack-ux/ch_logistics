@@ -16,7 +16,7 @@
    "fieldtype": "Select",
    "in_list_view": 1,
    "label": "Function",
-   "options": "bypass\nassign_driver\nstart_pickup\nmark_reached_destination\nreject_manifest\ncomplete_delivery\ndriver_close_manifest\naccept_delivery\nclose_manifest\ninitiate_recall\nconfirm_return\nops_control\nops_view\nhead_override\nresequence_override\napp_access\nreport_ops\ndigest_recipients\ndigest_preview\nrejection_dispatcher_notify",
+   "options": "create_manifest\nassign_driver\nstart_pickup\nmark_reached_destination\nreject_manifest\ncomplete_delivery\ndriver_close_manifest\naccept_delivery\nclose_manifest\ninitiate_recall\nconfirm_return\nops_control\nops_view\ndriver_override\ntracking_view\ncourier_poll\newaybill_sync\nhead_override\nresequence_override\napp_access\nreport_ops\ndigest_recipients\ndigest_preview\nrejection_dispatcher_notify",
    "reqd": 1
   },
   {

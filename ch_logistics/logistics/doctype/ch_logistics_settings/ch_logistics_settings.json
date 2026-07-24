@@ -18,6 +18,36 @@
   "enforce_delivery_otp",
   "enforce_geofence",
   "geofence_radius_m",
+  "performance_section",
+  "eta_average_speed_kmh",
+  "optimizer_max_stops",
+  "optimizer_max_passes",
+  "max_manifests_per_trip",
+  "courier_poll_batch_size",
+  "courier_api_allowed_hosts",
+  "courier_api_timeout_seconds",
+  "courier_api_max_response_bytes",
+  "courier_api_url_max_length",
+  "geocode_api_timeout_seconds",
+  "geocode_api_max_response_bytes",
+  "courier_webhook_replay_window_seconds",
+  "courier_webhook_max_payload_bytes",
+  "courier_webhook_requests_per_minute",
+  "geo_sync_store_batch_size",
+  "geo_sync_warehouse_batch_size",
+  "eta_sla_trip_batch_size",
+  "eta_default_dwell_minutes",
+  "driver_history_max_days",
+  "driver_maintenance_batch_size",
+  "location_purge_batch_size",
+  "ops_max_window_days",
+  "ops_driver_row_limit",
+  "ops_record_row_limit",
+  "driver_device_row_limit",
+  "driver_location_requests_per_minute",
+  "delivery_otp_attempts_per_minute",
+  "public_tracking_requests_per_window",
+  "public_tracking_window_seconds",
   "push_section",
   "push_provider",
   "fcm_service_account_file",
@@ -28,6 +58,10 @@
   "daily_digest_enabled",
   "column_break_digest",
   "digest_recipients",
+  "digest_company_batch_size",
+  "notification_recipient_limit",
+  "business_notifications_include_privileged",
+  "business_notification_excluded_roles",
   "access_control_section",
   "enforce_store_scope",
   "role_matrix"
@@ -123,6 +157,239 @@
    "depends_on": "enforce_geofence"
   },
   {
+   "fieldname": "performance_section",
+   "fieldtype": "Section Break",
+   "label": "Planning and Performance"
+  },
+  {
+   "default": "24",
+   "description": "Average road speed used for predictive stop ETA calculations.",
+   "fieldname": "eta_average_speed_kmh",
+   "fieldtype": "Int",
+   "label": "ETA Average Speed (km/h)",
+   "non_negative": 1
+  },
+  {
+   "default": "250",
+   "description": "Maximum stops accepted by one route optimization request.",
+   "fieldname": "optimizer_max_stops",
+   "fieldtype": "Int",
+   "label": "Optimizer Maximum Stops",
+   "non_negative": 1
+  },
+  {
+   "default": "10",
+   "description": "Maximum 2-opt improvement passes per route optimization.",
+   "fieldname": "optimizer_max_passes",
+   "fieldtype": "Int",
+   "label": "Optimizer Maximum Passes",
+   "non_negative": 1
+  },
+  {
+   "default": "60",
+   "description": "Maximum requests accepted for one public tracking bearer token in each configured window.",
+   "fieldname": "public_tracking_requests_per_window",
+   "fieldtype": "Int",
+   "label": "Public Tracking Requests Per Window",
+   "non_negative": 1
+  },
+  {
+   "default": "300",
+   "description": "Fixed-window duration for per-token public tracking throttling (10–3600 seconds).",
+   "fieldname": "public_tracking_window_seconds",
+   "fieldtype": "Int",
+   "label": "Public Tracking Window (seconds)",
+   "non_negative": 1
+  },
+  {
+   "default": "500",
+   "description": "Maximum manifests accepted by one trip creation, attachment, or clubbing request.",
+   "fieldname": "max_manifests_per_trip",
+   "fieldtype": "Int",
+   "label": "Maximum Manifests Per Trip",
+   "non_negative": 1
+  },
+  {
+   "default": "200",
+   "description": "Maximum courier-backed manifests processed by one polling request.",
+   "fieldname": "courier_poll_batch_size",
+   "fieldtype": "Int",
+   "label": "Courier Poll Batch Size",
+   "non_negative": 1
+  },
+  {
+   "description": "Exact HTTPS hostnames permitted for outbound courier tracking calls, one per line. Empty disables polling.",
+   "fieldname": "courier_api_allowed_hosts",
+   "fieldtype": "Small Text",
+   "label": "Courier API Allowed Hosts"
+  },
+  {
+   "default": "8",
+   "description": "Connect/read timeout for courier API calls (bounded to 15 seconds).",
+   "fieldname": "courier_api_timeout_seconds",
+   "fieldtype": "Int",
+   "label": "Courier API Timeout (seconds)",
+   "non_negative": 1
+  },
+  {
+   "default": "262144",
+   "description": "Maximum courier response body accepted (bounded to 1 MiB).",
+   "fieldname": "courier_api_max_response_bytes",
+   "fieldtype": "Int",
+   "label": "Courier API Maximum Response (bytes)",
+   "non_negative": 1
+  },
+  {
+   "default": "2048",
+   "description": "Maximum configured courier request URL length (bounded to 8192 characters).",
+   "fieldname": "courier_api_url_max_length",
+   "fieldtype": "Int",
+   "label": "Courier API Maximum URL Length",
+   "non_negative": 1
+  },
+  {
+   "default": "10",
+   "description": "Connect/read timeout for the fixed Google geocoding endpoint (bounded to 15 seconds).",
+   "fieldname": "geocode_api_timeout_seconds",
+   "fieldtype": "Int",
+   "label": "Geocoding API Timeout (seconds)",
+   "non_negative": 1
+  },
+  {
+   "default": "262144",
+   "description": "Maximum Google geocoding response body (bounded to 1 MiB).",
+   "fieldname": "geocode_api_max_response_bytes",
+   "fieldtype": "Int",
+   "label": "Geocoding API Maximum Response (bytes)",
+   "non_negative": 1
+  },
+  {
+   "default": "500",
+   "description": "Maximum operational records returned or processed by one logistics API call.",
+   "fieldname": "ops_record_row_limit",
+   "fieldtype": "Int",
+   "label": "Operations Record Row Limit",
+   "non_negative": 1
+  },
+  {
+   "default": "20",
+   "description": "Maximum registered device rows retained or returned for one driver.",
+   "fieldname": "driver_device_row_limit",
+   "fieldtype": "Int",
+   "label": "Driver Device Row Limit",
+   "non_negative": 1
+  },
+  {
+   "default": "120",
+   "description": "Maximum authenticated GPS pings accepted per caller each minute.",
+   "fieldname": "driver_location_requests_per_minute",
+   "fieldtype": "Int",
+   "label": "Driver Location Requests Per Minute",
+   "non_negative": 1
+  },
+  {
+   "default": "10",
+   "description": "Maximum delivery OTP verification attempts accepted per authenticated caller each minute.",
+   "fieldname": "delivery_otp_attempts_per_minute",
+   "fieldtype": "Int",
+   "label": "Delivery OTP Attempts Per Minute",
+   "non_negative": 1
+  },
+  {
+   "default": "300",
+   "description": "Maximum accepted clock skew and replay lifetime for signed courier webhook events.",
+   "fieldname": "courier_webhook_replay_window_seconds",
+   "fieldtype": "Int",
+   "label": "Courier Webhook Replay Window (seconds)",
+   "non_negative": 1
+  },
+  {
+   "default": "500",
+   "description": "Maximum scoped stores processed by one coordinate synchronization request.",
+   "fieldname": "geo_sync_store_batch_size",
+   "fieldtype": "Int",
+   "label": "Geo Sync Store Batch Size",
+   "non_negative": 1
+  },
+  {
+   "default": "5000",
+   "description": "Maximum warehouses resolved by one coordinate synchronization request.",
+   "fieldname": "geo_sync_warehouse_batch_size",
+   "fieldtype": "Int",
+   "label": "Geo Sync Warehouse Batch Size",
+   "non_negative": 1
+  },
+  {
+   "default": "500",
+   "description": "Maximum active trips processed by one scheduled ETA SLA pass.",
+   "fieldname": "eta_sla_trip_batch_size",
+   "fieldtype": "Int",
+   "label": "ETA SLA Trip Batch Size",
+   "non_negative": 1
+  },
+  {
+   "default": "5",
+   "description": "Fallback dwell time used for route stops without an explicit estimate.",
+   "fieldname": "eta_default_dwell_minutes",
+   "fieldtype": "Int",
+   "label": "ETA Default Dwell (minutes)",
+   "non_negative": 1
+  },
+  {
+   "default": "90",
+   "description": "Maximum trip-history lookback accepted by driver and dispatcher APIs.",
+   "fieldname": "driver_history_max_days",
+   "fieldtype": "Int",
+   "label": "Driver History Maximum Days",
+   "non_negative": 1
+  },
+  {
+   "default": "500",
+   "fieldname": "driver_maintenance_batch_size",
+   "fieldtype": "Int",
+   "label": "Driver Maintenance Batch Size",
+   "non_negative": 1
+  },
+  {
+   "default": "5000",
+   "fieldname": "location_purge_batch_size",
+   "fieldtype": "Int",
+   "label": "Location Purge Batch Size",
+   "non_negative": 1
+  },
+  {
+   "default": "31",
+   "description": "Maximum date window accepted by logistics board, lifecycle, and map endpoints.",
+   "fieldname": "ops_max_window_days",
+   "fieldtype": "Int",
+   "label": "Operations Maximum Window (days)",
+   "non_negative": 1
+  },
+  {
+   "default": "200",
+   "description": "Maximum drivers returned by one scoped dispatcher availability request.",
+   "fieldname": "ops_driver_row_limit",
+   "fieldtype": "Int",
+   "label": "Operations Driver Row Limit",
+   "non_negative": 1
+  },
+  {
+   "default": "262144",
+   "description": "Maximum UTF-8 payload size accepted by the courier webhook.",
+   "fieldname": "courier_webhook_max_payload_bytes",
+   "fieldtype": "Int",
+   "label": "Courier Webhook Maximum Payload (bytes)",
+   "non_negative": 1
+  },
+  {
+   "default": "300",
+   "description": "Maximum courier webhook requests accepted per source IP each minute.",
+   "fieldname": "courier_webhook_requests_per_minute",
+   "fieldtype": "Int",
+   "label": "Courier Webhook Requests Per Minute",
+   "non_negative": 1
+  },
+  {
    "fieldname": "push_section",
    "fieldtype": "Section Break",
    "label": "Push Notifications"
@@ -173,10 +440,35 @@
    "fieldtype": "Column Break"
   },
   {
-   "description": "Comma-separated emails, in addition to Delivery Manager / Stock Manager role holders.",
+   "description": "One Company|email mapping per line. Unscoped addresses are used only for all-company previews.",
    "fieldname": "digest_recipients",
    "fieldtype": "Small Text",
    "label": "Extra Digest Recipients"
+  },
+  {
+   "default": "100",
+   "fieldname": "digest_company_batch_size",
+   "fieldtype": "Int",
+   "label": "Digest Company Batch Size",
+   "non_negative": 1
+  },
+  {
+   "default": "200",
+   "fieldname": "notification_recipient_limit",
+   "fieldtype": "Int",
+   "label": "Notification Recipient Limit",
+   "non_negative": 1
+  },
+  {
+   "default": "0",
+   "fieldname": "business_notifications_include_privileged",
+   "fieldtype": "Check",
+   "label": "Include Privileged Users in Business Notifications"
+  },
+  {
+   "fieldname": "business_notification_excluded_roles",
+   "fieldtype": "Small Text",
+   "label": "Business Notification Excluded Roles"
   },
   {
    "fieldname": "access_control_section",
@@ -184,11 +476,12 @@
    "label": "Access Control"
   },
   {
-   "default": "0",
-   "description": "When enabled, dispatcher actions (trip create, manifest attach/detach, driver assignment, clubbing) are fail-closed checked against CH User Scope via the central ch_erp15 scope guard — same behaviour as POS and GoFix. Load a CH User Scope row for every dispatcher BEFORE enabling, or they will be blocked (System Manager bypasses; drivers are unaffected).",
+   "default": "1",
+   "description": "Dispatcher actions are always checked against CH User Scope. Administrator and System Manager bypass; assigned drivers are authorized by Driver ownership.",
    "fieldname": "enforce_store_scope",
    "fieldtype": "Check",
-   "label": "Enforce Store Scope on Dispatcher Actions"
+   "label": "Enforce Store Scope on Dispatcher Actions",
+   "read_only": 1
   },
   {
    "description": "Role → function mapping for every logistics gate (manifest stage transitions, ops console, overrides, digests). Rows here OVERRIDE the shipped defaults for that function; leave a function unlisted to keep its default. Defaults are seeded on migrate and can be edited or deleted freely.",
@@ -217,12 +510,9 @@
    "write": 1
   },
   {
-   "create": 1,
    "print": 1,
    "read": 1,
-   "role": "Delivery Manager",
-   "share": 1,
-   "write": 1
+   "role": "Delivery Manager"
   }
  ],
  "sort_field": "modified",

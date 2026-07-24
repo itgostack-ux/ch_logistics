@@ -22,6 +22,9 @@ from frappe.utils import get_datetime, now_datetime
 
 
 class CHDriverBreakLog(Document):
+    def before_insert(self):
+        self._validate_owner()
+
     def before_save(self):
         # Compute duration_min when both timestamps are present.  We do
         # this in Python (not a MySQL generated column) so the value
@@ -38,6 +41,7 @@ class CHDriverBreakLog(Document):
             self.duration_min = None
 
     def validate(self):
+        self._validate_owner()
         # A driver may only have ONE open break log at a time.  The
         # ``end_break`` API always operates on the newest open row;
         # allowing multiple concurrent open rows would let stale
@@ -60,6 +64,24 @@ class CHDriverBreakLog(Document):
                 "Close it before starting a new one."
             ).format(self.driver, others[0]),
                 title=_("Duplicate Open Break"))
+
+    def _validate_owner(self):
+        from ch_logistics import roles as role_registry
+        from ch_logistics.api.driver_resolver import resolve_current_driver
+
+        if role_registry.is_privileged():
+            return
+        driver = resolve_current_driver(throw=True)
+        if self.driver != driver:
+            frappe.throw(_("Break logs can only be changed for your Driver profile."), frappe.PermissionError)
+        if self.trip and frappe.db.get_value("CH Logistics Trip", self.trip, "driver") != driver:
+            frappe.throw(_("Break logs can only reference your assigned trip."), frappe.PermissionError)
+        if not self.is_new():
+            stored = frappe.db.get_value(
+                "CH Driver Break Log", self.name, ["driver", "trip", "start_ts"], as_dict=True
+            ) or {}
+            if stored.get("driver") != self.driver or stored.get("trip") != self.trip or stored.get("start_ts") != self.start_ts:
+                frappe.throw(_("Break ownership and start time cannot be changed."), frappe.PermissionError)
 
 
 def start_break_for_driver(
@@ -94,7 +116,7 @@ def start_break_for_driver(
         doc.start_latitude = latitude
     if longitude is not None:
         doc.start_longitude = longitude
-    doc.insert(ignore_permissions=True)
+    doc.insert()
     return doc.name
 
 
@@ -124,5 +146,5 @@ def end_break_for_driver(
         doc.end_latitude = latitude
     if longitude is not None:
         doc.end_longitude = longitude
-    doc.save(ignore_permissions=True)
+    doc.save()
     return doc.name

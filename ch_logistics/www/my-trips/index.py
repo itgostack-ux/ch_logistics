@@ -10,6 +10,9 @@ import frappe
 from frappe import _
 from frappe.utils import add_days, getdate, today
 
+from ch_logistics.api.driver_resolver import resolve_current_driver
+from ch_logistics.roles import user_has
+
 no_cache = 1
 
 
@@ -19,9 +22,12 @@ def get_context(context):
         frappe.local.flags.redirect_location = "/login?redirect-to=/my-trips"
         raise frappe.Redirect
 
-    driver = frappe.db.get_value("Driver", {"user": user},
-                                 ["name", "full_name", "cell_number"], as_dict=True)
-    if not driver and user != "Administrator":
+    driver_name = resolve_current_driver(throw=False)
+    driver = frappe.db.get_value(
+        "Driver", driver_name, ["name", "full_name", "cell_number"], as_dict=True
+    ) if driver_name else None
+    can_preview = user_has("ops_view", user)
+    if not driver and not can_preview:
         context.error = _("Your account is not linked to a driver record. "
                           "Please contact dispatch.")
         context.trips = []
@@ -59,7 +65,7 @@ def get_context(context):
         )
 
     context.title = _("My Trips")
-    context.driver = driver or {"name": "—", "full_name": "Administrator (preview)"}
+    context.driver = driver or {"name": "—", "full_name": _("Operations preview")}
     context.trips = trips
     context.today = today_d
     context.no_cache = 1

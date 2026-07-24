@@ -663,12 +663,6 @@ function show_return_confirm_dialog(frm, api) {
                 description: __("Photo of all items returned to source warehouse"),
                 reqd: 1
             },
-            {
-                fieldname: "confirmed_by",
-                fieldtype: "Data",
-                label: __("Received By (Name at Source)"),
-                description: __("Name of person who received the returned items at source warehouse")
-            },
         ],
         primary_action_label: __("Confirm Return & Reverse Stock"),
         primary_action(values) {
@@ -681,7 +675,6 @@ function show_return_confirm_dialog(frm, api) {
                         args: {
                             manifest: frm.doc.name,
                             return_photo: values.return_photo,
-                            confirmed_by: values.confirmed_by,
                         },
                         freeze: true,
                         freeze_message: __("Reversing stock entries..."),

@@ -14,6 +14,7 @@ CUSTOM_FIELDS = {
             "unique": 1,
             "no_copy": 1,
             "hidden": 1,
+            "permlevel": 1,
             "description": "Opaque id for the public /track page.",
         },
     ],

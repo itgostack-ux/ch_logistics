@@ -20,7 +20,7 @@ Resolution order per function key:
 Function keys
 ─────────────
 Stage keys (manifest lifecycle transitions — used by transfer_manifest_api):
-  assign_driver, start_pickup, mark_reached_destination, reject_manifest,
+  create_manifest, assign_driver, start_pickup, mark_reached_destination, reject_manifest,
   complete_delivery, driver_close_manifest, accept_delivery, close_manifest,
   initiate_recall, confirm_return
 
@@ -41,15 +41,18 @@ Console / override keys:
 
 from __future__ import annotations
 
+import re
+
 import frappe
 from frappe import _
+from frappe.utils import cint
 
 # Roles that bypass every logistics gate (matches ch_erp15.scope._BYPASS_ROLES).
 # Shipped defaults — exactly the pre-centralisation behaviour of each call
 # site. "Logistic Head" (legacy misspelling) is retained as an accepted
 # alias so any site that hand-created the misspelt role keeps working.
 DEFAULT_ROLE_MATRIX: dict[str, set[str]] = {
-    "bypass": {"System Manager"},
+    "create_manifest": {"Delivery Manager", "Stock Manager", "Operations Manager"},
     # Outward stages — source-store dispatch lane
     "assign_driver": {"Delivery Manager", "Stock Manager", "Store Manager"},
     "start_pickup": {"Delivery Manager", "Delivery User", "Stock Manager"},
@@ -66,6 +69,10 @@ DEFAULT_ROLE_MATRIX: dict[str, set[str]] = {
     # Console / overrides
     "ops_control": {"Operations Manager", "Delivery Manager", "Logistics Head", "Logistic Head"},
     "ops_view": {"Delivery Manager", "Delivery User", "Operations Manager", "Logistics Head"},
+    "driver_override": {"Delivery Manager", "Stock Manager", "Operations Manager", "Logistics Head", "Logistic Head"},
+    "tracking_view": {"Delivery Manager", "Operations Manager", "Logistics Head", "Logistic Head"},
+    "courier_poll": {"Delivery Manager", "Operations Manager", "Logistics Head", "Logistic Head"},
+    "ewaybill_sync": {"Delivery Manager", "Stock Manager", "Operations Manager"},
     "head_override": {"Logistics Head", "Logistic Head"},
     "resequence_override": {"Logistics Head", "Logistic Head", "Operations Manager"},
     "app_access": {"Logistics Manager", "Logistics User"},
@@ -94,29 +101,145 @@ def _settings_matrix() -> dict[str, set[str]]:
     for row in settings.get("role_matrix") or []:
         key = (row.get("function_key") or "").strip()
         role = (row.get("role") or "").strip()
-        if key and role:
+        if key in DEFAULT_ROLE_MATRIX and role:
             matrix.setdefault(key, set()).add(role)
     return matrix
 
 
 def get_roles_for(function_key: str) -> set[str]:
     """Allowed role set for a function key (settings override → defaults)."""
+    if function_key not in DEFAULT_ROLE_MATRIX:
+        return set()
     configured = _settings_matrix().get(function_key)
     if configured:
         return configured
     return set(DEFAULT_ROLE_MATRIX.get(function_key, set()))
 
 
+def get_int_setting(fieldname: str, default: int, minimum: int = 1) -> int:
+    """Read a positive CH Logistics Settings value with migrate-safe fallback.
+
+    CH Logistics Settings is a SINGLE doctype — it has no table, so
+    frappe.db.has_column() raises TableMissingError for it. The migrate-safe
+    existence check for a Single is the meta field lookup.
+    """
+    try:
+        if not frappe.get_meta("CH Logistics Settings").has_field(fieldname):
+            return default
+    except Exception:
+        return default
+    value = cint(frappe.db.get_single_value("CH Logistics Settings", fieldname))
+    return value if value >= minimum else default
+
+
+def get_list_setting(fieldname: str) -> set[str]:
+    try:
+        value = frappe.db.get_single_value("CH Logistics Settings", fieldname) or ""
+    except Exception:
+        return set()
+    return {part.strip() for part in re.split(r"[,\n]", value) if part.strip()}
+
+
+def is_privileged(user: str | None = None) -> bool:
+    """Immutable Administrator/System Manager bypass.
+
+    Administrator is a Frappe principal, not a role.  System Manager cannot
+    be removed from this bypass through the editable role matrix.
+    """
+    user = user or frappe.session.user
+    if user == "Administrator":
+        return True
+    if not user or user == "Guest":
+        return False
+    return "System Manager" in set(frappe.get_roles(user))
+
+
+def filter_notification_users(users) -> list[str]:
+    limit = get_int_setting("notification_recipient_limit", 200)
+    candidates = sorted({user for user in (users or []) if user})[:limit]
+    if not candidates:
+        return []
+    enabled = frappe.get_all(
+        "User",
+        filters={
+            "name": ("in", candidates),
+            "enabled": 1,
+            "user_type": "System User",
+        },
+        pluck="name",
+        limit=limit,
+    )
+    include_privileged = bool(
+        get_int_setting("business_notifications_include_privileged", 0, minimum=0)
+    )
+    excluded_roles = get_list_setting("business_notification_excluded_roles")
+    return sorted(
+        user
+        for user in enabled
+        if (include_privileged or not is_privileged(user))
+        and not set(frappe.get_roles(user)).intersection(excluded_roles)
+    )
+
+
+def get_notification_role_users(function_key: str) -> list[str]:
+    limit = get_int_setting("notification_recipient_limit", 200)
+    users = frappe.get_all(
+        "Has Role",
+        filters={
+            "role": ("in", sorted(get_roles_for(function_key))),
+            "parenttype": "User",
+        },
+        pluck="parent",
+        limit=limit,
+    )
+    return filter_notification_users(users)
+
+
+def get_name_batch(
+    doctype: str,
+    *,
+    filters=None,
+    fields=None,
+    cursor_key: str,
+    limit_field: str,
+    default_limit: int,
+):
+    limit = get_int_setting(limit_field, default_limit)
+    cache_key = f"ch_logistics::scheduler_cursor::{cursor_key}"
+    cursor = frappe.cache().get_value(cache_key) or ""
+
+    def fetch(after):
+        query_filters = list(filters or [])
+        if after:
+            query_filters.append(["name", ">", after])
+        return frappe.get_all(
+            doctype,
+            filters=query_filters,
+            fields=fields or ["name"],
+            order_by="name asc",
+            limit=limit,
+        )
+
+    rows = fetch(cursor)
+    if not rows and cursor:
+        frappe.cache().delete_value(cache_key)
+        rows = fetch("")
+    if rows:
+        frappe.cache().set_value(cache_key, rows[-1].name, expires_in_sec=604800)
+    return rows
+
+
 def user_has(function_key: str, user: str | None = None) -> bool:
     """True when `user` may exercise `function_key` (bypass roles included)."""
     user = user or frappe.session.user
-    user_roles = set(frappe.get_roles(user))
-    if user_roles & get_roles_for("bypass"):
+    if function_key not in DEFAULT_ROLE_MATRIX or not user or user == "Guest":
+        return False
+    if is_privileged(user):
         return True
+    user_roles = set(frappe.get_roles(user))
     needed = get_roles_for(function_key)
     if not needed:
-        # Unknown / unconfigured key → no extra roles demanded beyond login.
-        return True
+        return False
     return bool(user_roles & needed)
 
 

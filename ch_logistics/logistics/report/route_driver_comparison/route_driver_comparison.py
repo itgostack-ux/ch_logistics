@@ -28,9 +28,10 @@ from __future__ import annotations
 
 import frappe
 from frappe import _
-from frappe.utils import flt
+from frappe.utils import add_days, flt, getdate, nowdate
 
 from ch_erp15.ch_erp15.report_scope import scope_where_clause
+from ch_logistics import roles as role_registry
 from ch_logistics.api.report_utils import col, resolve_company
 
 
@@ -83,6 +84,7 @@ def _fetch_trip_aggregates(filters: dict) -> list[dict]:
     where, vals = _trip_where(filters)
     show_unassigned = bool(filters.get("include_unassigned_route"))
     route_filter = "" if show_unassigned else " AND t.route IS NOT NULL AND t.route != ''"
+    vals["row_limit"] = filters["row_limit"]
     rows = frappe.db.sql(
         f"""
         SELECT
@@ -96,6 +98,8 @@ def _fetch_trip_aggregates(filters: dict) -> list[dict]:
         FROM `tabCH Logistics Trip` t
         WHERE t.driver IS NOT NULL {route_filter} {where}
         GROUP BY route, t.driver
+        ORDER BY trips DESC, route, t.driver
+        LIMIT %(row_limit)s
         """,
         vals,
         as_dict=True,
@@ -181,10 +185,53 @@ def _fetch_exceptions(filters: dict) -> dict[tuple[str, str], int]:
 
 def execute(filters: dict | None = None):
     filters = dict(filters or {})
+    max_window_days = role_registry.get_int_setting("ops_max_window_days", 31)
+    filters["to_date"] = getdate(filters.get("to_date") or nowdate())
+    filters["from_date"] = getdate(
+        filters.get("from_date") or add_days(filters["to_date"], -(min(max_window_days, 31) - 1))
+    )
+    if filters["from_date"] > filters["to_date"]:
+        frappe.throw(_("From Date cannot be after To Date."), frappe.ValidationError)
+    if (filters["to_date"] - filters["from_date"]).days + 1 > max_window_days:
+        frappe.throw(
+            _("The report window cannot exceed {0} days.").format(max_window_days),
+            frappe.ValidationError,
+        )
+    filters["row_limit"] = min(
+        role_registry.get_int_setting("ops_driver_row_limit", 200),
+        2_000,
+    )
 
     base = _fetch_trip_aggregates(filters)
     ontime = _fetch_ontime(filters)
     exceptions = _fetch_exceptions(filters)
+
+    driver_ids = sorted({row["driver"] for row in base if row.get("driver")})
+    route_ids = sorted(
+        {
+            row["route"]
+            for row in base
+            if row.get("route") and row.get("route") != "(Unassigned)"
+        }
+    )
+    driver_names = {
+        row.name: row.full_name or row.name
+        for row in frappe.get_all(
+            "Driver",
+            filters={"name": ("in", driver_ids or ["__none__"])},
+            fields=["name", "full_name"],
+            limit_page_length=filters["row_limit"],
+        )
+    }
+    route_names = {
+        row.name: row.route_name or row.name
+        for row in frappe.get_all(
+            "CH Route",
+            filters={"name": ("in", route_ids or ["__none__"])},
+            fields=["name", "route_name"],
+            limit_page_length=filters["row_limit"],
+        )
+    }
 
     # Enrich in memory — one pass over base is O(N drivers × routes)
     # which stays tiny (< a few hundred rows) at 500-store scale.
@@ -194,15 +241,8 @@ def execute(filters: dict | None = None):
         onm = ontime.get(key, {})
         deliveries = flt(onm.get("deliveries") or 0)
         on_time = flt(onm.get("on_time") or 0)
-        driver_name = (
-            frappe.db.get_value("Driver", row["driver"], "full_name")
-            or row["driver"]
-        )
-        route_name = (
-            frappe.db.get_value("CH Route", row["route"], "route_name")
-            if row["route"] and row["route"] != "(Unassigned)"
-            else row["route"]
-        )
+        driver_name = driver_names.get(row["driver"], row["driver"])
+        route_name = route_names.get(row["route"], row["route"])
         planned_km = flt(row["planned_km"] or 0, 1)
         actual_km = flt(row["actual_km"] or 0, 1)
         # Positive delta = actual > planned (bad).  Negative = beat the plan.

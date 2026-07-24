@@ -4,23 +4,96 @@ Lifecycle:
     Draft → Packed → Assigned → Pickup Started → In Transit → Delivered → Received → Closed
 """
 
+import hashlib
+import hmac
 import secrets
 
 import frappe
 from frappe import _
 from frappe.model.document import Document
 from frappe.utils import now_datetime, cint, flt, getdate, nowdate
+from frappe.utils.password import get_encryption_key
+
+
+_OTP_DIGEST_PREFIX = "hmac-sha256$"
+
+
+def delivery_otp_digest(otp: str) -> str:
+    """Return a site-keyed digest; a receiver OTP must never be stored raw."""
+    key = get_encryption_key()
+    if isinstance(key, str):
+        key = key.encode("utf-8")
+    value = str(otp or "").strip().encode("utf-8")
+    return _OTP_DIGEST_PREFIX + hmac.new(key, value, hashlib.sha256).hexdigest()
+
+
+def verify_delivery_otp(stored: str | None, candidate: str | None) -> bool:
+    stored = str(stored or "").strip()
+    candidate = str(candidate or "").strip()
+    if not stored or not candidate:
+        return False
+    if stored.startswith(_OTP_DIGEST_PREFIX):
+        return hmac.compare_digest(stored, delivery_otp_digest(candidate))
+    # Migration-safe legacy verification.  Successful use clears the value;
+    # rotation patches digest remaining active legacy codes.
+    return hmac.compare_digest(stored, candidate)
 
 
 class CHTransferManifest(Document):
 
+    _SERVER_MANAGED_FIELDS = frozenset({
+        "status", "trip", "driver", "driver_name", "driver_phone",
+        "vehicle_number", "custom_vehicle", "courier_partner",
+        "tracking_number", "custom_external_booking_id",
+        "pickup_datetime", "pickup_photo", "pickup_lat", "pickup_lng",
+        "arrival_datetime", "arrival_lat", "arrival_lng",
+        "delivery_datetime", "delivery_photo", "delivery_lat", "delivery_lng",
+        "receiver_name", "delivery_otp", "delivery_otp_verified", "qr_payload",
+        "tracking_token", "received_by", "received_at", "closed_by", "closed_at",
+        "rejected_by", "rejected_at", "rejected_during", "rejection_reason",
+        "rejection_photo", "rejection_notes", "recall_initiated_by",
+        "recall_initiated_at", "return_confirmed_by", "return_confirmed_at",
+    })
+
     def validate(self):
+        self._validate_server_managed_fields()
         if not self.status:
             self.status = "Draft"
         self._populate_transfer_details()
         self._compute_totals()
         self._validate_packing()
         self._validate_transfers()
+
+    def _validate_server_managed_fields(self):
+        """Prevent ordinary CRUD from forging logistics lifecycle evidence."""
+        from ch_logistics import roles as role_registry
+
+        if role_registry.is_privileged() or self.flags.ignore_validate_update_after_submit:
+            return
+        if self.is_new():
+            if self.get("status") not in (None, "", "Draft"):
+                frappe.throw(_("New manifests must begin in Draft status."), frappe.PermissionError)
+            forged = [
+                fieldname
+                for fieldname in self._SERVER_MANAGED_FIELDS - {"status"}
+                if self.meta.has_field(fieldname) and self.get(fieldname) not in (None, "", 0)
+            ]
+        else:
+            before = self.get_doc_before_save()
+            if not before:
+                return
+            forged = [
+                fieldname
+                for fieldname in self._SERVER_MANAGED_FIELDS
+                if self.meta.has_field(fieldname)
+                and self.get(fieldname) != before.get(fieldname)
+            ]
+        if forged:
+            frappe.throw(
+                _("Lifecycle fields can only be changed through an authorized logistics action: {0}.")
+                .format(", ".join(sorted(forged))),
+                frappe.PermissionError,
+            )
 
     def before_submit(self):
         if not self.transfers:
@@ -375,8 +448,8 @@ class CHTransferManifest(Document):
             self._generate_delivery_otp()
             # Seed the pickup-scan token so QR enforcement has something to
             # match against (older manifests are backfilled lazily here).
-            if not self.qr_payload:
-                self.qr_payload = self.name
+            if not self.qr_payload or self.qr_payload == self.name:
+                self.qr_payload = frappe.generate_hash(length=32)
             # Issue the public track-and-trace token once, at assignment.
             if not self.get("tracking_token"):
                 from ch_logistics.api.customer_tracking import ensure_token
@@ -704,13 +777,16 @@ class CHTransferManifest(Document):
         enforce = frappe.db.get_single_value("CH Logistics Settings", "enforce_pickup_qr")
         if enforce is not None and not int(enforce):
             return
-        expected = (self.qr_payload or self.name or "").strip()
+        expected = (self.qr_payload or "").strip()
         scanned = (scanned_qr or "").strip()
         if not scanned:
             frappe.throw(_("QR scan is mandatory. Scan the manifest/order QR to start pickup."),
                          title=_("Scan Required"))
-        if scanned != expected:
-            frappe.throw(_("Scanned QR does not match this manifest. Expected {0}.").format(expected),
+        if len(expected) < 22 or expected == self.name:
+            frappe.throw(_("This manifest is missing a secure QR token. Reassign it before pickup."),
+                         title=_("QR Token Missing"))
+        if not hmac.compare_digest(scanned, expected):
+            frappe.throw(_("Scanned QR does not match this manifest."),
                          title=_("Wrong QR"))
 
     def _validate_delivery_qr(self, scanned_qr):
@@ -721,14 +797,35 @@ class CHTransferManifest(Document):
         # Default ON when the flag has never been set (matches JSON default=1).
         if enforce is not None and not int(enforce):
             return
-        expected = (self.qr_payload or self.name or "").strip()
+        expected = (self.qr_payload or "").strip()
         scanned = (scanned_qr or "").strip()
         if not scanned:
             frappe.throw(_("QR scan is mandatory. Scan the manifest/order QR to complete delivery."),
                          title=_("Scan Required"))
-        if scanned != expected:
-            frappe.throw(_("Scanned QR does not match this manifest. Expected {0}.").format(expected),
+        if len(expected) < 22 or expected == self.name:
+            frappe.throw(_("This manifest is missing a secure QR token. Reassign it before delivery."),
+                         title=_("QR Token Missing"))
+        if not hmac.compare_digest(scanned, expected):
+            frappe.throw(_("Scanned QR does not match this manifest."),
                          title=_("Wrong QR"))
+
+    def ensure_secure_qr_token(self):
+        """Mint a secure ``qr_payload`` when the stored one is missing, too
+        short, or a legacy name-equals-token — i.e. exactly the cases the
+        pickup/delivery QR validators reject (``len < 22`` or ``== name``).
+
+        Returns ``(token, minted)``. Safe on submitted manifests (uses
+        ``db_set`` and never bumps ``modified``). Centralises the lazy-mint
+        that used to live only in the consolidated stop endpoints, so EVERY
+        pickup/delivery path (bundle, per-manifest, desk) self-heals instead of
+        dead-ending on "This manifest is missing a secure QR token."
+        """
+        token = (self.qr_payload or "").strip()
+        if len(token) < 22 or token == self.name:
+            token = frappe.generate_hash(length=32)
+            self.db_set("qr_payload", token, update_modified=False)
+            return token, True
+        return token, False
 
     def _validate_geo(self, lat, lng, kind: str):
         """Mandatory driver-location proof for pickup/delivery.
@@ -978,17 +1075,21 @@ class CHTransferManifest(Document):
             recipients = set()
             if self.owner:
                 recipients.add(self.owner)
-            for u in frappe.get_all(
-                "Has Role", filters={"role": "Delivery Manager", "parenttype": "User"},
-                pluck="parent",
-            ):
-                recipients.add(u)
+            from ch_logistics.roles import filter_notification_users, get_notification_role_users
+
+            recipients.update(get_notification_role_users("rejection_dispatcher_notify"))
+            recipients = filter_notification_users(recipients)
+            if self.company:
+                try:
+                    from ch_erp15.ch_erp15.notification_router import filter_users_by_company
+
+                    recipients = filter_users_by_company(recipients, self.company)
+                except Exception:
+                    recipients = []
             subject = _("Manifest {0} rejected: {1}").format(self.name, self.rejection_reason)
             body = _("Driver {0} rejected manifest {1}. Reason: {2}.").format(
                 self.driver_name or self.driver or "", self.name, self.rejection_reason)
             for user in recipients:
-                if not user or user == "Administrator":
-                    continue
                 frappe.get_doc({
                     "doctype": "Notification Log",
                     "for_user": user,
@@ -1089,9 +1190,10 @@ class CHTransferManifest(Document):
             if self.delivery_otp:
                 if not otp:
                     frappe.throw(_("Delivery OTP is required."), title=_("Ch Transfer Manifest Error"))
-                if str(otp).strip() != str(self.delivery_otp).strip():
+                if not verify_delivery_otp(self.delivery_otp, otp):
                     frappe.throw(_("Invalid OTP. Please check and try again."), title=_("Ch Transfer Manifest Error"))
                 self.delivery_otp_verified = 1
+                self.delivery_otp = None
 
             self.delivery_photo = delivery_photo
             self.delivery_datetime = now_datetime()
@@ -1195,8 +1297,12 @@ class CHTransferManifest(Document):
 
             # GAP-2: auto-submit Draft SEs so ledger reflects physical receipt immediately
             self._auto_submit_stock_entries(received_map)
-            # Cascade to parent trip's drop stop (Pending → Completed)
+            # Cascade to parent trip's drop stop (Pending → Completed), then let
+            # the parent trip auto-close now that this shipment is settled
+            # (Received). When it's the last outstanding shipment the trip
+            # closes cleanly — the driver was already freed at delivery.
             self._cascade_stop_status_to_trip()
+            self._maybe_auto_close_parent_trip()
         finally:
             frappe.db.sql("SELECT RELEASE_LOCK(%s)", (lock_key,))
 
@@ -1364,6 +1470,18 @@ class CHTransferManifest(Document):
             )
             raise
 
+    def _insert_system_delivery_claim(self, claim) -> None:
+        previous_manifest = frappe.flags.get("ch_system_generated_delivery_claim")
+        claim.flags.ch_system_generated_delivery_claim = self.name
+        frappe.flags.ch_system_generated_delivery_claim = self.name
+        try:
+            claim.insert(ignore_permissions=True)
+        finally:
+            if previous_manifest is None:
+                frappe.flags.pop("ch_system_generated_delivery_claim", None)
+            else:
+                frappe.flags.ch_system_generated_delivery_claim = previous_manifest
+
     def _auto_create_damage_claim(self, damage_notes: str, damage_photo: str = None) -> None:
         """Auto-create a CH Delivery Claim when damage is reported on acceptance."""
         try:
@@ -1376,13 +1494,14 @@ class CHTransferManifest(Document):
                 claim.damage_photo = damage_photo
             claim.claim_type = "Courier" if self.courier_partner else "Internal"
             claim.responsible_party = self.courier_partner or self.driver_name or ""
-            claim.insert(ignore_permissions=True)
+            self._insert_system_delivery_claim(claim)
             self.add_comment(
                 "Comment",
                 _("Damage claim {0} auto-created on delivery acceptance.").format(claim.name),
             )
         except Exception:
             frappe.log_error(frappe.get_traceback(), f"Auto damage claim failed: {self.name}")
+            raise
 
     def _auto_create_shortage_claim(self, shortage_rows, total_shortage):
         """Auto-create a CH Delivery Claim when partial-receipt shortage is recorded."""
@@ -1403,7 +1522,7 @@ class CHTransferManifest(Document):
             claim.damage_notes = damage_notes
             claim.claim_type = "Courier" if self.courier_partner else "Internal"
             claim.responsible_party = self.courier_partner or self.driver_name or ""
-            claim.insert(ignore_permissions=True)
+            self._insert_system_delivery_claim(claim)
             self.add_comment(
                 "Comment",
                 _("Shortage claim {0} auto-created — total {1} units short.").format(
@@ -1412,6 +1531,7 @@ class CHTransferManifest(Document):
             )
         except Exception:
             frappe.log_error(frappe.get_traceback(), f"Auto shortage claim failed: {self.name}")
+            raise
 
     def _compute_freight(self):
         """Compute freight_amount from courier rate card × total package weight."""
@@ -1498,7 +1618,11 @@ class CHTransferManifest(Document):
             frappe.throw(frappe._("Freight GL posting failed for manifest {0}. Check Error Log and retry.").format(self.name))
 
     def _generate_delivery_otp(self):
-        self.delivery_otp = str(secrets.randbelow(900000) + 100000)
+        plaintext = str(secrets.randbelow(900000) + 100000)
+        self.delivery_otp = delivery_otp_digest(plaintext)
+        self.delivery_otp_verified = 0
+        self.flags.delivery_otp_plaintext = plaintext
+        return plaintext
 
     def _sync_logistics_status_to_entries(self, logistics_status):
         """Push logistics status change to all child Stock Entries.
@@ -1573,15 +1697,26 @@ class CHTransferManifest(Document):
             )
 
     def _maybe_auto_close_parent_trip(self):
-        """Auto-close parent trip when every attached manifest is terminal.
+        """Advance the parent trip as its manifests settle.
 
-        Terminal set for trip auto-close: Delivered / Closed / Cancelled.
-        If the trip is still Started, this helper first marks it Completed,
-        then closes it.
+        Two INDEPENDENT gates, using the trip's own canonical status sets so
+        the two controllers can never disagree:
+
+        * Completed — no manifest is still pre-delivery (every shipment has at
+          least been Delivered — goods handed over).
+        * Closed    — no manifest blocks closing. Per policy a Delivered
+          shipment is enough: the driver's job ends at handover, so the trip
+          closes right away. The destination store's Scan & Receive settles the
+          manifest (posts stock) later, on its own time, decoupled from the
+          trip. Only pre-delivery or Rejected shipments block closing.
         """
         trip_name = self.get("trip")
         if not trip_name:
             return
+        from ch_logistics.logistics.doctype.ch_logistics_trip.ch_logistics_trip import (
+            _MANIFEST_PREDELIVERY,
+            _MANIFEST_BLOCKS_TRIP_CLOSE,
+        )
         try:
             trip = frappe.get_doc("CH Logistics Trip", trip_name)
             if trip.status in ("Closed", "Cancelled"):
@@ -1595,16 +1730,21 @@ class CHTransferManifest(Document):
             if not rows:
                 return
 
-            terminal = {"Closed", "Delivered", "Cancelled"}
-            blocking = [r.name for r in rows if (r.status or "Draft") not in terminal]
-            if blocking:
-                return
+            statuses = [(r.status or "Draft") for r in rows]
+            # Completion gate — every shipment is at least Delivered.
+            all_delivered = not any(s in _MANIFEST_PREDELIVERY for s in statuses)
+            # Close gate — per policy the trip closes the moment goods are all
+            # delivered; the store's Scan & Receive settles the manifest later
+            # and must NOT hold the trip (or the driver) open. Only pre-delivery
+            # or Rejected shipments block closing.
+            blocks_close = any(s in _MANIFEST_BLOCKS_TRIP_CLOSE for s in statuses)
 
-            if trip.status == "Started":
+            if trip.status == "Started" and all_delivered:
                 trip.mark_completed()
                 trip.save(ignore_permissions=True)
+                trip.reload()
 
-            if trip.status == "Completed":
+            if not blocks_close and trip.status == "Completed":
                 trip.mark_closed()
                 trip.save(ignore_permissions=True)
         except Exception:
@@ -1814,7 +1954,7 @@ class CHTransferManifest(Document):
         finally:
             frappe.db.sql("SELECT RELEASE_LOCK(%s)", (lock_key,))
 
-    def confirm_return(self, return_photo, confirmed_by=None):
+    def confirm_return(self, return_photo):
         """Delivery person confirms all items have been physically returned to source.
 
         Creates reverse Stock Entries (cancels original SEs) to reinstate stock at source.
@@ -1838,7 +1978,7 @@ class CHTransferManifest(Document):
                 frappe.throw(_("Return photo is mandatory."), title=_("Transfer Return Error"))
 
             self.return_photo = return_photo
-            self.return_confirmed_by = confirmed_by or frappe.session.user
+            self.return_confirmed_by = frappe.session.user
             self.return_confirmed_at = now_datetime()
 
             reversed_ses = self._reverse_stock_entries()
@@ -2071,7 +2211,7 @@ class CHTransferManifest(Document):
 # Whitelisted helpers (e-Way Bill orchestration from the manifest form)
 # ────────────────────────────────────────────────────────────────────────
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def refresh_ewaybill_summary(manifest):
     """Pull the latest EWB numbers / validity off each linked Stock Entry,
     update the cached summary on the manifest, and return the structured list.
@@ -2081,20 +2221,28 @@ def refresh_ewaybill_summary(manifest):
     """
     if not manifest:
         frappe.throw(_("Manifest name is required."))
+    from ch_logistics import roles as role_registry, scope_guard
+
+    role_registry.require("ewaybill_sync", _("refresh e-Way Bills"))
     doc = frappe.get_doc("CH Transfer Manifest", manifest)
-    doc.check_permission("read")
+    doc.check_permission("write")
+    scope_guard.assert_manifest_scope(doc.as_dict(), side="source")
     return doc.refresh_ewaybill_summary()
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def resync_ewaybills(manifest):
     """Manually re-run EWB sync for a manifest (e.g. after addresses are
     corrected, or a failed job is retried). Restricted to users who can
     write to the manifest."""
     if not manifest:
         frappe.throw(_("Manifest name is required."))
+    from ch_logistics import roles as role_registry, scope_guard
+
+    role_registry.require("ewaybill_sync", _("resync e-Way Bills"))
     doc = frappe.get_doc("CH Transfer Manifest", manifest)
     doc.check_permission("write")
+    scope_guard.assert_manifest_scope(doc.as_dict(), side="source")
     if doc.status not in ("Assigned", "Pickup Started", "In Transit"):
         frappe.throw(_("e-Way Bills can only be (re)synced once the driver is Assigned."))
     if not doc.vehicle_number:

@@ -29,6 +29,8 @@ import frappe
 from frappe import _
 from frappe.utils import cint, today
 
+from ch_logistics.api.trip_lock import get_locked_trip, lock_manifests
+
 
 def on_stock_entry_submit(doc, method=None):
     """doc_events hook: CH Erp15 → Stock Entry → on_submit."""
@@ -205,6 +207,8 @@ def _find_open_reverse_trip(trip_date, company, source_warehouse):
 def _attach_manifest_to_trip(trip, manifest):
     """Attach manifest to trip if not already, and set stop_sequence to
     match the stop where source_warehouse matches."""
+    trip_doc = get_locked_trip(trip)
+    lock_manifests((manifest,))
     current = frappe.db.get_value("CH Transfer Manifest", manifest, "trip")
     if current == trip:
         return
@@ -224,12 +228,21 @@ def _attach_manifest_to_trip(trip, manifest):
     meta = frappe.get_meta("CH Transfer Manifest")
     if seq and meta.has_field("stop_sequence"):
         updates["stop_sequence"] = cint(seq)
-    frappe.db.set_value("CH Transfer Manifest", manifest, updates)
-
-    # Refresh trip totals
+    savepoint = f"buyback_trip_{frappe.generate_hash(length=10)}"
+    frappe.db.savepoint(savepoint)
     try:
-        trip_doc = frappe.get_doc("CH Logistics Trip", trip)
+        frappe.db.set_value("CH Transfer Manifest", manifest, updates)
+
+        # Saving the trip recomputes totals/derived state. The manifest link
+        # and the trip refresh are one integrity unit and must not diverge.
         trip_doc.flags.ignore_permissions = True
         trip_doc.save()
     except Exception:
-        pass
+        frappe.db.rollback(save_point=savepoint)
+        frappe.log_error(
+            frappe.get_traceback(),
+            f"Buyback manifest/trip attachment rolled back: {manifest} -> {trip}",
+        )
+        raise
+    else:
+        frappe.db.release_savepoint(savepoint)

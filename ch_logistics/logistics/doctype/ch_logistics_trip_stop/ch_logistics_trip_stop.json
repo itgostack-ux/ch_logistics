@@ -110,7 +110,9 @@
   {
    "fieldname": "pickup_token",
    "fieldtype": "Data",
+   "hidden": 1,
    "label": "Pickup QR Token",
+   "permlevel": 1,
    "read_only": 1,
    "no_copy": 1,
    "length": 64,
@@ -119,7 +121,9 @@
   {
    "fieldname": "delivery_token",
    "fieldtype": "Data",
+   "hidden": 1,
    "label": "Delivery QR Token",
+   "permlevel": 1,
    "read_only": 1,
    "no_copy": 1,
    "length": 64,

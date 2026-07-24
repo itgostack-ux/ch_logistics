@@ -151,16 +151,19 @@ frappe.ui.form.on("CH Logistics Trip", {
 			});
 		}
 
-		// Draft or Assigned → Cancelled
+		// Draft or Assigned → Cancelled (reason mandatory, recorded for audit)
 		if (["Draft", "Assigned"].includes(status)) {
 			frm.add_custom_button(__("Cancel Trip"), () => {
-				frappe.confirm(
-					__("Cancel this trip?"),
-					() => {
+				frappe.prompt(
+					[{ fieldtype: "Small Text", fieldname: "reason", label: __("Reason"), reqd: 1 }],
+					(vals) => {
 						frappe.xcall("ch_logistics.api.logistics_api.trip_cancel", {
 							trip: frm.doc.name,
+							reason: vals.reason,
 						}).then(() => frm.reload_doc());
-					}
+					},
+					__("Cancel Trip"),
+					__("Cancel Trip")
 				);
 			}, __("Actions"));
 		}

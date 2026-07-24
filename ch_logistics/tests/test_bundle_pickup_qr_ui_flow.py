@@ -163,8 +163,14 @@ def run():
         # ── Step 2 : Get label for the stop ───────────────────────
         print("== Step 2 — get_stop_label for the consolidated stop ==")
         s = stops[0]
+        # Raw tokens are no longer exposed in API payloads — read from DB.
+        db_pickup_token = frappe.db.get_value(
+            "CH Logistics Trip Stop",
+            {"parent": trip, "sequence": s["sequence"]},
+            "pickup_token",
+        )
         lbl = api.get_stop_label(trip=trip, sequence=s["sequence"], kind="pickup")
-        _expect(s["pickup_token"] == lbl["token"],
+        _expect(db_pickup_token == lbl["token"],
                 "label token matches stop.pickup_token")
         _expect(lbl["manifest_count"] == 3,
                 f"label manifest_count == 3 (got {lbl['manifest_count']})")
@@ -228,7 +234,7 @@ def run():
             "stops": [{"sequence": s["sequence"],
                         "store": s["store"],
                         "manifests": s["manifests"],
-                        "pickup_token": s["pickup_token"]} for s in stops],
+                        "pickup_token": db_pickup_token} for s in stops],
         }
     finally:
         _teardown()

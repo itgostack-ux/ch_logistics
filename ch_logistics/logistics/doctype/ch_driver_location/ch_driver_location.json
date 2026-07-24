@@ -167,8 +167,14 @@
    "role": "Logistics Manager"
   },
   {
+   "create": 1,
    "read": 1,
    "role": "Logistics User"
+  },
+  {
+   "create": 1,
+   "read": 1,
+   "role": "Delivery User"
   }
  ],
  "sort_field": "captured_at",

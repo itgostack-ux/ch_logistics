@@ -1,14 +1,15 @@
-"""Daily logistics digest — a morning email summary for managers / logistics head.
+"""Daily logistics digest — a morning email summary for configured recipients.
 
-Recipients are resolved from roles (Delivery Manager + Stock Manager) plus any
-extra addresses in CH Logistics Settings, so nothing is hardcoded. Gated by the
-``daily_digest_enabled`` setting and wired to the scheduler.
+Recipients are resolved from the role matrix plus any extra addresses in CH
+Logistics Settings. Gated by the ``daily_digest_enabled`` setting and wired to
+the scheduler.
 """
 import frappe
 from frappe import _
 from frappe.utils import nowdate, now_datetime, cint, get_url_to_report
 
 from ch_logistics.api import driver_status as ds
+from ch_logistics.roles import get_int_setting
 
 
 def _enabled():
@@ -18,38 +19,40 @@ def _enabled():
     return v is None or cint(v) == 1
 
 
-def _digest_roles():
-    from ch_logistics.roles import get_roles_for
-    return get_roles_for("digest_recipients")
-
-
 def _recipients(company=None):
     """Logistics managers — scoped to `company` when given (fail-closed via
-    ch_erp15's notification router); explicit settings recipients always kept."""
+    ch_erp15's notification router); extra addresses require a company map."""
+    from ch_logistics.roles import get_notification_role_users
+
     valid = set()
+    role_users = get_notification_role_users("digest_recipients")
     if company:
         try:
-            from ch_erp15.ch_erp15.notification_router import scoped_role_emails
+            from ch_erp15.ch_erp15.notification_router import filter_users_by_company
 
-            valid.update(scoped_role_emails(sorted(_digest_roles()), company=company))
+            role_users = filter_users_by_company(role_users, company)
         except ImportError:
-            company = None  # router unavailable — fall back to role-wide below
-    if not company:
-        role_users = frappe.get_all(
-            "Has Role",
-            filters={"role": ["in", sorted(_digest_roles())], "parenttype": "User"},
-            pluck="parent",
+            role_users = []
+    if role_users:
+        valid.update(
+            frappe.get_all(
+                "User",
+                filters={"name": ("in", role_users), "email": ("is", "set")},
+                pluck="email",
+                limit=get_int_setting("notification_recipient_limit", 200),
+            )
         )
-        for u in set(role_users):
-            if not u or u in ("Administrator", "Guest"):
-                continue
-            info = frappe.db.get_value("User", u, ["enabled", "email"], as_dict=True)
-            if info and info.enabled and info.email:
-                valid.add(info.email)
     extra = frappe.db.get_single_value("CH Logistics Settings", "digest_recipients") or ""
     for e in extra.replace("\n", ",").split(","):
-        if e.strip():
-            valid.add(e.strip())
+        entry = e.strip()
+        if not entry:
+            continue
+        if "|" in entry:
+            mapped_company, email = (part.strip() for part in entry.split("|", 1))
+            if "@" in email and (not company or mapped_company == company):
+                valid.add(email)
+        elif not company and "@" in entry:
+            valid.add(entry)
     return sorted(valid)
 
 
@@ -140,10 +143,32 @@ def _html(m, company=None):
 
 def _active_companies():
     """Companies that actually have logistics activity (manifests)."""
+    limit = get_int_setting("digest_company_batch_size", 100)
+    cache_key = "ch_logistics::digest_company_cursor"
+    cursor = frappe.cache().get_value(cache_key) or ""
     rows = frappe.db.sql(
-        "SELECT DISTINCT company FROM `tabCH Transfer Manifest` WHERE IFNULL(company,'') != ''",
-        as_dict=True)
-    return [r.company for r in rows] or [c.name for c in frappe.get_all("Company", fields=["name"])]
+        """SELECT DISTINCT company FROM `tabCH Transfer Manifest`
+           WHERE IFNULL(company, '') != '' AND company > %(cursor)s
+           ORDER BY company ASC LIMIT %(limit)s""",
+        {"cursor": cursor, "limit": limit}, as_dict=True,
+    )
+    companies = [row.company for row in rows]
+    if not companies and cursor:
+        frappe.cache().delete_value(cache_key)
+        rows = frappe.db.sql(
+            """SELECT DISTINCT company FROM `tabCH Transfer Manifest`
+               WHERE IFNULL(company, '') != ''
+               ORDER BY company ASC LIMIT %(limit)s""",
+            {"limit": limit}, as_dict=True,
+        )
+        companies = [row.company for row in rows]
+    if not companies:
+        companies = frappe.get_all(
+            "Company", pluck="name", order_by="name asc", limit=limit
+        )
+    if companies:
+        frappe.cache().set_value(cache_key, companies[-1], expires_in_sec=604800)
+    return companies
 
 
 def send_logistics_daily_digest():
@@ -177,8 +202,11 @@ def send_logistics_daily_digest():
 @frappe.whitelist()
 def preview_digest(company=None):
     """Render the digest HTML without sending — for a quick admin preview."""
-    from ch_logistics import roles as role_registry
+    from ch_logistics import roles as role_registry, scope_guard
     role_registry.require("digest_preview", "preview the logistics digest")
     company = company or frappe.defaults.get_user_default("Company")
-    return {"recipients": _recipients(), "enabled": _enabled(),
+    if not company:
+        frappe.throw(_("Company is required to preview the logistics digest."))
+    scope_guard.assert_scope(company=company)
+    return {"recipients": _recipients(company), "enabled": _enabled(),
             "company": company, "html": _html(_metrics(company), company=company)}

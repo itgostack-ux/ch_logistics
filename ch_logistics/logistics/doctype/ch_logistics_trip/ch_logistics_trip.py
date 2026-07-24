@@ -35,6 +35,13 @@ _MANIFEST_SETTLED = {
 _MANIFEST_UNSETTLED = (
     _MANIFEST_PREDELIVERY | {"Delivered", "Rejected"}
 )
+# Trip CLOSE gate (policy): a Delivered shipment is enough to close the trip.
+# The driver / logistics team must NOT wait for the destination store's
+# Scan & Receive — that posts stock and settles the manifest later, on the
+# store's own time, and is decoupled from trip closure. Only shipments not yet
+# handed over (still pre-delivery) or Rejected (awaiting a decision) block a
+# trip from closing.
+_MANIFEST_BLOCKS_TRIP_CLOSE = _MANIFEST_PREDELIVERY | {"Rejected"}
 
 
 class CHLogisticsTrip(Document):
@@ -42,22 +49,129 @@ class CHLogisticsTrip(Document):
         self._validate_stops()
         self._validate_planned_times()
         self._populate_hub_from_route()
+        self._validate_actor_scope()
+        self._validate_stop_proof_fields()
         self._ensure_stop_tokens()
         self._recompute_totals()
 
     def before_save(self):
         self._enforce_status_transition()
 
+    def _validate_actor_scope(self):
+        from ch_logistics import roles as role_registry, scope_guard
+
+        if role_registry.is_privileged():
+            return
+        previous = None if self.is_new() else self.get_doc_before_save()
+        if role_registry.user_has("ops_control"):
+            scope_guard.assert_scope(warehouse=self.hub_warehouse, company=self.company)
+            for stop in self.stops or ():
+                scope_guard.assert_scope(
+                    store=stop.get("store"),
+                    warehouse=stop.get("warehouse"),
+                    company=self.company,
+                )
+            return
+        from ch_logistics.api.driver_resolver import resolve_current_driver
+
+        driver = resolve_current_driver(throw=False)
+        if not driver or not previous or previous.driver != driver:
+            frappe.throw(_("You can only update a trip assigned to your Driver profile."), frappe.PermissionError)
+        rejected_assignment = (
+            previous.status == "Assigned"
+            and self.status == "Draft"
+            and not self.driver
+        )
+        if self.driver != driver and not rejected_assignment:
+            frappe.throw(_("Trip assignment fields can only be changed by dispatch."), frappe.PermissionError)
+        protected = (
+            "company", "trip_date", "direction", "route", "hub_warehouse",
+            "vehicle", "planned_start", "planned_end", "stops",
+        )
+        if any(self.has_value_changed(fieldname) for fieldname in protected):
+            frappe.throw(_("Trip planning fields can only be changed by dispatch."), frappe.PermissionError)
+
     # ------------------------------------------------------------------
     def _validate_stops(self):
         if not self.stops:
             return
+        warehouse_names = {row.warehouse for row in self.stops if row.warehouse}
+        warehouse_rows = {
+            row.name: row
+            for row in frappe.get_all(
+                "Warehouse",
+                filters={"name": ("in", tuple(warehouse_names))},
+                fields=["name", "company"],
+                limit_page_length=max(len(warehouse_names), 1),
+            )
+        } if warehouse_names else {}
+        store_names = {row.store for row in self.stops if row.store}
+        store_fields = ["name", "company"]
+        store_meta = frappe.get_meta("CH Store")
+        store_warehouse_fields = [
+            fieldname
+            for fieldname in ("warehouse", "default_warehouse")
+            if store_meta.has_field(fieldname)
+        ]
+        store_fields.extend(store_warehouse_fields)
+        store_rows = {
+            row.name: row
+            for row in frappe.get_all(
+                "CH Store",
+                filters={"name": ("in", tuple(store_names))},
+                fields=store_fields,
+                limit_page_length=max(len(store_names), 1),
+            )
+        } if store_names else {}
         seen = set()
         for row in self.stops:
             if row.sequence in seen:
                 frappe.throw(_("Duplicate stop sequence {0}").format(row.sequence))
             seen.add(row.sequence)
+            if not row.warehouse or row.warehouse not in warehouse_rows:
+                frappe.throw(_("Stop {0} has an unknown warehouse.").format(row.sequence))
+            if warehouse_rows[row.warehouse].company != self.company:
+                frappe.throw(
+                    _("Stop {0} warehouse belongs to another company.").format(row.sequence),
+                    frappe.PermissionError,
+                )
+            if row.store:
+                store = store_rows.get(row.store)
+                if not store or store.company != self.company:
+                    frappe.throw(
+                        _("Stop {0} store belongs to another company.").format(row.sequence),
+                        frappe.PermissionError,
+                    )
+                configured = {store.get(fieldname) for fieldname in store_warehouse_fields}
+                if configured and row.warehouse not in configured:
+                    frappe.throw(
+                        _("Stop {0} store is not configured for its warehouse.").format(row.sequence),
+                        frappe.PermissionError,
+                    )
         self.stops.sort(key=lambda r: r.sequence or 0)
+
+    def _validate_stop_proof_fields(self):
+        """Keep QR bearers and scan evidence server-managed on direct saves."""
+        from ch_logistics import roles as role_registry
+
+        if role_registry.is_privileged() or self.flags.ignore_validate_update_after_submit:
+            return
+        protected = (
+            "pickup_token", "delivery_token", "pickup_scanned_at",
+            "delivery_scanned_at", "pickup_scanned_by", "delivery_scanned_by",
+        )
+        if self.is_new():
+            if any(stop.get(fieldname) for stop in self.stops for fieldname in protected):
+                frappe.throw(_("Stop proof fields are generated by the server."), frappe.PermissionError)
+            return
+        previous = self.get_doc_before_save()
+        if not previous:
+            return
+        previous_by_name = {row.name: row for row in previous.stops or () if row.name}
+        for stop in self.stops or ():
+            old = previous_by_name.get(stop.name)
+            if old and any(stop.get(fieldname) != old.get(fieldname) for fieldname in protected):
+                frappe.throw(_("Stop proof fields are generated by the server."), frappe.PermissionError)
 
     def _validate_planned_times(self):
         """Enforce planned_end > planned_start.
@@ -242,12 +356,13 @@ class CHLogisticsTrip(Document):
             _cur = frappe.db.get_value("CH Logistics Trip", self.name, "status")
             if _cur != "Completed":
                 frappe.throw(_("Trip must be Completed before closing"))
-            unsettled = self._blocking_manifests(_MANIFEST_UNSETTLED)
+            unsettled = self._blocking_manifests(_MANIFEST_BLOCKS_TRIP_CLOSE)
             if unsettled:
                 frappe.throw(_(
-                    "Cannot close trip {0}. These shipments are not yet settled "
-                    "(Received / Partially Received / Closed / Cancelled / Returned): {1}. "
-                    "Reconcile each shipment first, then close the trip."
+                    "Cannot close trip {0} yet — these shipments have not been delivered: {1}. "
+                    "Deliver them (or resolve any rejected shipment) first. Delivered "
+                    "shipments do not block closing — the destination store receives them "
+                    "separately, after the trip is closed."
                 ).format(self.name, ", ".join(unsettled)))
             self.status = "Closed"
         finally:

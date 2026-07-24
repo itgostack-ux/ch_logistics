@@ -164,8 +164,38 @@ class LogisticsCommandCenter {
 				<div class="lcc-loading"><i class="fa fa-spinner fa-spin"></i> ${__("Loading Overview…")}</div>
 			</div>
 		`);
+		this._ov_bind_events($("#lcc-ov"));
 		this._start_auto_refresh();
 		this._ov_load();
+	}
+
+	// Delegated handlers bound ONCE per #lcc-ov element (recreated each
+	// _ov_init). Must NOT live in the render path — _ov_render fires every
+	// 60s via auto-refresh and only empties #lcc-ov, so per-render .on()
+	// calls stack a duplicate handler every minute.
+	_ov_bind_events($ov) {
+		$ov.on("click", ".lcc-action-btn", (e) => {
+			const act = $(e.currentTarget).data("act");
+			const fn = {
+				new_manifest:    () => frappe.new_doc("CH Transfer Manifest"),
+				new_transfer:    () => frappe.new_doc("Stock Entry", { stock_entry_type: "Material Transfer" }),
+				new_trip:        () => this._dlg_new_trip(),
+				ops_view:        () => this._switch_mode("ops"),
+				manifest_list:   () => this._go_list("CH Transfer Manifest"),
+				stock_entry_list:() => this._go_list("Stock Entry", { stock_entry_type: "Material Transfer" }),
+				delivery_app:    () => frappe.set_route("delivery-app"),
+				buy_spares:      () => frappe.new_doc("Purchase Order"),
+			}[act];
+			if (fn) fn();
+		});
+
+		$ov.on("click", ".lcc-tab", function () {
+			const tab = $(this).data("tab");
+			$(this).siblings(".lcc-tab").removeClass("active");
+			$(this).addClass("active");
+			$(this).closest(".lcc-section").find(".lcc-tab-panel").removeClass("active");
+			$(this).closest(".lcc-section").find(`[data-panel="${tab}"]`).addClass("active");
+		});
 	}
 
 	_ov_load() {
@@ -471,21 +501,6 @@ class LogisticsCommandCenter {
 					<button class="lcc-action-btn" data-act="buy_spares"><i class="fa fa-shopping-cart"></i> ${__("Buy Spares")}</button>
 				</div>
 			</div>`);
-
-		$ov.on("click", ".lcc-action-btn", (e) => {
-			const act = $(e.currentTarget).data("act");
-			const fn = {
-				new_manifest:    () => frappe.new_doc("CH Transfer Manifest"),
-				new_transfer:    () => frappe.new_doc("Stock Entry", { stock_entry_type: "Material Transfer" }),
-				new_trip:        () => this._dlg_new_trip(),
-				ops_view:        () => this._switch_mode("ops"),
-				manifest_list:   () => this._go_list("CH Transfer Manifest"),
-				stock_entry_list:() => this._go_list("Stock Entry", { stock_entry_type: "Material Transfer" }),
-				delivery_app:    () => frappe.set_route("delivery-app"),
-				buy_spares:      () => frappe.new_doc("Purchase Order"),
-			}[act];
-			if (fn) fn();
-		});
 	}
 
 	/* ── Manifest detail tabs (Active | Deliveries | Overdue) ─── */
@@ -510,14 +525,6 @@ class LogisticsCommandCenter {
 				<div class="lcc-tabs">${tab_btns}</div>
 				${panels}
 			</div>`);
-
-		$ov.on("click", ".lcc-tab", function () {
-			const tab = $(this).data("tab");
-			$(this).siblings(".lcc-tab").removeClass("active");
-			$(this).addClass("active");
-			$(this).closest(".lcc-section").find(".lcc-tab-panel").removeClass("active");
-			$(this).closest(".lcc-section").find(`[data-panel="${tab}"]`).addClass("active");
-		});
 
 		this._ov_tbl_active($ov, data.active_manifests || []);
 		this._ov_tbl_deliveries($ov, data.recent_deliveries || []);
@@ -944,6 +951,11 @@ class LogisticsCommandCenter {
 	}
 
 	_ops_bind_events() {
+		// Delegated handlers live on the persistent $root — bind once, or every
+		// visit to the Operations tab stacks another copy (double dialogs,
+		// duplicate trip actions/prints). Same guard idiom as _pack_init.
+		if (this._ops_events_bound) return;
+		this._ops_events_bound = true;
 		const $r = this.$root;
 		$r.on("change", ".lcc-ops-date",    (e) => { this.trip_date = $(e.currentTarget).val(); this._ops_load(); });
 		$r.on("change", ".lcc-ops-days",    (e) => { this.include_days = parseInt($(e.currentTarget).val()) || 1; this._ops_load(); });
@@ -989,6 +1001,7 @@ class LogisticsCommandCenter {
 		$r.on("click",  "#lcc-side-resequence", () => this._ops_trip_action("resequence_trip", _OPT));
 		$r.on("click",  "#lcc-side-close-trip",()=> this._ops_trip_action("trip_close"));
 		$r.on("click",  "#lcc-side-cancel",   () => this._ops_trip_action("trip_unassign"));
+		$r.on("click",  "#lcc-side-cancel-trip", () => this._ops_cancel_trip());
 		$r.on("click",  ".lcc-side-detach",   (e) => this._ops_detach_manifest($(e.currentTarget).data("name")));
 		$r.on("click",  ".lcc-trip-link",     (e) => { e.preventDefault(); this._ops_open_trip($(e.currentTarget).data("name")); });
 
@@ -1510,12 +1523,6 @@ class LogisticsCommandCenter {
 					description: __("Photo of all items returned to source warehouse"),
 					reqd: 1,
 				},
-				{
-					fieldname: "confirmed_by",
-					fieldtype: "Data",
-					label: __("Received By (Name at Source)"),
-					description: __("Name of person who received the returned items at source warehouse"),
-				},
 			],
 			primary_action_label: __("Confirm Return & Reverse Stock"),
 			primary_action: (values) => {
@@ -1528,7 +1535,6 @@ class LogisticsCommandCenter {
 							args: {
 								manifest: name,
 								return_photo: values.return_photo,
-								confirmed_by: values.confirmed_by,
 							},
 							freeze: true,
 							freeze_message: __("Reversing stock entries..."),
@@ -1573,6 +1579,7 @@ class LogisticsCommandCenter {
 		const can_complete = t.status === "Started";
 		const can_close    = t.status === "Completed";
 		const can_unassign = t.status === "Assigned";
+		const can_cancel   = ["Draft", "Assigned"].includes(t.status);
 		const can_detach = ["Draft", "Assigned", "Started"].includes(t.status);
 		const can_resequence = ["Assigned", "Started"].includes(t.status);
 		// Server-resolved capability (CH Logistics Settings → Role Matrix);
@@ -1628,6 +1635,8 @@ class LogisticsCommandCenter {
 				<div><b>${__("Vehicle")}:</b> ${frappe.utils.escape_html(t.vehicle_number || "—")}</div>
 				<div><b>${__("Hub")}:</b> ${frappe.utils.escape_html(t.hub_warehouse || "—")}</div>
 				<div><b>${__("Shipments")}:</b> ${t.total_shipments || 0}</div>
+				<div><b>${__("Created")}:</b> ${frappe.utils.escape_html(t.created_by || "—")}${t.created_on ? ` · ${frappe.datetime.str_to_user(t.created_on)}` : ""}</div>
+				${t.cancelled_by ? `<div class="lcc-cancel-info"><b>${__("Cancelled")}:</b> ${frappe.utils.escape_html(t.cancelled_by)}${t.cancelled_on ? ` · ${frappe.datetime.str_to_user(t.cancelled_on)}` : ""}${t.cancellation_reason ? `<br><span class="lcc-muted">${frappe.utils.escape_html(t.cancellation_reason)}</span>` : ""}</div>` : ""}
 			</div>
 			<div class="lcc-side-actions">
 				${can_assign   ? `<button class="btn btn-sm btn-default" id="lcc-side-assign"><i class="fa fa-user-plus"></i> ${__("Assign Driver")}</button>` : ""}
@@ -1637,6 +1646,7 @@ class LogisticsCommandCenter {
 				${can_complete_override ? `<button class="btn btn-sm btn-danger" id="lcc-side-complete-override"><i class="fa fa-shield"></i> ${__("Complete (Override Exceptions)")}</button>` : ""}
 				${can_close    ? `<button class="btn btn-sm btn-primary" id="lcc-side-close-trip"><i class="fa fa-archive"></i> ${__("Close")}</button>` : ""}
 				${can_unassign ? `<button class="btn btn-sm btn-default" id="lcc-side-cancel"><i class="fa fa-user-times"></i> ${__("Unassign")}</button>` : ""}
+				${can_cancel ? `<button class="btn btn-sm btn-danger" id="lcc-side-cancel-trip"><i class="fa fa-ban"></i> ${__("Cancel Trip")}</button>` : ""}
 			</div>
 			<div class="lcc-side-sec">${__("Stops")}</div>
 			${stops_html}
@@ -1648,6 +1658,34 @@ class LogisticsCommandCenter {
 		if (!this.active_trip) return;
 		frappe.call({ method: prefix + method, args: { trip: this.active_trip, ...extraArgs } })
 			.then(() => { frappe.show_alert({ message: __("Done"), indicator: "green" }); this._ops_load(); });
+	}
+
+	_ops_cancel_trip() {
+		if (!this.active_trip) return;
+		const trip = this.active_trip;
+		const d = new frappe.ui.Dialog({
+			title: __("Cancel Trip {0}", [trip]),
+			fields: [
+				{ fieldtype: "HTML", options: `<p class="text-muted">${__("This cancels the trip and releases its driver. The reason is recorded against the trip (who / when / why) for audit.")}</p>` },
+				{ fieldtype: "Small Text", fieldname: "reason", label: __("Reason"), reqd: 1 },
+			],
+			primary_action_label: __("Cancel Trip"),
+			primary_action: (vals) => {
+				const reason = (vals.reason || "").trim();
+				if (!reason) {
+					frappe.show_alert({ message: __("A reason is required."), indicator: "red" });
+					return;
+				}
+				d.hide();
+				frappe.call({ method: _LCC + "trip_cancel", args: { trip, reason } })
+					.then(() => {
+						frappe.show_alert({ message: __("Trip {0} cancelled", [trip]), indicator: "orange" });
+						this._ops_close_side();
+						this._ops_load();
+					});
+			},
+		});
+		d.show();
 	}
 
 	_ops_assign_driver() {
@@ -1723,10 +1761,10 @@ class LogisticsCommandCenter {
 		if (this._leaflet_loading) return this._leaflet_loading;
 		this._leaflet_loading = new Promise((resolve, reject) => {
 			const css = document.createElement("link"); css.rel = "stylesheet";
-			css.href = "https://unpkg.com/leaflet@1.9.4/dist/leaflet.css";
+			css.href = "/assets/frappe/js/lib/leaflet/leaflet.css";
 			document.head.appendChild(css);
 			const js = document.createElement("script");
-			js.src = "https://unpkg.com/leaflet@1.9.4/dist/leaflet.js";
+			js.src = "/assets/frappe/js/lib/leaflet/leaflet.js";
 			js.onload = resolve; js.onerror = () => reject(new Error("network"));
 			document.head.appendChild(js);
 		});

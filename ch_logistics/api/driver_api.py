@@ -15,6 +15,7 @@ from frappe import _
 
 from ch_logistics.api import driver_status as ds
 from ch_logistics.api.driver_resolver import resolve_current_driver
+from ch_logistics import roles as role_registry
 from ch_logistics.logistics.doctype.ch_driver_device.ch_driver_device import (
     deactivate_devices,
     register_device,
@@ -57,7 +58,7 @@ def _profile(driver: str) -> dict:
 # --------------------------------------------------------------------------
 # Session: login / logout / token (FR-001 → FR-008)
 # --------------------------------------------------------------------------
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def driver_login(device_id, platform="Android", fcm_token=None, app_version=None):
     """Register the handset against the logged-in driver and bring them online.
 
@@ -78,7 +79,6 @@ def driver_login(device_id, platform="Android", fcm_token=None, app_version=None
     # Offline → Available. force=True because a re-login from any online state
     # (e.g. app reinstall mid-shift) should still settle to Available.
     ds.set_status(driver, ds.AVAILABLE, force=True)
-    frappe.db.commit()
     return {
         "driver": driver,
         "device": device,
@@ -87,17 +87,16 @@ def driver_login(device_id, platform="Android", fcm_token=None, app_version=None
     }
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def driver_logout(device_id=None):
     """Clear FCM token(s), deactivate the device(s) and go Offline (FR-008)."""
     driver = _current_driver()
     deactivate_devices(driver, device_id=device_id)
     ds.set_status(driver, ds.OFFLINE, force=True, touch_activity=False)
-    frappe.db.commit()
     return {"driver": driver, "status": ds.OFFLINE}
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def update_fcm_token(device_id, fcm_token):
     """Refresh the FCM token for an existing device (FR-007)."""
     driver = _current_driver()
@@ -114,7 +113,7 @@ def update_fcm_token(device_id, fcm_token):
 # --------------------------------------------------------------------------
 # Status / activity (FR-004, FR-042 → FR-047)
 # --------------------------------------------------------------------------
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def heartbeat(lat=None, lng=None):
     """Lightweight keep-alive. Refreshes activity and pulls an Idle driver back
     to Available (FR-047). The mobile app calls this periodically and on any
@@ -124,7 +123,7 @@ def heartbeat(lat=None, lng=None):
     return {"driver": driver, "status": status}
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def set_break(break_type: str = "Rest", reason: str = None, lat=None, lng=None, trip: str = None):
     """Driver starts a break — Available → Break (FR-042).
 
@@ -138,6 +137,11 @@ def set_break(break_type: str = "Rest", reason: str = None, lat=None, lng=None, 
     )
 
     driver = _current_driver()
+    if trip and frappe.db.get_value("CH Logistics Trip", trip, "driver") != driver:
+        frappe.throw(
+            _("You can only start a break against your assigned trip."),
+            frappe.PermissionError,
+        )
     ds.set_status(driver, ds.BREAK)
     log_name = None
     try:
@@ -157,11 +161,10 @@ def set_break(break_type: str = "Rest", reason: str = None, lat=None, lng=None, 
             frappe.get_traceback(),
             f"CH Driver Break Log start failed for {driver}",
         )
-    frappe.db.commit()
     return {"driver": driver, "status": ds.BREAK, "break_log": log_name}
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def end_break(lat=None, lng=None):
     """Driver resumes from break — Break → Available (FR-043, FR-044).
 
@@ -187,7 +190,6 @@ def end_break(lat=None, lng=None):
             frappe.get_traceback(),
             f"CH Driver Break Log end failed for {driver}",
         )
-    frappe.db.commit()
     return {"driver": driver, "status": ds.AVAILABLE, "break_log": log_name}
 
 
@@ -208,4 +210,5 @@ def get_active_devices():
         fields=["name", "device_id", "platform", "app_version", "is_active",
                 "last_seen", "registered_on"],
         order_by="is_active desc, last_seen desc",
+        limit_page_length=role_registry.get_int_setting("driver_device_row_limit", 20),
     )

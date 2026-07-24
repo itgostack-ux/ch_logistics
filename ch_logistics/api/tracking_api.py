@@ -17,15 +17,16 @@ Scheduler entry points:
 from __future__ import annotations
 
 import math
-from typing import Iterable
 
 import frappe
 from frappe import _
-from frappe.utils import add_to_date, cint, flt, get_datetime, now_datetime
+from frappe.rate_limiter import rate_limit
+from frappe.utils import add_to_date, cint, flt, now_datetime
 
 from ch_logistics.logistics.doctype.ch_tracking_settings.ch_tracking_settings import (
 	get_public_config,
 )
+from ch_logistics import roles as role_registry, scope_guard
 
 
 # ----- Driver resolution ---------------------------------------------------
@@ -44,6 +45,24 @@ def _driver_has_field(field: str) -> bool:
 		return frappe.get_meta("Driver").has_field(field)
 	except Exception:
 		return False
+
+
+def _authorize_driver_read(driver: str) -> None:
+	"""Allow a driver self-view or a scoped fleet-tracking role."""
+	if not driver:
+		frappe.throw(_("Driver is required."), frappe.PermissionError)
+	current_driver = _current_driver(throw=False)
+	if current_driver and current_driver == driver:
+		return
+	role_registry.require("tracking_view", _("view another driver's location"))
+	trip = frappe.db.get_value("Driver", driver, "current_trip")
+	if trip:
+		scope_guard.assert_trip_scope(trip)
+	elif not scope_guard.is_in_scope():
+		frappe.throw(
+			_("An unassigned driver's location is available only to a global fleet role."),
+			frappe.PermissionError,
+		)
 
 
 def _update_driver_current_position(loc) -> None:
@@ -91,6 +110,11 @@ def get_config() -> dict:
 
 
 @frappe.whitelist(methods=["POST"])
+@rate_limit(
+	limit=lambda: role_registry.get_int_setting("driver_location_requests_per_minute", 120),
+	seconds=60,
+	methods=["POST"],
+)
 def ping_location(latitude, longitude, accuracy_m=None, speed_kmh=None,
 				  heading=None, device_id=None, battery_pct=None,
 				  event_type="Heartbeat", is_mock=0, source="App",
@@ -101,6 +125,10 @@ def ping_location(latitude, longitude, accuracy_m=None, speed_kmh=None,
 	at high cadence; insertion is the only DB write.
 	"""
 	driver = _current_driver()
+	if trip:
+		trip_driver = frappe.db.get_value("CH Logistics Trip", trip, "driver")
+		if trip_driver != driver:
+			frappe.throw(_("You can only submit tracking for your assigned trip."), frappe.PermissionError)
 
 	# Optionally suppress writes when tracking is globally disabled.
 	settings = frappe.get_cached_doc("CH Tracking Settings")
@@ -121,8 +149,7 @@ def ping_location(latitude, longitude, accuracy_m=None, speed_kmh=None,
 	loc.battery_pct = cint(battery_pct) if battery_pct is not None else None
 	loc.is_mock = cint(is_mock)
 	loc.source = source or "App"
-	loc.insert(ignore_permissions=True)
-	frappe.db.commit()
+	loc.insert()
 
 	# Best-effort mock-location alert.
 	if cint(is_mock) and cint(settings.alert_on_mock_location):
@@ -157,6 +184,7 @@ def get_live_drivers(status: str | None = None) -> list[dict]:
 	Used by the live fleet map page. Filtered down to drivers that are
 	online (any status other than Offline) and have a recent ping.
 	"""
+	role_registry.require("tracking_view", _("view the live fleet map"))
 	# Only return rows where geo fields exist; otherwise nothing to plot.
 	if not (_driver_has_field("current_lat") and _driver_has_field("current_lng")):
 		return []
@@ -179,8 +207,30 @@ def get_live_drivers(status: str | None = None) -> list[dict]:
 		] + (["current_speed_kmh"] if _driver_has_field("current_speed_kmh") else [])
 		  + (["current_heading"] if _driver_has_field("current_heading") else []),
 		filters=filters,
-		limit_page_length=500,
+		limit_page_length=role_registry.get_int_setting("ops_driver_row_limit", 200),
 	)
+	trip_names = {row.get("current_trip") for row in rows if row.get("current_trip")}
+	trip_scopes = {
+		row.name: row
+		for row in frappe.get_all(
+			"CH Logistics Trip",
+			filters={"name": ["in", list(trip_names) or ["__none__"]]},
+			fields=["name", "hub_warehouse", "company"],
+		)
+	}
+	visible = []
+	for row in rows:
+		trip = row.get("current_trip")
+		if trip:
+			trip_scope = trip_scopes.get(trip) or {}
+			if not scope_guard.is_in_scope(
+				warehouse=trip_scope.get("hub_warehouse"), company=trip_scope.get("company")
+			):
+				continue
+		elif not scope_guard.is_in_scope():
+			continue
+		visible.append(row)
+	rows = visible
 	# Coerce numeric fields for clean JSON.
 	for r in rows:
 		r["current_lat"] = flt(r.get("current_lat"))
@@ -195,14 +245,17 @@ def get_driver_trail(driver: str | None = None, minutes: int = 60,
 					 limit: int = 500) -> list[dict]:
 	"""Recent positions for a driver (default: self, last hour, ≤500 pts)."""
 	driver = driver or _current_driver()
-	since = add_to_date(now_datetime(), minutes=-cint(minutes))
+	_authorize_driver_read(driver)
+	minutes = min(max(cint(minutes), 1), 1440)
+	limit = min(max(cint(limit), 1), 500)
+	since = add_to_date(now_datetime(), minutes=-minutes)
 	rows = frappe.get_all(
 		"CH Driver Location",
 		fields=["name", "captured_at", "latitude", "longitude",
 				"speed_kmh", "heading", "event_type", "trip"],
 		filters={"driver": driver, "captured_at": [">", since]},
 		order_by="captured_at asc",
-		limit_page_length=cint(limit),
+		limit_page_length=limit,
 	)
 	for r in rows:
 		r["latitude"] = flt(r.get("latitude"))
@@ -214,6 +267,7 @@ def get_driver_trail(driver: str | None = None, minutes: int = 60,
 def get_driver_last_position(driver: str | None = None) -> dict | None:
 	"""Last-known position for a driver (driver self-view + popup)."""
 	driver = driver or _current_driver()
+	_authorize_driver_read(driver)
 	if not (_driver_has_field("current_lat") and _driver_has_field("current_lng")):
 		return None
 	d = frappe.db.get_value(
@@ -246,12 +300,20 @@ def purge_old_locations() -> int:
 	if days <= 0:
 		return 0
 	cutoff = add_to_date(now_datetime(), days=-days)
-	deleted = frappe.db.sql(
-		"DELETE FROM `tabCH Driver Location` WHERE captured_at < %s",
-		(cutoff,),
+	limit = role_registry.get_int_setting("location_purge_batch_size", 5000)
+	names = frappe.get_all(
+		"CH Driver Location",
+		filters={"captured_at": ("<", cutoff)},
+		pluck="name",
+		order_by="captured_at asc",
+		limit=limit,
 	)
-	frappe.db.commit()
-	return cint(getattr(deleted, "rowcount", 0))
+	if names:
+		frappe.db.sql(
+			"DELETE FROM `tabCH Driver Location` WHERE name IN %(names)s",
+			{"names": tuple(names)},
+		)
+	return len(names)
 
 
 def mark_stale_drivers_offline() -> int:
@@ -265,6 +327,7 @@ def mark_stale_drivers_offline() -> int:
 	if minutes <= 0:
 		return 0
 	cutoff = add_to_date(now_datetime(), minutes=-minutes)
+	limit = role_registry.get_int_setting("driver_maintenance_batch_size", 500)
 	stale = frappe.get_all(
 		"Driver",
 		filters={
@@ -272,6 +335,8 @@ def mark_stale_drivers_offline() -> int:
 			"last_geo_at": ["<", cutoff],
 		},
 		pluck="name",
+		order_by="last_geo_at asc",
+		limit=limit,
 	)
 	for d in stale:
 		try:
@@ -281,8 +346,6 @@ def mark_stale_drivers_offline() -> int:
 		except Exception:
 			frappe.db.set_value("Driver", d, "availability_status", "Offline",
 								update_modified=False)
-	if stale:
-		frappe.db.commit()
 	return len(stale)
 
 
@@ -359,16 +422,19 @@ def _maybe_recompute_trip_eta(trip: str, min_interval_sec: int = 45) -> None:
 
 	cache = frappe.cache()
 	key = f"ch_logistics:eta_refresh:{trip}"
-	now_ts = int(now_datetime().timestamp())
-	last = cache.get_value(key)
 	try:
-		last_ts = int(last) if last is not None else 0
+		acquired = cache.set(
+			name=cache.make_key(key),
+			value=b"1",
+			ex=max(cint(min_interval_sec), 5),
+			nx=True,
+		)
 	except Exception:
-		last_ts = 0
-	if last_ts and (now_ts - last_ts) < max(cint(min_interval_sec), 5):
+		# A broken throttle backend must not turn every GPS ping into an ETA
+		# recomputation storm.
 		return
-
-	cache.set_value(key, now_ts, expires_in_sec=max(cint(min_interval_sec) * 3, 180))
+	if not acquired:
+		return
 	try:
 		from ch_logistics.api.optimizer import compute_trip_eta
 

@@ -82,7 +82,7 @@ def _ensure_stub_stock_entry(source_wh):
     don't care which one (we're testing the cascade routing, not the
     receiving-side SE sync), so we hunt for any existing submitted SE
     in the database and reuse it across every manifest. This mirrors
-    what the dispatcher tests in _e2e_pos_multi_pickup.py do.
+    what the dispatcher pickup flow does.
     """
     se = frappe.db.get_value(
         "Stock Entry", {"docstatus": 1, "stock_entry_type": "Material Transfer"}, "name")
@@ -107,7 +107,10 @@ def _make_manifest(source_wh, dest_wh, dest_store, idx, stub_se):
     m.destination_warehouse = dest_wh
     m.destination_store = dest_store
     m.status = "Packed"
-    m.qr_payload = f"{_TAG}-M{idx}"
+    # ≥22 chars + != name: passes the secure-QR-token guard the same way
+    # production minting (frappe.generate_hash on validate) does, while the
+    # _TAG prefix keeps the LIKE-based teardown working.
+    m.qr_payload = f"{_TAG}-" + frappe.generate_hash(length=24)
     # Anchor the reqd transfers table so subsequent self.save() calls
     # inside start_pickup / complete_delivery pass the mandatory check.
     m.append("transfers", {"stock_entry": stub_se})
@@ -297,13 +300,25 @@ def run():
 
         # Pull every manifest's delivery_otp and assert they're identical
         # and non-blank. This is the linchpin: the driver types ONE code.
+        # OTPs are hashed at rest (hmac-sha256$...) — assert digest form,
+        # then broadcast a KNOWN otp through the same digest helper so the
+        # happy-path verify below exercises the real hmac compare.
+        from ch_logistics.logistics.doctype.ch_transfer_manifest.ch_transfer_manifest import (
+            delivery_otp_digest,
+        )
         otps = {mname: frappe.db.get_value("CH Transfer Manifest", mname, "delivery_otp")
                 for mname in manifests}
-        shared = otps[m1]
-        _expect(bool(shared) and len(str(shared)) == 6,
-                f"shared OTP is a 6-digit string (got {shared!r})")
-        _expect(all(v == shared for v in otps.values()),
+        stored = otps[m1]
+        _expect(bool(stored) and str(stored).startswith("hmac-sha256$"),
+                f"stored OTP is an hmac digest, not plaintext (got {stored!r})")
+        _expect(all(v == stored for v in otps.values()),
                 f"every manifest carries the SAME delivery_otp ({otps})")
+        shared = "123456"
+        known_digest = delivery_otp_digest(shared)
+        for mname in manifests:
+            frappe.db.set_value("CH Transfer Manifest", mname, "delivery_otp",
+                                known_digest, update_modified=False)
+        frappe.db.commit()
 
         # Each manifest's arrival_datetime must now be set so
         # complete_delivery's gate is satisfied.
@@ -312,31 +327,24 @@ def run():
             _expect(bool(arr), f"{mname} has arrival_datetime stamped")
 
         # ── Step 7 : Negative — wrong OTP refused ─────────────────
-        # Important: the stop-level delivery_token in `scanned_qr` is
-        # correct here, so `complete_stop_delivery` runs the per-manifest
-        # cascade. Each per-manifest `complete_delivery` raises
-        # ValidationError on the OTP mismatch, which the cascade catches
-        # and surfaces via the `skipped` list (NOT a re-raise). Same
-        # contract as start_stop_pickup. We assert all 3 are skipped with
-        # an OTP-related reason, and none flipped to Delivered.
+        # Contract (hardened): the stop cascade is ALL-OR-NOTHING — a wrong
+        # OTP aborts the entire request transaction with ValidationError
+        # (no partial `skipped` list anymore), so no manifest can slip
+        # through a mixed-result drop.
         print("== complete_stop_delivery: wrong OTP refused ==")
-        wrong_otp_res = api.complete_stop_delivery(
-            trip=trip, sequence=stop_seq,
-            scanned_qr=delivery_token,
-            delivery_photo=_PHOTO,
-            receiver_name="Store Manager",
-            otp="000000",
-            lat=_BLR_LAT, lng=_BLR_LNG,
-        )
-        _expect(not wrong_otp_res.get("delivered"),
-                f"no manifests delivered on wrong OTP (got {wrong_otp_res.get('delivered')})")
-        skipped_names = {row["name"] for row in (wrong_otp_res.get("skipped") or [])}
-        _expect(skipped_names == set(manifests),
-                f"all 3 manifests skipped on wrong OTP (got {skipped_names})")
-        for row in (wrong_otp_res.get("skipped") or []):
-            reason = (row.get("reason") or "").lower()
-            _expect("otp" in reason or "invalid" in reason,
-                    f"{row['name']} skipped reason mentions OTP ({row.get('reason')})")
+        try:
+            api.complete_stop_delivery(
+                trip=trip, sequence=stop_seq,
+                scanned_qr=delivery_token,
+                delivery_photo=_PHOTO,
+                receiver_name="Store Manager",
+                otp="000000",
+                lat=_BLR_LAT, lng=_BLR_LNG,
+            )
+            _expect(False, "wrong OTP should abort the whole stop delivery")
+        except frappe.ValidationError as exc:
+            _expect("otp" in str(exc).lower(),
+                    f"wrong OTP rejected atomically ({exc})")
 
         # Sanity: still In Transit.
         for mname in manifests:

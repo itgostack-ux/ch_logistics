@@ -102,7 +102,7 @@ def current_driver():
     side-effect so opening a report never silently mints a Driver record.
     """
     from ch_logistics.api.driver_resolver import resolve_current_driver
-    return resolve_current_driver(throw=False, auto_provision_admin=False)
+    return resolve_current_driver(throw=False)
 
 
 def is_ops_user():

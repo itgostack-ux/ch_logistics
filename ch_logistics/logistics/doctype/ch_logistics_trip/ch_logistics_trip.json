@@ -40,7 +40,11 @@
   "sec_exceptions",
   "exceptions",
   "sec_notes",
-  "notes"
+  "notes",
+  "sec_cancellation",
+  "cancelled_by",
+  "cancelled_on",
+  "cancellation_reason"
  ],
  "fields": [
   {
@@ -247,6 +251,35 @@
    "fieldname": "notes",
    "fieldtype": "Small Text",
    "label": "Notes"
+  },
+  {
+   "fieldname": "sec_cancellation",
+   "fieldtype": "Section Break",
+   "label": "Cancellation",
+   "collapsible": 1,
+   "depends_on": "eval:doc.status=='Cancelled'"
+  },
+  {
+   "fieldname": "cancelled_by",
+   "fieldtype": "Link",
+   "label": "Cancelled By",
+   "options": "User",
+   "read_only": 1,
+   "no_copy": 1
+  },
+  {
+   "fieldname": "cancelled_on",
+   "fieldtype": "Datetime",
+   "label": "Cancelled On",
+   "read_only": 1,
+   "no_copy": 1
+  },
+  {
+   "fieldname": "cancellation_reason",
+   "fieldtype": "Small Text",
+   "label": "Cancellation Reason",
+   "read_only": 1,
+   "no_copy": 1
   }
  ],
  "links": [],
@@ -257,38 +290,68 @@
  "owner": "Administrator",
  "permissions": [
   {
-   "create": 1,
-   "delete": 1,
-   "email": 1,
-   "export": 1,
-   "print": 1,
-   "read": 1,
-   "report": 1,
    "role": "System Manager",
-   "share": 1,
+   "read": 1,
+   "write": 1,
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "import": 1,
+   "print": 1,
+   "report": 1,
+   "share": 1
+  },
+  {
+   "permlevel": 1,
+   "read": 1,
+   "role": "System Manager",
    "write": 1
   },
   {
+   "role": "Operations Manager",
+   "read": 1,
+   "write": 1,
    "create": 1,
    "delete": 1,
    "email": 1,
    "export": 1,
    "print": 1,
-   "read": 1,
    "report": 1,
-   "role": "Operations Manager",
-   "share": 1,
-   "write": 1
+   "share": 1
   },
   {
+   "role": "Stock User",
+   "read": 1,
+   "write": 1,
    "create": 1,
    "email": 1,
    "export": 1,
    "print": 1,
+   "report": 1
+  },
+  {
+   "role": "Delivery Manager",
    "read": 1,
-   "report": 1,
-   "role": "Stock User",
+   "write": 1,
+   "create": 1
+  },
+  {
+   "role": "Delivery User",
+   "read": 1,
    "write": 1
+  },
+  {
+   "role": "Logistics Head",
+   "read": 1,
+   "write": 1,
+   "create": 1
+  },
+  {
+   "role": "Logistic Head",
+   "read": 1,
+   "write": 1,
+   "create": 1
   }
  ],
  "sort_field": "modified",

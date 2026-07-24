@@ -20,6 +20,8 @@ import frappe
 from frappe import _
 from frappe.utils import add_to_date, cint, now_datetime
 
+from ch_logistics.roles import get_int_setting
+
 # Canonical states ----------------------------------------------------------
 OFFLINE = "Offline"
 AVAILABLE = "Available"
@@ -134,6 +136,7 @@ def auto_mark_idle():
     if not _auto_idle_enabled():
         return 0
     cutoff = add_to_date(now_datetime(), minutes=-_idle_timeout_minutes())
+    limit = get_int_setting("driver_maintenance_batch_size", 500)
     stale = frappe.get_all(
         "Driver",
         filters={
@@ -141,12 +144,12 @@ def auto_mark_idle():
             "last_active": ["<", cutoff],
         },
         pluck="name",
+        order_by="last_active asc",
+        limit=limit,
     )
     for driver in stale:
         # touch_activity=False: going Idle must NOT refresh the heartbeat.
         set_status(driver, IDLE, force=True, touch_activity=False)
-    if stale:
-        frappe.db.commit()
     return len(stale)
 
 
@@ -177,7 +180,7 @@ def status_counts() -> dict:
 # --------------------------------------------------------------------------
 def _driver_for_user(user: str | None) -> str | None:
     """Resolve the Driver doc whose ``user`` link matches the given User name."""
-    if not user or user in ("Administrator", "Guest"):
+    if not user or user == "Guest":
         return None
     try:
         return frappe.db.get_value("Driver", {"user": user}, "name")
@@ -202,7 +205,6 @@ def handle_user_login(login_manager=None):
         current = get_status(driver)
         if current in (None, OFFLINE):
             set_status(driver, AVAILABLE, force=True)
-            frappe.db.commit()
     except Exception:
         frappe.log_error(frappe.get_traceback(),
                          f"on_login driver-status sync failed for {user}")
@@ -223,7 +225,6 @@ def handle_user_logout(login_manager=None):
         return
     try:
         set_status(driver, OFFLINE, force=True, touch_activity=False)
-        frappe.db.commit()
     except Exception:
         frappe.log_error(frappe.get_traceback(),
                          f"on_logout driver-status sync failed for {user}")

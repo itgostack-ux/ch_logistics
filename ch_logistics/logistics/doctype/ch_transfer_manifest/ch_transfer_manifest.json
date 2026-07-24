@@ -79,6 +79,12 @@
   "return_confirmed_by",
   "return_confirmed_at",
   "reversed_stock_entries",
+  "sec_freight",
+  "total_weight_kg",
+  "freight_amount",
+  "col_break_freight",
+  "freight_account",
+  "freight_journal_entry",
   "direction",
   "stop_sequence",
   "shipment_priority",
@@ -390,13 +396,18 @@
    "fieldname": "delivery_otp",
    "fieldtype": "Data",
    "hidden": 1,
-   "label": "Delivery OTP"
+   "label": "Delivery OTP Digest",
+   "no_copy": 1,
+   "permlevel": 1,
+   "read_only": 1
   },
   {
    "fieldname": "delivery_otp_verified",
    "fieldtype": "Check",
    "default": "0",
    "label": "OTP Verified",
+   "no_copy": 1,
+   "permlevel": 1,
    "read_only": 1
   },
   {
@@ -607,7 +618,10 @@
    "fieldname": "qr_payload",
    "fieldtype": "Small Text",
    "label": "QR Payload",
-   "hidden": 1
+   "hidden": 1,
+   "no_copy": 1,
+   "permlevel": 1,
+   "read_only": 1
   }
  ],
  "index_web_pages_for_search": 0,
@@ -621,73 +635,98 @@
  "owner": "Administrator",
  "permissions": [
   {
-   "cancel": 1,
-   "create": 1,
-   "delete": 1,
-   "email": 1,
-   "export": 1,
-   "print": 1,
-   "read": 1,
-   "report": 1,
    "role": "System Manager",
-   "share": 1,
-   "submit": 1,
-   "write": 1
-  },
-  {
-   "cancel": 1,
-   "create": 1,
-   "delete": 1,
-   "email": 1,
-   "export": 1,
-   "print": 1,
-   "read": 1,
-   "report": 1,
-   "role": "Stock Manager",
-   "share": 1,
-   "submit": 1,
-   "write": 1
-  },
-  {
-   "cancel": 1,
-   "create": 1,
-   "delete": 1,
-   "email": 1,
-   "export": 1,
-   "print": 1,
-   "read": 1,
-   "report": 1,
-   "role": "Delivery Manager",
-   "share": 1,
-   "submit": 1,
-   "write": 1
-  },
-  {
-   "email": 1,
-   "export": 1,
-   "print": 1,
-   "read": 1,
-   "report": 1,
-   "role": "Store Manager",
-   "share": 1,
-   "write": 1
-  },
-  {
-   "create": 1,
-   "email": 1,
-   "export": 1,
-   "print": 1,
-   "read": 1,
-   "report": 1,
-   "role": "Stock User",
-   "share": 1,
-   "submit": 1,
-   "write": 1
-  },
-  {
    "read": 1,
    "write": 1,
-   "role": "Delivery User"
+   "create": 1,
+   "delete": 1,
+   "submit": 1,
+   "cancel": 1,
+   "amend": 1,
+   "email": 1,
+   "export": 1,
+   "import": 1,
+   "print": 1,
+   "report": 1,
+   "share": 1
+  },
+  {
+   "permlevel": 1,
+   "read": 1,
+   "role": "System Manager",
+   "write": 1
+  },
+  {
+   "role": "Stock Manager",
+   "read": 1,
+   "write": 1,
+   "create": 1,
+   "delete": 1,
+   "submit": 1,
+   "cancel": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "report": 1,
+   "share": 1
+  },
+  {
+   "role": "Delivery Manager",
+   "read": 1,
+   "write": 1,
+   "create": 1,
+   "delete": 1,
+   "submit": 1,
+   "cancel": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "report": 1,
+   "share": 1
+  },
+  {
+   "role": "Store Manager",
+   "read": 1,
+   "write": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "report": 1,
+   "share": 1
+  },
+  {
+   "role": "Stock User",
+   "read": 1,
+   "write": 1,
+   "create": 1,
+   "submit": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "report": 1,
+   "share": 1
+  },
+  {
+   "role": "Delivery User",
+   "read": 1,
+   "write": 1
+  },
+  {
+   "role": "Operations Manager",
+   "read": 1,
+   "write": 1,
+   "create": 1,
+   "submit": 1
+  },
+  {
+   "role": "Logistics Head",
+   "read": 1,
+   "write": 1
+  },
+  {
+   "role": "Logistic Head",
+   "read": 1,
+   "write": 1
   }
  ],
  "sort_field": "manifest_date",

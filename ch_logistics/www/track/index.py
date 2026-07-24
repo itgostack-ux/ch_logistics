@@ -28,5 +28,9 @@ def get_context(context):
 
     context.found = True
     context.t = data
-    context.maps_key = frappe.db.get_single_value("CH Tracking Settings", "google_maps_api_key") or ""
+    from ch_logistics.logistics.doctype.ch_tracking_settings.ch_tracking_settings import (
+        get_google_maps_api_key,
+    )
+
+    context.maps_key = get_google_maps_api_key()
     return context

@@ -384,10 +384,17 @@ class DeliveryApp {
                     <i class="fa fa-exclamation-triangle"></i> ${__("Failed Delivery (mid-trip)")}
                 </button>`;
             }
-        } else if (d.status === "Delivered" || d.status === "Received" || d.status === "Partially Received") {
+        } else if (d.status === "Received" || d.status === "Partially Received") {
             action_html = `<button id="da-manifest-close-btn" class="btn btn-success btn-lg btn-block da-action-btn">
                 <i class="fa fa-archive"></i> ${__("Close Manifest")}
             </button>`;
+        } else if (d.status === "Delivered") {
+            // Delivered = goods handed over, driver's job done. Closing is the
+            // destination store's step (Scan & Receive posts the stock), so
+            // the driver app must not offer a Close that would skip it.
+            action_html = `<div class="da-awaiting-receipt text-muted" style="text-align:center;padding:12px;">
+                <i class="fa fa-clock-o"></i> ${__("Delivered — awaiting destination-store receipt (Scan & Receive). The trip closes automatically once every shipment is received.")}
+            </div>`;
         }
 
         $c.html(`
@@ -778,7 +785,13 @@ class DeliveryApp {
                 {
                     fieldname: "rejection_photo",
                     fieldtype: "Attach Image",
-                    label: __("Proof Photo"),
+                    label: __("Proof Photo 1"),
+                    reqd: 1,
+                },
+                {
+                    fieldname: "rejection_photo_2",
+                    fieldtype: "Attach Image",
+                    label: __("Proof Photo 2"),
                     reqd: 1,
                 },
                 {
@@ -796,6 +809,7 @@ class DeliveryApp {
                         manifest: this.active_manifest,
                         rejection_reason: values.rejection_reason,
                         rejection_photo: values.rejection_photo,
+                        rejection_photo_2: values.rejection_photo_2,
                         rejection_notes: values.rejection_notes,
                     },
                     callback: () => {
@@ -860,7 +874,13 @@ class DeliveryApp {
                 {
                     fieldname: "rejection_photo",
                     fieldtype: "Attach Image",
-                    label: __("Proof Photo (shared)"),
+                    label: __("Proof Photo 1 (shared)"),
+                    reqd: 1,
+                },
+                {
+                    fieldname: "rejection_photo_2",
+                    fieldtype: "Attach Image",
+                    label: __("Proof Photo 2 (shared)"),
                     reqd: 1,
                 },
                 {
@@ -878,6 +898,7 @@ class DeliveryApp {
                         accepted_manifest: accepted,
                         rejection_reason: values.rejection_reason,
                         rejection_photo: values.rejection_photo,
+                        rejection_photo_2: values.rejection_photo_2,
                         rejection_notes: values.rejection_notes,
                     },
                     callback: (r) => {
@@ -1153,9 +1174,11 @@ class DeliveryApp {
                      data-name="${frappe.utils.escape_html(m.name)}">
                     <span><i class="fa fa-file-text-o"></i> ${frappe.utils.escape_html(m.name)}</span>
                     <span class="da-card-status da-status-${(m.status || "").toLowerCase().replace(/\s+/g, "-")}">${frappe.utils.escape_html(m.status)}</span>
-                    ${["Delivered", "Received", "Partially Received"].includes(m.status)
+                    ${["Received", "Partially Received"].includes(m.status)
                         ? `<button class="btn btn-xs btn-success da-stop-manifest-close-btn" data-name="${frappe.utils.escape_html(m.name)}"><i class="fa fa-archive"></i> ${__("Close")}</button>`
-                        : ""}
+                        : (m.status === "Delivered"
+                            ? `<span class="da-awaiting-pill text-muted" style="font-size:11px;" title="${__("The destination store must Scan & Receive this shipment")}"><i class="fa fa-clock-o"></i> ${__("Awaiting receipt")}</span>`
+                            : "")}
                     ${["Assigned", "Pickup Started", "In Transit"].includes(m.status)
                         ? `<button class="btn btn-xs btn-danger da-stop-manifest-reject-btn" data-name="${frappe.utils.escape_html(m.name)}"><i class="fa fa-ban"></i> ${__("Reject")}</button>`
                         : ""}
@@ -1305,10 +1328,10 @@ class DeliveryApp {
         if (window.L && window.L.map) return Promise.resolve(window.L);
         if (this._leaflet_loading) return this._leaflet_loading;
 
-        // Pin a known-good Leaflet release served via unpkg (also mirrored
-        // on cdnjs). Integrity hashes from leafletjs.com release notes.
-        const css_url = "https://unpkg.com/leaflet@1.9.4/dist/leaflet.css";
-        const js_url = "https://unpkg.com/leaflet@1.9.4/dist/leaflet.js";
+        // Use the Leaflet copy shipped with Frappe so production maps do not
+        // depend on a third-party CDN or its availability/security policy.
+        const css_url = "/assets/frappe/js/lib/leaflet/leaflet.css";
+        const js_url = "/assets/frappe/js/lib/leaflet/leaflet.js";
 
         if (!document.querySelector('link[data-da-leaflet-css="1"]')) {
             const link = document.createElement("link");

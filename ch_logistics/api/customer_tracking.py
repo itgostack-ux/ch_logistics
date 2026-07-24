@@ -6,9 +6,13 @@ recipient of an inter-store transfer is the destination store, so notifications
 go to the destination store's contacts, and anyone with the tokenized link sees
 a live status timeline + ETA + driver position.
 """
+import hashlib
+import re
+
 import frappe
 from frappe import _
-from frappe.utils import get_url, now_datetime
+from frappe.rate_limiter import rate_limit
+from frappe.utils import cint, get_url, now_datetime
 
 # Public, recipient-safe status labels (no internal vocabulary leaked).
 _PUBLIC_STATUS = {
@@ -28,7 +32,9 @@ _PUBLIC_STATUS = {
 
 def ensure_token(doc) -> str:
     if not doc.get("tracking_token"):
-        doc.tracking_token = frappe.generate_hash(length=22)
+        # 128 bits of CSPRNG entropy.  The token is a bearer credential, not a
+        # human-facing reference number.
+        doc.tracking_token = frappe.generate_hash(length=32)
     return doc.tracking_token
 
 
@@ -38,19 +44,59 @@ def tracking_url(doc) -> str:
 
 
 # ── public page payload ────────────────────────────────────────────────────
+def _validate_and_throttle_tracking_token(token: str | None) -> str:
+    token = (token or "").strip()
+    # Retain compatibility with already-issued 22-character tokens while all
+    # newly-issued tokens carry 128 bits of entropy.
+    if not 22 <= len(token) <= 64 or not re.fullmatch(r"[A-Za-z0-9_-]+", token):
+        frappe.throw(_("Invalid tracking link."), frappe.PermissionError)
+
+    digest = hashlib.sha256(token.encode()).hexdigest()
+    cache_key = f"ch_logistics_public_tracking::{digest}"
+    limit = min(
+        max(cint(frappe.get_cached_value(
+            "CH Logistics Settings", None, "public_tracking_requests_per_window"
+        ) or 60), 1),
+        1000,
+    )
+    window_seconds = min(
+        max(cint(frappe.get_cached_value(
+            "CH Logistics Settings", None, "public_tracking_window_seconds"
+        ) or 300), 10),
+        3600,
+    )
+    try:
+        cache = frappe.cache()
+        key = cache.make_key(cache_key)
+        cache.set(key, 0, nx=True, ex=window_seconds)
+        count = int(cache.incrby(key, 1))
+        if count == 1:
+            cache.expire(key, window_seconds)
+    except Exception:
+        frappe.log_error(frappe.get_traceback(), "Public tracking limiter unavailable")
+        frappe.throw(
+            _("Tracking protection is temporarily unavailable. Please retry."),
+            frappe.RateLimitExceededError,
+        )
+    if count > limit:
+        frappe.throw(_("Too many tracking requests. Please try again later."), frappe.RateLimitExceededError)
+    return token
+
+
 @frappe.whitelist(allow_guest=True)
+@rate_limit(limit=60, seconds=300, ip_based=True)
 def get_public_tracking(token: str) -> dict:
     """Recipient-safe tracking payload for the public /track page."""
-    if not token:
-        frappe.throw(_("Invalid tracking link."), frappe.PermissionError)
+    token = _validate_and_throttle_tracking_token(token)
     name = frappe.db.get_value("CH Transfer Manifest", {"tracking_token": token}, "name")
     if not name:
-        frappe.throw(_("Tracking link not found."), frappe.DoesNotExistError)
+        # Do not expose whether a guessed bearer token has a matching record.
+        frappe.throw(_("Invalid tracking link."), frappe.PermissionError)
 
     m = frappe.db.get_value(
         "CH Transfer Manifest", name,
         ["name", "status", "source_warehouse", "destination_warehouse",
-         "source_store", "destination_store", "driver_name", "trip",
+         "source_store", "destination_store", "trip",
          "pickup_datetime", "delivery_datetime", "received_datetime",
          "estimated_delivery_date", "creation"],
         as_dict=True,
@@ -69,7 +115,7 @@ def get_public_tracking(token: str) -> dict:
                 ["latitude", "longitude", "captured_at"],
                 order_by="captured_at desc", as_dict=True)
             if pos and pos.latitude and pos.longitude:
-                driver_pos = {"lat": pos.latitude, "lng": pos.longitude,
+                driver_pos = {"lat": round(float(pos.latitude), 5), "lng": round(float(pos.longitude), 5),
                               "at": str(pos.captured_at)}
     eta = eta or m.estimated_delivery_date
 
@@ -87,7 +133,6 @@ def get_public_tracking(token: str) -> dict:
         "is_delivered": done,
         "from": m.source_store or m.source_warehouse,
         "to": m.destination_store or m.destination_warehouse,
-        "driver_name": (m.driver_name or "").split(" ")[0] if m.driver_name else None,
         "eta": str(eta) if eta else None,
         "driver_position": driver_pos,
         "timeline": [{"label": t["label"], "time": str(t["time"]) if t["time"] else None,
@@ -118,15 +163,17 @@ def notify_destination(manifest_name: str, event: str) -> dict:
             return {"ok": False, "reason": "unknown-event"}
 
         users, emails, phones = _destination_contacts(m.destination_store)
+        from ch_logistics.roles import filter_notification_users
+
+        users = filter_notification_users(users)
 
         # 1. In-app notifications to destination store users.
         for user in users:
-            if user and user not in ("Administrator", "Guest"):
-                frappe.get_doc({
-                    "doctype": "Notification Log", "for_user": user, "type": "Alert",
-                    "subject": subject, "email_content": body,
-                    "document_type": "CH Transfer Manifest", "document_name": m.name,
-                }).insert(ignore_permissions=True)
+            frappe.get_doc({
+                "doctype": "Notification Log", "for_user": user, "type": "Alert",
+                "subject": subject, "email_content": body,
+                "document_type": "CH Transfer Manifest", "document_name": m.name,
+            }).insert(ignore_permissions=True)
 
         # 2. Email (only sends if a working outgoing account is configured).
         if emails:

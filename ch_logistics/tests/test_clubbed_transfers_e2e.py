@@ -198,16 +198,31 @@ def run():
         _expect(len(s1["manifests"]) == 3, f"Store 1 stop has 3 manifests (got {len(s1['manifests'])})")
         _expect(len(s2["manifests"]) == 2, f"Store 2 stop has 2 manifests (got {len(s2['manifests'])})")
 
-        _expect(bool(s1["pickup_token"]) and bool(s1["delivery_token"]),
+        # Raw tokens are no longer exposed in API payloads (client gets only
+        # has_pickup_token / has_delivery_token booleans) — read them from
+        # the DB, which is the trusted side the validators use.
+        def _stop_tokens(seq):
+            return frappe.db.get_value(
+                "CH Logistics Trip Stop",
+                {"parent": trip, "sequence": seq},
+                ["pickup_token", "delivery_token"],
+                as_dict=True,
+            )
+
+        t1 = _stop_tokens(s1["sequence"])
+        t2 = _stop_tokens(s2["sequence"])
+        _expect(bool(t1.pickup_token) and bool(t1.delivery_token),
                 "Store 1 stop minted both tokens")
-        _expect(bool(s2["pickup_token"]) and bool(s2["delivery_token"]),
+        _expect(bool(t2.pickup_token) and bool(t2.delivery_token),
                 "Store 2 stop minted both tokens")
-        _expect(s1["pickup_token"] != s2["pickup_token"],
+        _expect(t1.pickup_token != t2.pickup_token,
                 "stop pickup tokens are unique across stops")
-        _expect(s1["delivery_token"] != s2["delivery_token"],
+        _expect(t1.delivery_token != t2.delivery_token,
                 "stop delivery tokens are unique across stops")
-        _expect(s1["pickup_token"] != s1["delivery_token"],
+        _expect(t1.pickup_token != t1.delivery_token,
                 "pickup and delivery tokens differ within the same stop")
+        _expect(not s1.get("pickup_token") and not s1.get("delivery_token"),
+                "raw tokens are NOT leaked in the API stop payload")
 
         # Move both stops' manifests to 'Assigned' so start_pickup is legal.
         # (In real life this happens via assign_driver + assign_load.)
@@ -241,7 +256,7 @@ def run():
 
         print("== get_stop_label produces printable HTML ==")
         label = api.get_stop_label(trip=trip, sequence=s1["sequence"], kind="pickup")
-        _expect(s1["pickup_token"] in label["token"],
+        _expect(t1.pickup_token in label["token"],
                 "label embeds the pickup_token")
         _expect("<div" in label["html"] and "Stop #" in label["html"],
                 "label HTML structure looks right")

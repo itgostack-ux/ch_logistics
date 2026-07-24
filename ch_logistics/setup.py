@@ -62,6 +62,15 @@ def _provision_access_control():
 	if not frappe.db.exists("DocType", "CH Logistics Role Rule"):
 		return
 	ensure_roles()
+	from ch_erp15.ch_erp15.default_permissions import seed_default_docperms
+	seed_default_docperms({
+		"Warehouse": {
+			"Delivery Manager": {"read", "write"},
+			"Operations Manager": {"read", "write"},
+			"Logistics Head": {"read", "write"},
+			"Logistic Head": {"read", "write"},
+		},
+	})
 
 	settings = frappe.get_doc("CH Logistics Settings")
 	seeded_keys = {row.function_key for row in (settings.get("role_matrix") or [])}

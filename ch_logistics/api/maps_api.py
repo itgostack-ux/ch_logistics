@@ -28,6 +28,11 @@ def get_maps_url(libraries: str = "geometry,marker",
 	"""
 	if frappe.session.user == "Guest":
 		frappe.throw(_("Login required."), frappe.PermissionError)
+	from ch_logistics import roles as role_registry
+	from ch_logistics.api.driver_resolver import resolve_current_driver
+
+	if not resolve_current_driver(throw=False):
+		role_registry.require("tracking_view", _("load logistics maps"))
 
 	key = get_google_maps_api_key()
 	if not key:
