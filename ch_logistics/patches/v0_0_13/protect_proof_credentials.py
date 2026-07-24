@@ -1,4 +1,8 @@
-"""Digest legacy OTPs and rotate proof bearers that were previously readable."""
+"""Digest legacy OTPs and rotate proof bearers that were previously readable.
+
+Runs as post_model_sync so the tracking_token / pickup_token / delivery_token
+columns already exist in the database when we try to bulk-update them.
+"""
 
 import frappe
 
