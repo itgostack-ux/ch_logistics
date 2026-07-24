@@ -40,23 +40,19 @@ def _protect_tracking_custom_field():
         )
 
 
-def _tracking_column_exists():
-    """Authoritative check for the physical ``tracking_token`` column.
-
-    Queries information_schema directly — NOT ``frappe.db.has_column``, which
-    reads a cached column list that can report a column present after it was
-    dropped (or absent right after it is added). During a self-heal we must act
-    on the real schema, so cache staleness can't defeat the guard.
+def _column_exists(doctype, column):
+    """Authoritative check for a physical column via information_schema — NOT
+    ``frappe.db.has_column``, which reads a cached column list that can report a
+    column present after it was dropped (or absent right after it is added). We
+    act on the real schema so cache staleness can't defeat the guards.
     """
     return bool(
         frappe.db.sql(
             """
             SELECT 1 FROM information_schema.columns
-             WHERE table_schema = %s
-               AND table_name = 'tabCH Transfer Manifest'
-               AND column_name = 'tracking_token'
+             WHERE table_schema = %s AND table_name = %s AND column_name = %s
             """,
-            (frappe.conf.db_name,),
+            (frappe.conf.db_name, f"tab{doctype}", column),
         )
     )
 
@@ -73,7 +69,7 @@ def _ensure_tracking_token_column():
     ``Unknown column 'tracking_token' in 'SET'`` on ``bulk_update``. Recreate it
     here so the migrate always succeeds. No-op when the column already exists.
     """
-    if _tracking_column_exists():
+    if _column_exists("CH Transfer Manifest", "tracking_token"):
         return
     from frappe.custom.doctype.custom_field.custom_field import create_custom_fields
 
@@ -94,7 +90,7 @@ def _ensure_tracking_token_column():
     # Add the physical column FIRST via raw DDL — a stale table-columns cache
     # could otherwise fool create_custom_fields()/add_column() into skipping the
     # ALTER. The bulk_update writes to the real column, so this is what matters.
-    if not _tracking_column_exists():
+    if not _column_exists("CH Transfer Manifest", "tracking_token"):
         frappe.db.sql(
             "ALTER TABLE `tabCH Transfer Manifest` "
             "ADD COLUMN `tracking_token` varchar(140)"
@@ -109,9 +105,15 @@ def _ensure_tracking_token_column():
 
 
 def _rotate_manifests():
-    # Defensive: only rotate tracking_token when the column is actually present
-    # (it is ensured in execute(), but never let a schema gap crash migrate).
-    has_tracking = _tracking_column_exists()
+    # Rotate only the bearer columns that physically exist. A schema-drifted DB
+    # may be missing one or more of them, and migrate must never crash on that
+    # (any missing one is simply skipped — there is nothing to rotate).
+    has_qr = _column_exists("CH Transfer Manifest", "qr_payload")
+    has_tracking = _column_exists("CH Transfer Manifest", "tracking_token")
+    has_otp = _column_exists("CH Transfer Manifest", "delivery_otp")
+    if not (has_qr or has_tracking or has_otp):
+        return
+    fields = ["name"] + (["delivery_otp"] if has_otp else [])
     cursor = ""
     while True:
         rows = frappe.get_all(
@@ -121,7 +123,7 @@ def _rotate_manifests():
                 "docstatus": ("<", 2),
                 "status": ("in", _ACTIVE_MANIFEST_STATUSES),
             },
-            fields=["name", "delivery_otp"],
+            fields=fields,
             order_by="name asc",
             limit_page_length=500,
         )
@@ -131,18 +133,36 @@ def _rotate_manifests():
         for row in rows:
             # Every active QR and public tracking bearer was readable at
             # permlevel 0 before this patch, so rotate it unconditionally.
-            values = {"qr_payload": frappe.generate_hash(length=32)}
+            values = {}
+            if has_qr:
+                values["qr_payload"] = frappe.generate_hash(length=32)
             if has_tracking:
                 values["tracking_token"] = frappe.generate_hash(length=32)
-            otp = str(row.delivery_otp or "").strip()
-            if otp and not otp.startswith(_OTP_DIGEST_PREFIX):
-                values["delivery_otp"] = delivery_otp_digest(otp)
-            updates[row.name] = values
-        frappe.db.bulk_update("CH Transfer Manifest", updates, update_modified=False)
+            if has_otp:
+                otp = str(row.get("delivery_otp") or "").strip()
+                if otp and not otp.startswith(_OTP_DIGEST_PREFIX):
+                    values["delivery_otp"] = delivery_otp_digest(otp)
+            if values:
+                updates[row.name] = values
+        if updates:
+            frappe.db.bulk_update("CH Transfer Manifest", updates, update_modified=False)
         cursor = rows[-1].name
 
 
 def _rotate_trip_stops():
+    has_pickup = _column_exists("CH Logistics Trip Stop", "pickup_token")
+    has_delivery = _column_exists("CH Logistics Trip Stop", "delivery_token")
+    if not (has_pickup or has_delivery):
+        return
+
+    def _stop_values():
+        v = {}
+        if has_pickup:
+            v["pickup_token"] = frappe.generate_hash(length=32)
+        if has_delivery:
+            v["delivery_token"] = frappe.generate_hash(length=32)
+        return v
+
     trip_cursor = ""
     while True:
         trips = frappe.get_all(
@@ -166,20 +186,22 @@ def _rotate_trip_stops():
         if stops:
             frappe.db.bulk_update(
                 "CH Logistics Trip Stop",
-                {
-                    name: {
-                        "pickup_token": frappe.generate_hash(length=32),
-                        "delivery_token": frappe.generate_hash(length=32),
-                    }
-                    for name in stops
-                },
+                {name: _stop_values() for name in stops},
                 update_modified=False,
             )
         trip_cursor = trips[-1]
 
 
 def execute():
-    _ensure_tracking_token_column()
+    # Best-effort self-heal. Even if it fails, the rotate helpers below skip any
+    # column that is still missing, so the migrate can never crash on drift.
+    try:
+        _ensure_tracking_token_column()
+    except Exception:
+        frappe.log_error(
+            frappe.get_traceback(),
+            "protect_proof_credentials: tracking_token self-heal failed (continuing)",
+        )
     _protect_tracking_custom_field()
     _rotate_manifests()
     _rotate_trip_stops()
