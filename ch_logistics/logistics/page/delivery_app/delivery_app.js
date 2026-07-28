@@ -321,7 +321,7 @@ class DeliveryApp {
         for (let t of d.transfer_items_detail || []) {
             items_html += `<div class="da-se-group">
                 <div class="da-se-name">${frappe.utils.escape_html(t.stock_entry)}</div>
-                <div class="da-se-route">${frappe.utils.escape_html(t.from_warehouse || "")} → ${frappe.utils.escape_html(t.to_warehouse || "")}</div>`;
+                <div class="da-se-route">${window.ch_wh_label_html ? ch_wh_label_html(t.from_warehouse, "") : frappe.utils.escape_html(t.from_warehouse || "")} → ${window.ch_wh_label_html ? ch_wh_label_html(t.to_warehouse, "") : frappe.utils.escape_html(t.to_warehouse || "")}</div>`;
             for (let item of t.items || []) {
                 items_html += `<div class="da-item-row">
                     <span class="da-item-code">${frappe.utils.escape_html(item.item_code)}</span>

@@ -41,7 +41,7 @@
       </div>
       <div class="mt-meta">
         {{ t.direction or "" }} &middot; {{ t.route or "" }} &middot;
-        {{ t.hub_warehouse or "" }} &middot;
+        {{ t.hub_warehouse | wh_label }} &middot;
         {{ _("Vehicle") }}: {{ t.vehicle_number or "—" }} &middot;
         {{ _("Shipments") }}: {{ t.total_shipments or 0 }}
       </div>
@@ -68,7 +68,7 @@
           <tr>
             <td>{{ s.sequence or loop.index }}</td>
             <td>{{ s.stop_type or "" }}</td>
-            <td>{{ s.store or s.warehouse or "" }}</td>
+            <td>{{ s.store or (s.warehouse | wh_label) or "" }}</td>
             <td>{{ frappe.format_value(s.eta, {"fieldtype": "Datetime"}) if s.eta else "" }}</td>
             <td>{{ frappe.format_value(s.ata, {"fieldtype": "Datetime"}) if s.ata else "" }}</td>
             <td>{{ s.status or "Planned" }}</td>

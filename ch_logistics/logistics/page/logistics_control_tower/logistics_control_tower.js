@@ -146,7 +146,7 @@ class LogisticsCommandCenter {
 	_start_auto_refresh() {
 		this._stop_auto_refresh();
 		this._auto_timer = setInterval(() => {
-			if (this.mode === "overview") this._ov_load();
+			if (this.mode === "overview" && !document.hidden) this._ov_load(true);
 		}, 60000);
 	}
 
@@ -198,13 +198,23 @@ class LogisticsCommandCenter {
 		});
 	}
 
-	_ov_load() {
+	_ov_load(silent = false) {
 		const $ov = $("#lcc-ov");
-		$ov.html(`<div class="lcc-loading"><i class="fa fa-spinner fa-spin"></i> ${__("Loading Overview…")}</div>`);
+		if (this._ov_refreshing) return;
+		this._ov_refreshing = true;
+		if (!silent || !$ov.children().length) {
+			$ov.html(`<div class="lcc-loading"><i class="fa fa-spinner fa-spin"></i> ${__("Loading Overview…")}</div>`);
+		} else {
+			$(`<div class="hub-refresh-indicator"><i class="fa fa-spinner fa-spin"></i> ${__("Updating...")}</div>`).appendTo($ov);
+		}
 		frappe.xcall("ch_erp15.ch_erp15.hub_api.get_logistics_hub_data", this.filters.values())
 			.then((data) => this._ov_render(data))
 			.catch(() => {
-				$ov.html(`<div class="lcc-error-banner"><i class="fa fa-exclamation-circle"></i> ${__("Failed to load overview data.")}</div>`);
+				if (!silent) $ov.html(`<div class="lcc-error-banner"><i class="fa fa-exclamation-circle"></i> ${__("Failed to load overview data.")}</div>`);
+				else frappe.show_alert({ message: __("Update failed. Existing data has been kept."), indicator: "orange" }, 5);
+			}).finally(() => {
+				this._ov_refreshing = false;
+				$ov.find(".hub-refresh-indicator").remove();
 			});
 	}
 
@@ -734,8 +744,8 @@ class LogisticsCommandCenter {
 					<div class="lcc-muted">${m.manifest_date ? frappe.datetime.str_to_user(m.manifest_date) : ""}</div>
 				</td>
 				<td>
-					${frappe.utils.escape_html(m.source_warehouse || "—")}
-					<div class="lcc-muted">→ ${frappe.utils.escape_html(m.destination_warehouse || "—")}</div>
+					${window.ch_wh_label_html ? ch_wh_label_html(m.source_warehouse, "—") : frappe.utils.escape_html(m.source_warehouse || "—")}
+					<div class="lcc-muted">→ ${window.ch_wh_label_html ? ch_wh_label_html(m.destination_warehouse, "—") : frappe.utils.escape_html(m.destination_warehouse || "—")}</div>
 				</td>
 				<td class="tr">${m.total_stock_entries || 0}</td>
 				<td class="tr">${total_qty}</td>
@@ -1238,7 +1248,7 @@ class LogisticsCommandCenter {
 			<td><span class="indicator-pill ${color}">${status}</span></td>
 			<td>${frappe.utils.escape_html(m.direction || "—")}</td>
 			<td><span class="lcc-prio lcc-prio-${(m.shipment_priority || "Normal").toLowerCase()}">${m.shipment_priority || "Normal"}</span></td>
-			<td>${frappe.utils.escape_html(m.source_warehouse || "—")} → ${frappe.utils.escape_html(m.destination_warehouse || "—")}</td>
+			<td>${window.ch_wh_label_html ? ch_wh_label_html(m.source_warehouse, "—") : frappe.utils.escape_html(m.source_warehouse || "—")} → ${window.ch_wh_label_html ? ch_wh_label_html(m.destination_warehouse, "—") : frappe.utils.escape_html(m.destination_warehouse || "—")}</td>
 			<td class="tr">${m.total_qty || 0}</td>
 			<td class="tr">${m.box_count || 0}</td>
 			<td>${frappe.datetime.str_to_user(m.creation)}</td>
@@ -1316,7 +1326,7 @@ class LogisticsCommandCenter {
 				<td><a href="/app/ch-transfer-manifest/${nm}" target="_blank">${frappe.utils.escape_html(r.name)}</a></td>
 				<td>${trip_html}</td>
 				<td>${driver_html}</td>
-				<td>${frappe.utils.escape_html(r.source_warehouse || "—")} ← ${frappe.utils.escape_html(r.destination_warehouse || "—")}</td>
+				<td>${window.ch_wh_label_html ? ch_wh_label_html(r.source_warehouse, "—") : frappe.utils.escape_html(r.source_warehouse || "—")} ← ${window.ch_wh_label_html ? ch_wh_label_html(r.destination_warehouse, "—") : frappe.utils.escape_html(r.destination_warehouse || "—")}</td>
 				<td class="lcc-exc-remarks">${frappe.utils.escape_html(r.recall_reason || "—")}</td>
 				<td><span class="lcc-sev ${age_cls}">${age}</span><div class="lcc-muted">${r.recall_initiated_at ? frappe.datetime.str_to_user(r.recall_initiated_at) : ""}</div></td>
 				<td>
@@ -1498,7 +1508,7 @@ class LogisticsCommandCenter {
 		if (!name) return;
 		const api = "ch_logistics.api.transfer_manifest_api.";
 		const row = (this.recalls || []).find((r) => r.name === name) || {};
-		const src = frappe.utils.escape_html(row.source_warehouse || "—");
+		const src = window.ch_wh_label_html ? ch_wh_label_html(row.source_warehouse, "—") : frappe.utils.escape_html(row.source_warehouse || "—");
 		const d = new frappe.ui.Dialog({
 			title: __("Confirm Return — {0}", [name]),
 			size: "large",
@@ -1601,7 +1611,7 @@ class LogisticsCommandCenter {
 				</div>`).join("") || `<div class="lcc-muted">${__("No manifests")}</div>`;
 			return `<div class="lcc-side-stop">
 				<div class="lcc-side-stop-head">
-					<b>#${s.sequence}</b> ${frappe.utils.escape_html(s.warehouse || "")}
+					<b>#${s.sequence}</b> ${window.ch_wh_label_html ? ch_wh_label_html(s.warehouse, "") : frappe.utils.escape_html(s.warehouse || "")}
 					<span class="lcc-sev lcc-sev-${(s.status || "").toLowerCase().replace(/ /g,"-")}">${s.status}</span>
 				</div>
 				<div class="lcc-side-stop-meta">${s.stop_type || ""} · ETA ${s.eta ? frappe.datetime.str_to_user(s.eta) : "—"}</div>
@@ -1633,7 +1643,7 @@ class LogisticsCommandCenter {
 			<div class="lcc-side-info">
 				<div><b>${__("Driver")}:</b> ${frappe.utils.escape_html(t.driver_name || __("Unassigned"))}${t.driver_phone ? ` · ${t.driver_phone}` : ""}</div>
 				<div><b>${__("Vehicle")}:</b> ${frappe.utils.escape_html(t.vehicle_number || "—")}</div>
-				<div><b>${__("Hub")}:</b> ${frappe.utils.escape_html(t.hub_warehouse || "—")}</div>
+				<div><b>${__("Hub")}:</b> ${window.ch_wh_label_html ? ch_wh_label_html(t.hub_warehouse, "—") : frappe.utils.escape_html(t.hub_warehouse || "—")}</div>
 				<div><b>${__("Shipments")}:</b> ${t.total_shipments || 0}</div>
 				<div><b>${__("Created")}:</b> ${frappe.utils.escape_html(t.created_by || "—")}${t.created_on ? ` · ${frappe.datetime.str_to_user(t.created_on)}` : ""}</div>
 				${t.cancelled_by ? `<div class="lcc-cancel-info"><b>${__("Cancelled")}:</b> ${frappe.utils.escape_html(t.cancelled_by)}${t.cancelled_on ? ` · ${frappe.datetime.str_to_user(t.cancelled_on)}` : ""}${t.cancellation_reason ? `<br><span class="lcc-muted">${frappe.utils.escape_html(t.cancellation_reason)}</span>` : ""}</div>` : ""}
