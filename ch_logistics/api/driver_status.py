@@ -4,7 +4,7 @@ Mirrors how established last-mile fleets (Ekart, Delhivery, Amazon Logistics)
 model a delivery associate's shift lifecycle:
 
     Offline → Available → Assigned → In Transit → Available → … → Offline
-                       ↘ Break ↗
+                       ↘ Break ↗       ↕ Break
                        ↘ Idle  ↗     (auto, inactivity-driven)
 
 The status lives on the ``Driver.availability_status`` custom field (installed
@@ -38,8 +38,8 @@ ALLOWED_TRANSITIONS = {
     OFFLINE:    {AVAILABLE},
     AVAILABLE:  {ASSIGNED, BREAK, IDLE, OFFLINE},
     ASSIGNED:   {IN_TRANSIT, AVAILABLE, OFFLINE},
-    IN_TRANSIT: {AVAILABLE, ASSIGNED, OFFLINE},
-    BREAK:      {AVAILABLE, OFFLINE},
+    IN_TRANSIT: {AVAILABLE, ASSIGNED, BREAK, OFFLINE},
+    BREAK:      {AVAILABLE, IN_TRANSIT, OFFLINE},
     IDLE:       {AVAILABLE, ASSIGNED, OFFLINE},
 }
 

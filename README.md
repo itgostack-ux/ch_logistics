@@ -21,7 +21,7 @@ Migrate the following from `ch_erp15` (kept there for backward-compat shims):
 - Modules: `logistics_api`, `driver_api`, `driver_push`, `driver_status`,
   `transfer_manifest_api`, `buyback_logistics_bridge`
 - Pages: `delivery_app`, `logistics_control_tower`
-- Portal: `www/my-trips`
+- Portal: `www/my-trips` (retired — redirects to `/app/delivery-app`)
 
 ## Install
 ```bash

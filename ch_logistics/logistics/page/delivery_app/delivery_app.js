@@ -410,13 +410,17 @@ class DeliveryApp {
                 <div class="da-detail-route">
                     <div class="da-route-box da-from">
                         <div class="da-route-label">${__("From")}</div>
-                        <div class="da-route-wh">${frappe.utils.escape_html(d.source_store || d.source_warehouse || "—")}</div>
+                        <div class="da-route-wh">${d.source_store
+                            ? frappe.utils.escape_html(d.source_store)
+                            : (window.ch_wh_label_html ? ch_wh_label_html(d.source_warehouse, "—") : frappe.utils.escape_html(d.source_warehouse || "—"))}</div>
                         ${d.source_address ? `<div class="da-route-addr">${frappe.utils.escape_html(d.source_address)}</div>` : ""}
                     </div>
                     <div class="da-route-arrow"><i class="fa fa-long-arrow-right fa-2x"></i></div>
                     <div class="da-route-box da-to">
                         <div class="da-route-label">${__("To")}</div>
-                        <div class="da-route-wh">${frappe.utils.escape_html(d.destination_store || d.destination_warehouse || "—")}</div>
+                        <div class="da-route-wh">${d.destination_store
+                            ? frappe.utils.escape_html(d.destination_store)
+                            : (window.ch_wh_label_html ? ch_wh_label_html(d.destination_warehouse, "—") : frappe.utils.escape_html(d.destination_warehouse || "—"))}</div>
                         ${d.destination_address ? `<div class="da-route-addr">${frappe.utils.escape_html(d.destination_address)}</div>` : ""}
                     </div>
                 </div>
@@ -1065,7 +1069,9 @@ class DeliveryApp {
             if (valid_latlng(lat, lng)) {
                 map_points.push({
                     seq: s.sequence,
-                    label: s.store || s.warehouse || "Stop",
+                    label: s.store
+                        || (window.ch_wh_label ? ch_wh_label(s.warehouse) : s.warehouse)
+                        || "Stop",
                     stop_type: s.stop_type || "",
                     status: s.status || "",
                     lat,
@@ -1226,7 +1232,9 @@ class DeliveryApp {
                     </div>
                     <div class="da-stop-where">
                         <i class="fa fa-map-marker"></i>
-                        ${frappe.utils.escape_html(s.store || s.warehouse || "—")}
+                        ${s.store
+                            ? frappe.utils.escape_html(s.store)
+                            : (window.ch_wh_label_html ? ch_wh_label_html(s.warehouse, "—") : frappe.utils.escape_html(s.warehouse || "—"))}
                     </div>
                     ${completion_hint}
                     ${manifests_html ? `<div class="da-stop-manifests">${manifests_html}</div>` : ""}
@@ -1512,7 +1520,9 @@ class DeliveryApp {
         const manifest_rows_html = source_manifests.map((m) => `
             <div class="da-stop-batch-row" style="border:1px solid #eee;border-radius:6px;padding:6px 8px;margin-bottom:6px;">
                 <div style="font-weight:600;font-size:12px;">${frappe.utils.escape_html(m.name)}</div>
-                <div class="text-muted" style="font-size:11px;">${frappe.utils.escape_html(m.destination_store || m.destination_warehouse || "—")}</div>
+                <div class="text-muted" style="font-size:11px;">${m.destination_store
+                    ? frappe.utils.escape_html(m.destination_store)
+                    : (window.ch_wh_label_html ? ch_wh_label_html(m.destination_warehouse, "—") : frappe.utils.escape_html(m.destination_warehouse || "—"))}</div>
             </div>`).join("");
 
         const qr_fields = source_manifests.map((m) => ({
@@ -1956,7 +1966,9 @@ class DeliveryApp {
         const manifest_rows_html = candidates.map((m) => `
             <div class="da-stop-batch-row" style="border:1px solid #eee;border-radius:6px;padding:6px 8px;margin-bottom:6px;">
                 <div style="font-weight:600;font-size:12px;">${frappe.utils.escape_html(m.name)}</div>
-                <div class="text-muted" style="font-size:11px;">${frappe.utils.escape_html(m.destination_store || m.destination_warehouse || "—")}</div>
+                <div class="text-muted" style="font-size:11px;">${m.destination_store
+                    ? frappe.utils.escape_html(m.destination_store)
+                    : (window.ch_wh_label_html ? ch_wh_label_html(m.destination_warehouse, "—") : frappe.utils.escape_html(m.destination_warehouse || "—"))}</div>
             </div>`).join("");
 
         const qr_fields = candidates.map((m) => ({
@@ -1970,7 +1982,9 @@ class DeliveryApp {
             {
                 fieldname: "summary", fieldtype: "HTML",
                 options: `<div class="alert alert-info" style="padding:8px 10px;border-radius:6px;margin-bottom:8px;">
-                    <strong><i class="fa fa-map-marker"></i> ${frappe.utils.escape_html(stop.store || stop.warehouse || "—")}</strong>
+                    <strong><i class="fa fa-map-marker"></i> ${stop.store
+                        ? frappe.utils.escape_html(stop.store)
+                        : (window.ch_wh_label_html ? ch_wh_label_html(stop.warehouse, "—") : frappe.utils.escape_html(stop.warehouse || "—"))}</strong>
                     <div style="font-size:12px;">${__("Picking up {0} manifest(s) at this stop.", [candidates.length])}</div>
                 </div>
                 <div class="da-stop-batch-list">${manifest_rows_html}</div>`,
@@ -2179,7 +2193,9 @@ class DeliveryApp {
             {
                 fieldname: "summary", fieldtype: "HTML",
                 options: `<div class="alert alert-info" style="padding:8px 10px;border-radius:6px;margin-bottom:8px;">
-                    <strong><i class="fa fa-map-marker"></i> ${frappe.utils.escape_html(stop.store || stop.warehouse || "—")}</strong>
+                    <strong><i class="fa fa-map-marker"></i> ${stop.store
+                        ? frappe.utils.escape_html(stop.store)
+                        : (window.ch_wh_label_html ? ch_wh_label_html(stop.warehouse, "—") : frappe.utils.escape_html(stop.warehouse || "—"))}</strong>
                     <div style="font-size:12px;">${__("Delivering {0} manifest(s) at this stop.", [ready.length])}</div>
                 </div>
                 <div class="da-stop-batch-list">${ready_rows_html}</div>
@@ -2301,7 +2317,9 @@ class DeliveryApp {
         const manifest_rows_html = candidates.map((m) => `
             <div class="da-stop-batch-row" style="border:1px solid #eee;border-radius:6px;padding:6px 8px;margin-bottom:6px;">
                 <div style="font-weight:600;font-size:12px;">${frappe.utils.escape_html(m.name)}</div>
-                <div class="text-muted" style="font-size:11px;">${frappe.utils.escape_html(m.destination_store || m.destination_warehouse || "—")}</div>
+                <div class="text-muted" style="font-size:11px;">${m.destination_store
+                    ? frappe.utils.escape_html(m.destination_store)
+                    : (window.ch_wh_label_html ? ch_wh_label_html(m.destination_warehouse, "—") : frappe.utils.escape_html(m.destination_warehouse || "—"))}</div>
             </div>`).join("");
 
         const fields = [

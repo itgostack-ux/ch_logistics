@@ -1,72 +1,42 @@
-"""Driver-facing 'My Trips' portal page.
+"""Retired driver portal page — redirects to the Delivery App.
 
-Shows the logged-in driver's CH Logistics Trips for today (+/- include_days),
-with per-stop checkin/checkout buttons that hit the existing whitelisted
-`logistics_api.stop_arrive` / `stop_complete` endpoints.
+This page used to render its own stop table with per-stop Arrive / Complete
+buttons. It was a second, weaker driver UI alongside ``/app/delivery-app`` and
+had to go for two reasons:
+
+1. Its buttons could not work standalone. ``stop_arrive`` / ``stop_complete``
+   both require ``trip.status == "Started"``, and this page offered no way to
+   accept and start a trip — so on an Assigned trip both actions just errored.
+
+2. More seriously, on an already-Started trip it advanced stops to
+   Arrived / Completed WITHOUT touching the manifests. Manifests stayed
+   ``Assigned`` with no pickup photo, no QR scan and no receiver OTP, while the
+   trip's stops read Completed — a chain-of-custody proof bypass.
+
+The Delivery App is the single driver surface: it owns the three-stage
+manifest contract (Assigned → In Transit → Delivered), pickup/delivery proof
+capture, manifest rejection and the trip stop graph.
+
+The route is kept alive as a redirect rather than deleted because drivers have
+the URL bookmarked and it appears in the user guide.
 """
 from __future__ import annotations
 
 import frappe
-from frappe import _
-from frappe.utils import add_days, getdate, today
-
-from ch_logistics.api.driver_resolver import resolve_current_driver
-from ch_logistics.roles import user_has
 
 no_cache = 1
 
+#: Canonical driver surface. Desk page ``delivery-app`` (see
+#: ``logistics/page/delivery_app``).
+DELIVERY_APP_ROUTE = "/app/delivery-app"
+
 
 def get_context(context):
-    user = frappe.session.user
-    if user in ("Guest", ""):
-        frappe.local.flags.redirect_location = "/login?redirect-to=/my-trips"
-        raise frappe.Redirect
+	user = frappe.session.user
+	if user in ("Guest", ""):
+		# Land on the Delivery App after login, not back on this stub.
+		frappe.local.flags.redirect_location = f"/login?redirect-to={DELIVERY_APP_ROUTE}"
+		raise frappe.Redirect
 
-    driver_name = resolve_current_driver(throw=False)
-    driver = frappe.db.get_value(
-        "Driver", driver_name, ["name", "full_name", "cell_number"], as_dict=True
-    ) if driver_name else None
-    can_preview = user_has("ops_view", user)
-    if not driver and not can_preview:
-        context.error = _("Your account is not linked to a driver record. "
-                          "Please contact dispatch.")
-        context.trips = []
-        context.title = _("My Trips")
-        return context
-
-    today_d = getdate(today())
-    yesterday = add_days(today_d, -1)
-    tomorrow = add_days(today_d, 1)
-
-    filters = {"trip_date": ["between", [yesterday, tomorrow]]}
-    if driver:
-        filters["driver"] = driver.name
-    else:
-        # Admin preview: show any recent trip
-        pass
-
-    trips = frappe.get_all(
-        "CH Logistics Trip",
-        filters=filters,
-        fields=["name", "trip_date", "status", "direction", "route",
-                "hub_warehouse", "planned_start", "planned_end",
-                "vehicle_number", "total_shipments"],
-        order_by="trip_date desc, planned_start asc",
-        limit=10,
-    )
-
-    for t in trips:
-        t["stops"] = frappe.get_all(
-            "CH Logistics Trip Stop",
-            filters={"parent": t.name, "parenttype": "CH Logistics Trip"},
-            fields=["name", "sequence", "stop_type", "store", "warehouse",
-                    "eta", "ata", "status", "manifest_count", "notes"],
-            order_by="sequence asc",
-        )
-
-    context.title = _("My Trips")
-    context.driver = driver or {"name": "—", "full_name": _("Operations preview")}
-    context.trips = trips
-    context.today = today_d
-    context.no_cache = 1
-    return context
+	frappe.local.flags.redirect_location = DELIVERY_APP_ROUTE
+	raise frappe.Redirect

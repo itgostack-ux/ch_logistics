@@ -125,7 +125,7 @@ def heartbeat(lat=None, lng=None):
 
 @frappe.whitelist(methods=["POST"])
 def set_break(break_type: str = "Rest", reason: str = None, lat=None, lng=None, trip: str = None):
-    """Driver starts a break — Available → Break (FR-042).
+    """Driver starts a break — Available/In Transit → Break (FR-042).
 
     Also writes a CH Driver Break Log row so the Monthly Driver KPI
     report has an audit trail of break-time.  The doctype's
@@ -137,7 +137,14 @@ def set_break(break_type: str = "Rest", reason: str = None, lat=None, lng=None, 
     )
 
     driver = _current_driver()
-    if trip and frappe.db.get_value("CH Logistics Trip", trip, "driver") != driver:
+    # The delivery-app status bar does not send a trip argument. Preserve the
+    # driver's active trip on the break log so Resume can restore In Transit.
+    active_trip = (
+        frappe.db.get_value("Driver", driver, "current_trip")
+        if ds._has_field("current_trip") else None
+    )
+    break_trip = trip or active_trip
+    if break_trip and frappe.db.get_value("CH Logistics Trip", break_trip, "driver") != driver:
         frappe.throw(
             _("You can only start a break against your assigned trip."),
             frappe.PermissionError,
@@ -149,7 +156,7 @@ def set_break(break_type: str = "Rest", reason: str = None, lat=None, lng=None, 
             driver,
             break_type=(break_type or "Rest"),
             reason=reason,
-            trip=trip,
+            trip=break_trip,
             latitude=float(lat) if lat not in (None, "") else None,
             longitude=float(lng) if lng not in (None, "") else None,
         )
@@ -166,7 +173,7 @@ def set_break(break_type: str = "Rest", reason: str = None, lat=None, lng=None, 
 
 @frappe.whitelist(methods=["POST"])
 def end_break(lat=None, lng=None):
-    """Driver resumes from break — Break → Available (FR-043, FR-044).
+    """Resume from break to In Transit for an active trip, else Available.
 
     Closes the newest open CH Driver Break Log row for the driver
     and stamps end_ts + duration_min via the doctype's ``before_save``.
@@ -177,7 +184,14 @@ def end_break(lat=None, lng=None):
     )
 
     driver = _current_driver()
-    ds.set_status(driver, ds.AVAILABLE)
+    current_trip = (
+        frappe.db.get_value("Driver", driver, "current_trip")
+        if ds._has_field("current_trip") else None
+    )
+    resume_status = ds.AVAILABLE
+    if current_trip and frappe.db.get_value("CH Logistics Trip", current_trip, "status") == "Started":
+        resume_status = ds.IN_TRANSIT
+    ds.set_status(driver, resume_status)
     log_name = None
     try:
         log_name = end_break_for_driver(
@@ -190,7 +204,7 @@ def end_break(lat=None, lng=None):
             frappe.get_traceback(),
             f"CH Driver Break Log end failed for {driver}",
         )
-    return {"driver": driver, "status": ds.AVAILABLE, "break_log": log_name}
+    return {"driver": driver, "status": resume_status, "break_log": log_name}
 
 
 @frappe.whitelist()
