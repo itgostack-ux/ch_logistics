@@ -1,6 +1,6 @@
 {
  "actions": [],
- "creation": "2026-04-08 10:00:00.000000",
+ "creation": "2026-04-08 10:00:00",
  "doctype": "DocType",
  "editable_grid": 1,
  "engine": "InnoDB",
@@ -13,6 +13,8 @@
   "sec_break_items",
   "item_count",
   "total_qty",
+  "distance_km",
+  "trip_time",
   "col_break_2",
   "transfer_status"
  ],
@@ -80,19 +82,30 @@
    "in_list_view": 1,
    "label": "Transfer Status",
    "read_only": 1
+  },
+  {
+   "fieldname": "distance_km",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Trip Distance (KM)"
+  },
+  {
+   "fieldname": "trip_time",
+   "fieldtype": "Datetime",
+   "in_list_view": 1,
+   "label": "Trip Time"
   }
  ],
- "index_web_pages_for_search": 0,
  "istable": 1,
  "links": [],
- "modified": "2026-04-08 10:00:00.000000",
+ "modified": "2026-07-29 13:02:36.642632",
  "modified_by": "Administrator",
  "module": "Logistics",
  "name": "CH Transfer Manifest Item",
  "owner": "Administrator",
  "permissions": [],
+ "row_format": "Dynamic",
  "sort_field": "idx",
  "sort_order": "ASC",
- "states": [],
- "track_changes": 0
+ "states": []
 }
