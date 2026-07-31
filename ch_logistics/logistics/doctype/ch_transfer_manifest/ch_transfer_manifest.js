@@ -209,8 +209,22 @@ function render_lane_banner(frm) {
 }
 
 function add_action_buttons(frm) {
-    if (frm.doc.docstatus !== 1) return;
     const api = "ch_logistics.api.transfer_manifest_api.";
+    if (frm.doc.docstatus === 2) return;
+
+    // A draft manifest can already own transit stock. Keep the controlled
+    // cancellation action available before submit so users never fall back to
+    // deleting/cancelling the document without reversing that stock.
+    const cancellationAllowed = ["Draft", "Packed", "Assigned"];
+    if (!frm.is_new() && cancellationAllowed.includes(frm.doc.status) && !frm.doc.pickup_datetime) {
+        frm.add_custom_button(
+            __("Cancel & Return Stock"),
+            () => show_manifest_cancel_dialog(frm, api),
+            __("Actions")
+        );
+    }
+
+    if (frm.doc.docstatus !== 1) return;
 
     // Driver assignment is handled from the Logistics Trip flow, not per
     // manifest — the "Assign Driver" button was intentionally removed here.
@@ -233,14 +247,26 @@ function add_action_buttons(frm) {
                 frappe.call({
                     method: api + "close_manifest",
                     args: { manifest: frm.doc.name },
-                    callback: () => frm.reload_doc()
+                    callback: (r) => {
+                        const result = (r && r.message) || {};
+                        if (result.ok === false) {
+                            d.show();
+                            frappe.msgprint({
+                                title: __("OTP Verification Failed"),
+                                indicator: "red",
+                                message: result.message || __("Invalid delivery OTP."),
+                            });
+                            return;
+                        }
+                        frm.reload_doc();
+                    }
                 });
             });
         });
     }
 
     // ── Recall / Reversal ─────────────────────────────────────────────
-    const recallAllowed = ["Packed", "Assigned", "In Transit", "Delivered"];
+    const recallAllowed = ["Packed", "Assigned", "Pickup Started", "In Transit", "Delivered"];
     if (recallAllowed.includes(frm.doc.status)) {
         frm.add_custom_button(__("Initiate Recall"), () => show_recall_dialog(frm, api), __("Actions"));
     }
@@ -572,6 +598,51 @@ function capture_gps(callback) {
 
 // ── Recall / Return Dialogs ──────────────────────────────────────────────────
 
+function show_manifest_cancel_dialog(frm, api) {
+    const d = new frappe.ui.Dialog({
+        title: __("Cancel Manifest & Return Stock"),
+        fields: [
+            {
+                fieldtype: "HTML",
+                options: `<div class="alert alert-warning">
+                    <strong>${__("Controlled cancellation")}</strong><br>
+                    ${__("Every linked Stock Entry will be reversed to the source warehouse. The manifest and reversal records remain available for audit.")}
+                </div>`,
+            },
+            {
+                fieldname: "reason",
+                fieldtype: "Small Text",
+                label: __("Cancellation Reason"),
+                reqd: 1,
+            },
+        ],
+        primary_action_label: __("Cancel & Return Stock"),
+        primary_action(values) {
+            frappe.confirm(
+                __("Cancel manifest {0} and restore all linked stock to source?", [frm.doc.name]),
+                () => {
+                    d.hide();
+                    frappe.call({
+                        method: api + "cancel_manifest",
+                        args: { manifest: frm.doc.name, reason: values.reason },
+                        freeze: true,
+                        freeze_message: __("Reversing stock and cancelling manifest..."),
+                        callback(r) {
+                            if (!r.message) return;
+                            frappe.show_alert({
+                                message: r.message.message || __("Manifest cancelled and stock restored."),
+                                indicator: "green",
+                            }, 7);
+                            frm.reload_doc();
+                        },
+                    });
+                }
+            );
+        },
+    });
+    d.show();
+}
+
 function show_recall_dialog(frm, api) {
     let d = new frappe.ui.Dialog({
         title: __("Initiate Transfer Recall"),
@@ -640,9 +711,37 @@ function show_recall_dialog(frm, api) {
     d.show();
 }
 
-function show_return_confirm_dialog(frm, api) {
+async function show_return_confirm_dialog(frm, api) {
+    const response = await frappe.call({
+        method: api + "get_return_requirements",
+        args: { manifest: frm.doc.name },
+        freeze: true,
+        freeze_message: __("Loading return requirements..."),
+    });
+    const requirements = response.message || {};
+    const expected = new Set(requirements.serials || []);
+    const scanned = new Set();
+    const countRows = (requirements.items || []).filter(
+        (row) => !(row.serials || []).length && Number(row.qty || 0) > 0
+    );
+    const countFields = countRows.map((row, index) => ({
+        fieldname: `return_qty_${index}`,
+        fieldtype: "Float",
+        label: __("Counted Qty — {0}", [row.item_code || ""]),
+        description: __("Stock Entry {0}; expected {1}", [row.stock_entry || "", row.qty || 0]),
+        reqd: 1,
+    }));
+    const itemRows = (requirements.items || []).map((row) => `
+        <tr>
+            <td>${frappe.utils.escape_html(row.stock_entry || "")}</td>
+            <td>${frappe.utils.escape_html(row.item_code || "")}</td>
+            <td class="text-right">${row.qty || 0}</td>
+            <td class="text-right">${(row.serials || []).length}</td>
+        </tr>
+    `).join("");
     let d = new frappe.ui.Dialog({
         title: __("Confirm Return to Source"),
+        size: "large",
         fields: [
             {
                 fieldname: "info_html",
@@ -651,11 +750,37 @@ function show_return_confirm_dialog(frm, api) {
                     <strong>Return Checklist:</strong>
                     <ul style="margin:8px 0 0 0;padding-left:18px">
                         <li>All items have been physically returned to <strong>${frm.doc.source_warehouse}</strong></li>
-                        <li>Each item has been scanned / counted and matches the manifest</li>
+                        <li>${__("Each serialized item must be scanned below; duplicates and unknown IMEIs are rejected")}</li>
                         <li>A photo has been taken of the returned items</li>
                     </ul>
-                </div>`
+                    <table class="table table-bordered table-sm" style="margin-top:12px">
+                        <thead><tr>
+                            <th>${__("Stock Entry")}</th><th>${__("Item")}</th>
+                            <th class="text-right">${__("Qty")}</th>
+                            <th class="text-right">${__("IMEIs")}</th>
+                        </tr></thead>
+                        <tbody>${itemRows || `<tr><td colspan="4">${__("No return rows")}</td></tr>`}</tbody>
+                    </table>
+                </div>`,
             },
+            {
+                fieldname: "scan_imei",
+                fieldtype: "Data",
+                label: __("Scan Returned IMEI / Serial and press Enter"),
+                hidden: expected.size === 0,
+            },
+            {
+                fieldname: "scan_progress",
+                fieldtype: "HTML",
+                hidden: expected.size === 0,
+            },
+            ...(countFields.length ? [{
+                fieldname: "count_section",
+                fieldtype: "Section Break",
+                label: __("Count Non-Serialized Items"),
+                description: __("Enter the quantity physically counted. The server requires an exact match."),
+            }] : []),
+            ...countFields,
             {
                 fieldname: "return_photo",
                 fieldtype: "Attach Image",
@@ -666,15 +791,42 @@ function show_return_confirm_dialog(frm, api) {
         ],
         primary_action_label: __("Confirm Return & Reverse Stock"),
         primary_action(values) {
-            d.hide();
+            const missing = [...expected].filter((value) => !scanned.has(value));
+            if (missing.length) {
+                frappe.msgprint({
+                    title: __("Return Scan Incomplete"),
+                    indicator: "red",
+                    message: __("Scan all returned IMEIs. Missing: {0}", [missing.join(", ")]),
+                });
+                return;
+            }
+            const returnedQuantities = countRows.map((row, index) => ({
+                stock_entry: row.stock_entry,
+                row_name: row.row_name,
+                qty: values[`return_qty_${index}`],
+            }));
+            const countMismatch = countRows.find(
+                (row, index) => Number(values[`return_qty_${index}`]) !== Number(row.qty)
+            );
+            if (countMismatch) {
+                frappe.msgprint({
+                    title: __("Return Count Mismatch"),
+                    indicator: "red",
+                    message: __("The counted quantities must match the expected return before stock can be reversed."),
+                });
+                return;
+            }
             frappe.confirm(
                 __("Confirm that all items have been returned? This will reverse the stock entries and cannot be undone."),
                 () => {
+                    d.hide();
                     frappe.call({
                         method: api + "confirm_return",
                         args: {
                             manifest: frm.doc.name,
                             return_photo: values.return_photo,
+                            returned_serials: [...scanned],
+                            returned_quantities: returnedQuantities,
                         },
                         freeze: true,
                         freeze_message: __("Reversing stock entries..."),
@@ -694,4 +846,49 @@ function show_return_confirm_dialog(frm, api) {
         }
     });
     d.show();
+
+    const renderProgress = () => {
+        if (!expected.size) return;
+        const missing = [...expected].filter((value) => !scanned.has(value));
+        const chips = [...scanned].map((value) => `
+            <span class="badge badge-success" style="margin:2px 4px 2px 0">
+                ${frappe.utils.escape_html(value)}
+            </span>
+        `).join("");
+        d.fields_dict.scan_progress.$wrapper.html(`
+            <div class="alert ${missing.length ? "alert-warning" : "alert-success"}" style="padding:10px">
+                <strong>${__("Scanned {0} of {1}", [scanned.size, expected.size])}</strong>
+                ${missing.length ? `<div class="small text-muted">${__("Remaining")}: ${missing.length}</div>` : `<div>${__("All expected IMEIs reconciled")}</div>`}
+                <div style="margin-top:6px">${chips}</div>
+            </div>
+        `);
+    };
+    renderProgress();
+    if (expected.size) {
+        const $input = d.fields_dict.scan_imei.$input;
+        $input.on("keydown.returnScan", (event) => {
+            if (event.key !== "Enter") return;
+            event.preventDefault();
+            const value = String($input.val() || "").trim();
+            $input.val("");
+            if (!value) return;
+            if (!expected.has(value)) {
+                frappe.show_alert({
+                    message: __("IMEI {0} is not expected on this manifest", [value]),
+                    indicator: "red",
+                }, 5);
+                return;
+            }
+            if (scanned.has(value)) {
+                frappe.show_alert({
+                    message: __("IMEI {0} was already scanned", [value]),
+                    indicator: "orange",
+                }, 4);
+                return;
+            }
+            scanned.add(value);
+            renderProgress();
+        });
+        setTimeout(() => $input.trigger("focus"), 100);
+    }
 }

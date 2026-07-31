@@ -496,7 +496,17 @@ class DeliveryApp {
                             lat, lng,
                             notes: values.notes,
                         },
-                        callback: () => {
+                        callback: (r) => {
+                            const result = (r && r.message) || {};
+                            if (result.ok === false) {
+                                d.show();
+                                frappe.msgprint({
+                                    title: __("OTP Verification Failed"),
+                                    indicator: "red",
+                                    message: result.message || __("Invalid delivery OTP."),
+                                });
+                                return;
+                            }
                             frappe.show_alert({
                                 message: __("Pickup confirmed!"),
                                 indicator: "green",
@@ -1831,7 +1841,19 @@ class DeliveryApp {
             frappe.call({
                 method,
                 args: args || {},
-                callback: (r) => resolve(r && r.message),
+                callback: (r) => {
+                    const result = r && r.message;
+                    if (result && result.ok === false) {
+                        frappe.msgprint({
+                            title: __("OTP Verification Failed"),
+                            indicator: "red",
+                            message: result.message || __("Invalid delivery OTP."),
+                        });
+                        reject(result);
+                        return;
+                    }
+                    resolve(result);
+                },
                 error: (err) => reject(err),
             });
         });

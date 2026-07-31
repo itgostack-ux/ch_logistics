@@ -19,7 +19,9 @@ from ch_logistics import roles as role_registry
 from ch_logistics import scope_guard
 
 
-_TRIP_CLOSE_TERMINAL_MANIFEST_STATUSES = {"Closed", "Delivered", "Cancelled"}
+_TRIP_CLOSE_TERMINAL_MANIFEST_STATUSES = {
+    "Closed", "Delivered", "Received", "Partially Received", "Cancelled", "Returned",
+}
 
 # Manifest statuses considered "attachable to a trip" in the Logistics
 # Control Tower Operations tab.  Mirrors how TMS dispatcher consoles
@@ -496,11 +498,12 @@ def _close_trip_as_logistics_head(doc):
 
 @frappe.whitelist(methods=["POST"])
 def trip_cancel(trip, reason=None):
-    """Cancel a trip from Draft or Assigned state.
+    """Atomically cancel a pre-departure trip, manifests, and stock.
 
     A reason is mandatory. Who/when/why is stamped on the trip
     (cancelled_by / cancelled_on / cancellation_reason) and added to the
-    timeline for audit; owner/creation already record who raised the trip.
+    timeline for audit. Trips that have physically departed must use
+    ``trip_initiate_recall`` instead.
     """
     _require_ops()
     reason = (reason or "").strip()
@@ -510,7 +513,43 @@ def trip_cancel(trip, reason=None):
     doc.check_permission("write")
     scope_guard.assert_trip_scope(doc.as_dict())
     if doc.status not in ("Draft", "Assigned"):
-        frappe.throw(_("Trip can only be cancelled from Draft or Assigned state"))
+        frappe.throw(
+            _("Trip has already departed. Use Abort & Recall Trip."),
+            title=_("Recall Required"),
+        )
+
+    manifests = frappe.get_all(
+        "CH Transfer Manifest",
+        filters={"trip": doc.name, "docstatus": ["<", 2]},
+        fields=["name", "status", "pickup_datetime"],
+        order_by="name asc",
+    )
+    lock_manifests([row.name for row in manifests])
+    blocking = [
+        f"{row.name} ({row.status or 'Draft'})"
+        for row in manifests
+        if (row.status or "Draft") not in ("Draft", "Packed", "Assigned", "Cancelled")
+        or row.pickup_datetime
+    ]
+    if blocking:
+        frappe.throw(
+            _(
+                "Trip cancellation is blocked because physical movement has "
+                "started for: {0}. Use Abort & Recall Trip."
+            ).format(", ".join(blocking)),
+            title=_("Recall Required"),
+        )
+
+    reversal_actions = []
+    for row in manifests:
+        if (row.status or "Draft") == "Cancelled":
+            continue
+        manifest = frappe.get_doc("CH Transfer Manifest", row.name)
+        actions = manifest.cancel_before_departure(
+            reason=_("Trip {0} cancelled: {1}").format(doc.name, reason)
+        )
+        reversal_actions.extend(actions)
+
     prev_driver = doc.driver
     doc.status = "Cancelled"
     doc.cancelled_by = frappe.session.user
@@ -520,7 +559,89 @@ def trip_cancel(trip, reason=None):
     _trip_audit(doc, _("Trip cancelled by {0}: {1}").format(frappe.session.user, reason))
     if prev_driver:
         _set_driver_availability(prev_driver, "Available", None)
-    return doc.name
+    return {
+        "trip": doc.name,
+        "status": doc.status,
+        "cancelled_manifests": [row.name for row in manifests],
+        "stock_reversals": reversal_actions,
+    }
+
+
+@frappe.whitelist(methods=["POST"])
+def trip_initiate_recall(trip, reason=None, notes=None):
+    """Abort a departed trip and recall every active manifest.
+
+    The trip remains active until source staff confirm each physical return.
+    The final confirmation atomically marks the trip Cancelled.
+    """
+    _require_ops()
+    reason = (reason or "").strip()
+    if not reason:
+        frappe.throw(_("A reason is required to recall a trip."))
+    doc = get_locked_trip(trip)
+    doc.check_permission("write")
+    scope_guard.assert_trip_scope(doc.as_dict())
+    if doc.status not in ("Assigned", "Started"):
+        frappe.throw(
+            _("Only an Assigned or Started trip can be recalled (current: {0}).").format(
+                doc.status
+            )
+        )
+
+    rows = frappe.get_all(
+        "CH Transfer Manifest",
+        filters={"trip": doc.name, "docstatus": ["<", 2]},
+        fields=["name", "status"],
+        order_by="name asc",
+    )
+    if not rows:
+        frappe.throw(_("Trip {0} has no active manifests.").format(doc.name))
+    lock_manifests([row.name for row in rows])
+
+    recallable = {"Packed", "Assigned", "Pickup Started", "In Transit", "Delivered"}
+    terminal = {"Recall Initiated", "Returned", "Cancelled"}
+    blocking = [
+        f"{row.name} ({row.status or 'Draft'})"
+        for row in rows
+        if (row.status or "Draft") not in recallable | terminal
+    ]
+    if blocking:
+        frappe.throw(
+            _(
+                "Trip recall cannot continue because these manifests require a "
+                "different accounting action: {0}"
+            ).format(", ".join(blocking)),
+            title=_("Manual Resolution Required"),
+        )
+
+    doc.cancellation_reason = reason
+    doc.save()
+    _trip_audit(
+        doc,
+        _("Trip abort/recall initiated by {0}: {1}").format(
+            frappe.session.user, reason
+        ),
+    )
+
+    recalled = []
+    for row in rows:
+        if row.status not in recallable:
+            continue
+        manifest = frappe.get_doc("CH Transfer Manifest", row.name)
+        manifest.initiate_recall(
+            reason=_("Trip {0} aborted: {1}").format(doc.name, reason),
+            notes=notes,
+        )
+        recalled.append(row.name)
+    return {
+        "trip": doc.name,
+        "status": doc.status,
+        "recalled_manifests": recalled,
+        "message": _(
+            "Trip recall initiated. The trip will be cancelled after every "
+            "manifest is physically returned and reconciled."
+        ),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -2878,6 +2999,41 @@ def complete_stop_delivery(trip, sequence, scanned_qr, delivery_photo,
         assert_manifest_driver_access(doc, scope_side="destination")
         manifests.append(doc)
 
+    active_otp_digests = [
+        str(doc.get("delivery_otp") or "").strip() for doc in manifests
+    ]
+    otp_digests = {digest for digest in active_otp_digests if digest}
+    otp_required = any(doc._delivery_otp_required() for doc in manifests)
+    otp_expected = otp_required or bool(otp_digests)
+    if otp_expected and (
+        any(not digest for digest in active_otp_digests) or len(otp_digests) != 1
+    ):
+        frappe.throw(
+            _("The manifests at this stop do not share one active OTP. Request a fresh stop OTP."),
+            title=_("OTP State Mismatch"),
+        )
+
+    from ch_logistics.logistics.doctype.ch_logistics_otp_log.ch_logistics_otp_log import (
+        verify_manifest_otp,
+    )
+
+    if otp_digests:
+        verification_results = [verify_manifest_otp(doc, otp) for doc in manifests]
+        invalid = next(
+            (result for result in verification_results if not result.get("valid")),
+            None,
+        )
+        if invalid:
+            return {
+                "ok": False,
+                "otp_valid": False,
+                "trip": trip_doc.name,
+                "stop": stop.sequence,
+                "delivered": [],
+                "skipped": [],
+                "message": invalid.get("message") or _("Invalid delivery OTP."),
+            }
+
     delivered = []
     for doc in manifests:
         # Same lazy mint as the pickup side — legacy manifests without a
@@ -2892,6 +3048,7 @@ def complete_stop_delivery(trip, sequence, scanned_qr, delivery_photo,
             # Consolidated stop token authorizes the batch; the controller
             # still receives each manifest's independent secure payload.
             scanned_qr=doc.qr_payload,
+            otp_preverified=bool(otp_digests),
         )
         delivered.append(doc.name)
 
@@ -2911,6 +3068,8 @@ def complete_stop_delivery(trip, sequence, scanned_qr, delivery_photo,
         trip_doc.save()
 
     return {
+        "ok": True,
+        "otp_valid": bool(otp_digests),
         "trip": trip_doc.name,
         "stop": stop.sequence,
         "delivered": delivered,
@@ -2988,24 +3147,38 @@ def request_stop_otp(trip, sequence, lat=None, lng=None):
     # Step 1: arrival ping for the first manifest (so its delivery_otp can
     # be requested via the same path as the per-manifest flow).
     first.mark_reached_destination(lat=lat, lng=lng)
-    plaintext_otp = first._generate_delivery_otp()
+    plaintext_otp = first._generate_delivery_otp(
+        request_source="Consolidated Stop",
+        stop_sequence=stop.sequence,
+    )
     first.flags.ignore_validate_update_after_submit = True
     first.save()
-    shared_otp_digest = first.delivery_otp
-
     for r in rows[1:]:
         doc = frappe.get_doc("CH Transfer Manifest", r.name)
         doc.check_permission("write")
         assert_manifest_driver_access(doc, scope_side="destination")
         doc.mark_reached_destination(lat=lat, lng=lng)
-        doc.delivery_otp = shared_otp_digest
-        doc.delivery_otp_verified = 0
+        doc._generate_delivery_otp(
+            request_source="Consolidated Stop",
+            stop_sequence=stop.sequence,
+            plaintext_otp=plaintext_otp,
+        )
         doc.flags.ignore_validate_update_after_submit = True
         doc.save()
 
     # Send via the first manifest's destination — same store for all of
     # them by the bundle invariant.
     recipients = _send_delivery_otp(first, plaintext_otp) or {}
+    from ch_logistics.logistics.doctype.ch_logistics_otp_log.ch_logistics_otp_log import (
+        record_otp_dispatch,
+    )
+    dispatch_status = recipients.get("dispatch_status") or "Failed"
+    for r in rows[1:]:
+        record_otp_dispatch(
+            frappe.get_doc("CH Transfer Manifest", r.name),
+            recipients,
+            dispatch_status,
+        )
 
     def _mask_email(addr):
         if not addr or "@" not in addr:

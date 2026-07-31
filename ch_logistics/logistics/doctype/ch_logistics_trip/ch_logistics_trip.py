@@ -270,6 +270,12 @@ class CHLogisticsTrip(Document):
         previous = self.get_doc_before_save()
         if not previous or previous.status == self.status:
             return
+        if (
+            previous.status == "Started"
+            and self.status == "Cancelled"
+            and self.flags.get("cancel_after_recall")
+        ):
+            return
         allowed = _ALLOWED_STATUS_TRANSITIONS.get(previous.status, set())
         if self.status not in allowed:
             frappe.throw(
@@ -345,6 +351,42 @@ class CHLogisticsTrip(Document):
                 ).format(self.name, ", ".join(pending)))
             self.status = "Completed"
             self.actual_end = now_datetime()
+        finally:
+            frappe.db.sql("SELECT RELEASE_LOCK(%s)", (_lk,))
+
+    def mark_cancelled_after_recall(self):
+        """Finalize an aborted trip after every manifest is back or cancelled."""
+        _lk = f"trip_st_{frappe.scrub(self.name)}"
+        if not frappe.db.sql("SELECT GET_LOCK(%s, 15)", (_lk,))[0][0]:
+            frappe.throw(frappe._("Trip {0} is being updated. Retry.").format(self.name))
+        try:
+            current = frappe.db.get_value("CH Logistics Trip", self.name, "status")
+            if current not in ("Assigned", "Started"):
+                frappe.throw(
+                    _("A recalled trip can be cancelled only from Assigned or Started.")
+                )
+            rows = frappe.get_all(
+                "CH Transfer Manifest",
+                filters={"trip": self.name, "docstatus": ["<", 2]},
+                fields=["name", "status"],
+            )
+            blocking = [
+                row.name
+                for row in rows
+                if (row.status or "Draft") not in ("Returned", "Cancelled")
+            ]
+            if blocking:
+                frappe.throw(
+                    _(
+                        "Trip {0} cannot be cancelled yet. These manifests have "
+                        "not been returned: {1}"
+                    ).format(self.name, ", ".join(blocking))
+                )
+            self.flags.cancel_after_recall = True
+            self.status = "Cancelled"
+            self.cancelled_by = frappe.session.user
+            self.cancelled_on = now_datetime()
+            self.actual_end = self.actual_end or now_datetime()
         finally:
             frappe.db.sql("SELECT RELEASE_LOCK(%s)", (_lk,))
 

@@ -70,7 +70,6 @@ def _get_or_create_ch_store(name: str, warehouse: str, company: str) -> None:
     if frappe.db.exists("CH Store", name):
         return
     doc = frappe.new_doc("CH Store")
-    doc.store_id = name
     doc.store_code = name
     doc.store_name = name
     doc.company = company
@@ -85,7 +84,7 @@ def _make_scope(user: str, store: str, company: str) -> None:
         frappe.delete_doc("CH User Scope", row, ignore_permissions=True, force=True)
     doc = frappe.new_doc("CH User Scope")
     doc.user = user
-    doc.scope_role = "Store Executive"
+    doc.role_profile = "CH Store Executive"
     doc.enabled = 1
     doc.append("stores", {"company": company, "store": store})
     doc.flags.ignore_permissions = True

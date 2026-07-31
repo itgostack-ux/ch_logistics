@@ -121,9 +121,25 @@ def _make_manifest(source_wh, dest_wh, dest_store, idx, stub_se):
 
 
 def _teardown():
-    for m in frappe.get_all("CH Transfer Manifest",
-                            filters={"qr_payload": ["like", f"{_TAG}-%"]},
-                            pluck="name"):
+    manifests = frappe.get_all(
+        "CH Transfer Manifest",
+        filters={"qr_payload": ["like", f"{_TAG}-%"]},
+        pluck="name",
+    )
+    if manifests and frappe.db.exists("DocType", "CH Logistics OTP Log"):
+        for log_name in frappe.get_all(
+            "CH Logistics OTP Log",
+            filters={"manifest": ["in", manifests]},
+            pluck="name",
+        ):
+            try:
+                frappe.delete_doc(
+                    "CH Logistics OTP Log", log_name, force=1,
+                    ignore_permissions=True, delete_permanently=True,
+                )
+            except Exception:
+                pass
+    for m in manifests:
         try:
             frappe.delete_doc("CH Transfer Manifest", m, force=1,
                               ignore_permissions=True, delete_permanently=True)
@@ -313,11 +329,39 @@ def run():
                 f"stored OTP is an hmac digest, not plaintext (got {stored!r})")
         _expect(all(v == stored for v in otps.values()),
                 f"every manifest carries the SAME delivery_otp ({otps})")
+        otp_logs = {
+            mname: frappe.db.get_value(
+                "CH Transfer Manifest", mname, "delivery_otp_log"
+            )
+            for mname in manifests
+        }
+        _expect(all(otp_logs.values()) and len(set(otp_logs.values())) == 3,
+                f"every manifest has its own OTP audit row ({otp_logs})")
+        for mname, log_name in otp_logs.items():
+            audit = frappe.db.get_value(
+                "CH Logistics OTP Log",
+                log_name,
+                ["manifest", "status", "request_source", "otp_digest", "generated_at", "expires_at"],
+                as_dict=True,
+            )
+            _expect(audit.manifest == mname and audit.status == "Pending",
+                    f"{mname} pending OTP audit is linked")
+            _expect(audit.request_source == "Consolidated Stop",
+                    f"{mname} audit records consolidated-stop origin")
+            _expect(audit.otp_digest == stored and audit.generated_at and audit.expires_at,
+                    f"{mname} audit retains digest + generation/expiry")
         shared = "123456"
         known_digest = delivery_otp_digest(shared)
         for mname in manifests:
             frappe.db.set_value("CH Transfer Manifest", mname, "delivery_otp",
                                 known_digest, update_modified=False)
+            frappe.db.set_value(
+                "CH Logistics OTP Log",
+                otp_logs[mname],
+                "otp_digest",
+                known_digest,
+                update_modified=False,
+            )
         frappe.db.commit()
 
         # Each manifest's arrival_datetime must now be set so
@@ -327,24 +371,25 @@ def run():
             _expect(bool(arr), f"{mname} has arrival_datetime stamped")
 
         # ── Step 7 : Negative — wrong OTP refused ─────────────────
-        # Contract (hardened): the stop cascade is ALL-OR-NOTHING — a wrong
-        # OTP aborts the entire request transaction with ValidationError
-        # (no partial `skipped` list anymore), so no manifest can slip
-        # through a mixed-result drop.
+        # Contract (hardened): the stop cascade is ALL-OR-NOTHING. A wrong
+        # OTP returns a structured refusal so the request can commit the
+        # failed-attempt audit without delivering any manifest.
         print("== complete_stop_delivery: wrong OTP refused ==")
-        try:
-            api.complete_stop_delivery(
-                trip=trip, sequence=stop_seq,
-                scanned_qr=delivery_token,
-                delivery_photo=_PHOTO,
-                receiver_name="Store Manager",
-                otp="000000",
-                lat=_BLR_LAT, lng=_BLR_LNG,
+        wrong_result = api.complete_stop_delivery(
+            trip=trip, sequence=stop_seq,
+            scanned_qr=delivery_token,
+            delivery_photo=_PHOTO,
+            receiver_name="Store Manager",
+            otp="000000",
+            lat=_BLR_LAT, lng=_BLR_LNG,
+        )
+        _expect(wrong_result.get("ok") is False and not wrong_result.get("delivered"),
+                f"wrong OTP rejected atomically ({wrong_result})")
+        for log_name in otp_logs.values():
+            _expect(
+                frappe.db.get_value("CH Logistics OTP Log", log_name, "attempts") == 1,
+                f"failed stop OTP attempt persisted on {log_name}",
             )
-            _expect(False, "wrong OTP should abort the whole stop delivery")
-        except frappe.ValidationError as exc:
-            _expect("otp" in str(exc).lower(),
-                    f"wrong OTP rejected atomically ({exc})")
 
         # Sanity: still In Transit.
         for mname in manifests:
@@ -389,7 +434,8 @@ def run():
             row = frappe.db.get_value(
                 "CH Transfer Manifest", mname,
                 ["status", "delivery_photo", "receiver_name", "delivery_otp_verified",
-                 "delivery_datetime", "delivery_lat", "delivery_lng"],
+                 "delivery_datetime", "delivery_lat", "delivery_lng", "delivery_otp",
+                 "delivery_otp_log", "delivery_otp_verified_at", "delivery_otp_verified_by"],
                 as_dict=True,
             )
             _expect(row.status == "Delivered",
@@ -398,10 +444,26 @@ def run():
                     f"{mname} has delivery photo + receiver_name")
             _expect(int(row.delivery_otp_verified or 0) == 1,
                     f"{mname} delivery_otp_verified == 1")
+            _expect(not row.delivery_otp and row.delivery_otp_log == otp_logs[mname],
+                    f"{mname} clears one-time digest but retains audit link")
+            _expect(bool(row.delivery_otp_verified_at) and bool(row.delivery_otp_verified_by),
+                    f"{mname} verifier timestamp + user recorded")
             _expect(bool(row.delivery_datetime),
                     f"{mname} delivery_datetime stamped")
             _expect(row.delivery_lat == _BLR_LAT and row.delivery_lng == _BLR_LNG,
                     f"{mname} delivery GPS recorded (lat={row.delivery_lat}, lng={row.delivery_lng})")
+            audit = frappe.db.get_value(
+                "CH Logistics OTP Log",
+                otp_logs[mname],
+                ["status", "attempts", "verified_at", "verified_by", "otp_digest"],
+                as_dict=True,
+            )
+            _expect(audit.status == "Verified" and audit.attempts == 2,
+                    f"{mname} OTP audit is Verified with both attempts recorded")
+            _expect(bool(audit.verified_at) and bool(audit.verified_by),
+                    f"{mname} OTP audit keeps confirmation identity/time")
+            _expect(str(audit.otp_digest).startswith("hmac-sha256$"),
+                    f"{mname} audit retains only the HMAC digest")
 
         # Stop bookkeeping: status -> Completed, ata stamped, delivery_scanned_at stamped.
         trip_doc.reload()

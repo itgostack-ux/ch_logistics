@@ -1012,6 +1012,7 @@ class LogisticsCommandCenter {
 		$r.on("click",  "#lcc-side-close-trip",()=> this._ops_trip_action("trip_close"));
 		$r.on("click",  "#lcc-side-cancel",   () => this._ops_trip_action("trip_unassign"));
 		$r.on("click",  "#lcc-side-cancel-trip", () => this._ops_cancel_trip());
+		$r.on("click",  "#lcc-side-recall-trip", () => this._ops_recall_trip());
 		$r.on("click",  ".lcc-side-detach",   (e) => this._ops_detach_manifest($(e.currentTarget).data("name")));
 		$r.on("click",  ".lcc-trip-link",     (e) => { e.preventDefault(); this._ops_open_trip($(e.currentTarget).data("name")); });
 
@@ -1504,11 +1505,30 @@ class LogisticsCommandCenter {
 	 * manifest form shows, but inlined into the dispatcher console so
 	 * source-warehouse staff don't need to open each manifest.
 	 */
-	_ops_confirm_recall_return(name) {
+	async _ops_confirm_recall_return(name) {
 		if (!name) return;
 		const api = "ch_logistics.api.transfer_manifest_api.";
 		const row = (this.recalls || []).find((r) => r.name === name) || {};
 		const src = window.ch_wh_label_html ? ch_wh_label_html(row.source_warehouse, "—") : frappe.utils.escape_html(row.source_warehouse || "—");
+		const response = await frappe.call({
+			method: api + "get_return_requirements",
+			args: { manifest: name },
+			freeze: true,
+			freeze_message: __("Loading return requirements..."),
+		});
+		const requirements = response.message || {};
+		const expected = new Set(requirements.serials || []);
+		const scanned = new Set();
+		const countRows = (requirements.items || []).filter(
+			(row) => !(row.serials || []).length && Number(row.qty || 0) > 0
+		);
+		const countFields = countRows.map((row, index) => ({
+			fieldname: `return_qty_${index}`,
+			fieldtype: "Float",
+			label: __("Counted Qty — {0}", [row.item_code || ""]),
+			description: __("Stock Entry {0}; expected {1}", [row.stock_entry || "", row.qty || 0]),
+			reqd: 1,
+		}));
 		const d = new frappe.ui.Dialog({
 			title: __("Confirm Return — {0}", [name]),
 			size: "large",
@@ -1520,12 +1540,31 @@ class LogisticsCommandCenter {
 						<strong>${__("Return Checklist")}:</strong>
 						<ul style="margin:8px 0 0 0;padding-left:18px">
 							<li>${__("All items have been physically returned to")} <strong>${src}</strong></li>
-							<li>${__("Each item has been scanned / counted and matches the manifest")}</li>
+							<li>${__("Every serialized item must be scanned below")}</li>
 							<li>${__("A photo has been taken of the returned items")}</li>
 						</ul>
+						<div><b>${__("Expected Qty")}:</b> ${requirements.total_qty || 0} · <b>${__("Expected IMEIs")}:</b> ${expected.size}</div>
 						<div style="margin-top:8px"><b>${__("Recall Reason")}:</b> ${frappe.utils.escape_html(row.recall_reason || "—")}</div>
 					</div>`,
 				},
+				{
+					fieldname: "scan_imei",
+					fieldtype: "Data",
+					label: __("Scan Returned IMEI / Serial and press Enter"),
+					hidden: expected.size === 0,
+				},
+				{
+					fieldname: "scan_progress",
+					fieldtype: "HTML",
+					hidden: expected.size === 0,
+				},
+				...(countFields.length ? [{
+					fieldname: "count_section",
+					fieldtype: "Section Break",
+					label: __("Count Non-Serialized Items"),
+					description: __("Enter the physically counted quantity; an exact match is required."),
+				}] : []),
+				...countFields,
 				{
 					fieldname: "return_photo",
 					fieldtype: "Attach Image",
@@ -1536,15 +1575,41 @@ class LogisticsCommandCenter {
 			],
 			primary_action_label: __("Confirm Return & Reverse Stock"),
 			primary_action: (values) => {
-				d.hide();
+				const missing = [...expected].filter((value) => !scanned.has(value));
+				if (missing.length) {
+					frappe.msgprint({
+						title: __("Return Scan Incomplete"),
+						indicator: "red",
+						message: __("Scan all returned IMEIs. Missing: {0}", [missing.join(", ")]),
+					});
+					return;
+				}
+				const returnedQuantities = countRows.map((item, index) => ({
+					stock_entry: item.stock_entry,
+					row_name: item.row_name,
+					qty: values[`return_qty_${index}`],
+				}));
+				if (countRows.some(
+					(item, index) => Number(values[`return_qty_${index}`]) !== Number(item.qty)
+				)) {
+					frappe.msgprint({
+						title: __("Return Count Mismatch"),
+						indicator: "red",
+						message: __("The counted quantities must match the expected return before stock can be reversed."),
+					});
+					return;
+				}
 				frappe.confirm(
 					__("Confirm that all items have been returned? This will reverse the stock entries and cannot be undone."),
 					() => {
+						d.hide();
 						frappe.call({
 							method: api + "confirm_return",
 							args: {
 								manifest: name,
 								return_photo: values.return_photo,
+								returned_serials: [...scanned],
+								returned_quantities: returnedQuantities,
 							},
 							freeze: true,
 							freeze_message: __("Reversing stock entries..."),
@@ -1564,6 +1629,38 @@ class LogisticsCommandCenter {
 			},
 		});
 		d.show();
+		const renderProgress = () => {
+			if (!expected.size) return;
+			const missing = [...expected].filter((value) => !scanned.has(value));
+			d.fields_dict.scan_progress.$wrapper.html(`
+				<div class="alert ${missing.length ? "alert-warning" : "alert-success"}">
+					<strong>${__("Scanned {0} of {1}", [scanned.size, expected.size])}</strong>
+					<div class="small">${missing.length ? __("Remaining: {0}", [missing.length]) : __("All expected IMEIs reconciled")}</div>
+				</div>
+			`);
+		};
+		renderProgress();
+		if (expected.size) {
+			const $input = d.fields_dict.scan_imei.$input;
+			$input.on("keydown.returnScan", (event) => {
+				if (event.key !== "Enter") return;
+				event.preventDefault();
+				const value = String($input.val() || "").trim();
+				$input.val("");
+				if (!value) return;
+				if (!expected.has(value)) {
+					frappe.show_alert({ message: __("IMEI {0} is not expected", [value]), indicator: "red" }, 5);
+					return;
+				}
+				if (scanned.has(value)) {
+					frappe.show_alert({ message: __("IMEI {0} was already scanned", [value]), indicator: "orange" }, 4);
+					return;
+				}
+				scanned.add(value);
+				renderProgress();
+			});
+			setTimeout(() => $input.trigger("focus"), 100);
+		}
 	}
 
 	/* ── Side panel ───────────────────────────────────────────── */
@@ -1590,6 +1687,7 @@ class LogisticsCommandCenter {
 		const can_close    = t.status === "Completed";
 		const can_unassign = t.status === "Assigned";
 		const can_cancel   = ["Draft", "Assigned"].includes(t.status);
+		const can_recall_trip = t.status === "Started";
 		const can_detach = ["Draft", "Assigned", "Started"].includes(t.status);
 		const can_resequence = ["Assigned", "Started"].includes(t.status);
 		// Server-resolved capability (CH Logistics Settings → Role Matrix);
@@ -1657,6 +1755,7 @@ class LogisticsCommandCenter {
 				${can_close    ? `<button class="btn btn-sm btn-primary" id="lcc-side-close-trip"><i class="fa fa-archive"></i> ${__("Close")}</button>` : ""}
 				${can_unassign ? `<button class="btn btn-sm btn-default" id="lcc-side-cancel"><i class="fa fa-user-times"></i> ${__("Unassign")}</button>` : ""}
 				${can_cancel ? `<button class="btn btn-sm btn-danger" id="lcc-side-cancel-trip"><i class="fa fa-ban"></i> ${__("Cancel Trip")}</button>` : ""}
+				${can_recall_trip ? `<button class="btn btn-sm btn-danger" id="lcc-side-recall-trip"><i class="fa fa-undo"></i> ${__("Abort & Recall Trip")}</button>` : ""}
 			</div>
 			<div class="lcc-side-sec">${__("Stops")}</div>
 			${stops_html}
@@ -1676,7 +1775,7 @@ class LogisticsCommandCenter {
 		const d = new frappe.ui.Dialog({
 			title: __("Cancel Trip {0}", [trip]),
 			fields: [
-				{ fieldtype: "HTML", options: `<p class="text-muted">${__("This cancels the trip and releases its driver. The reason is recorded against the trip (who / when / why) for audit.")}</p>` },
+				{ fieldtype: "HTML", options: `<div class="alert alert-warning">${__("This pre-departure cancellation will reverse every attached manifest's stock to source, cancel the manifests, cancel the trip, and release the driver. If physical pickup has started, the server will require Abort & Recall instead.")}</div>` },
 				{ fieldtype: "Small Text", fieldname: "reason", label: __("Reason"), reqd: 1 },
 			],
 			primary_action_label: __("Cancel Trip"),
@@ -1693,6 +1792,48 @@ class LogisticsCommandCenter {
 						this._ops_close_side();
 						this._ops_load();
 					});
+			},
+		});
+		d.show();
+	}
+
+	_ops_recall_trip() {
+		if (!this.active_trip) return;
+		const trip = this.active_trip;
+		const d = new frappe.ui.Dialog({
+			title: __("Abort & Recall Trip {0}", [trip]),
+			fields: [
+				{
+					fieldtype: "HTML",
+					options: `<div class="alert alert-danger">
+						<strong>${__("Physical return required")}</strong><br>
+						${__("Every active manifest will be recalled. The trip remains open until source staff scan all returned IMEIs, attach return proof, and every stock reversal succeeds.")}
+					</div>`,
+				},
+				{ fieldtype: "Small Text", fieldname: "reason", label: __("Abort / Recall Reason"), reqd: 1 },
+				{ fieldtype: "Small Text", fieldname: "notes", label: __("Instructions to Driver") },
+			],
+			primary_action_label: __("Abort & Recall Trip"),
+			primary_action: (values) => {
+				frappe.confirm(
+					__("Recall every active manifest on trip {0}?", [trip]),
+					() => {
+						d.hide();
+						frappe.call({
+							method: _LCC + "trip_initiate_recall",
+							args: { trip, reason: values.reason, notes: values.notes },
+							freeze: true,
+							freeze_message: __("Initiating trip recall..."),
+						}).then((r) => {
+							frappe.show_alert({
+								message: r.message?.message || __("Trip recall initiated"),
+								indicator: "orange",
+							}, 7);
+							this._ops_close_side();
+							this._ops_load();
+						});
+					}
+				);
 			},
 		});
 		d.show();

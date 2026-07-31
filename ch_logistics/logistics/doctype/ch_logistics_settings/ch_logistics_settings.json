@@ -16,6 +16,8 @@
   "enforce_pickup_qr",
   "enforce_delivery_qr",
   "enforce_delivery_otp",
+  "delivery_otp_expiry_minutes",
+  "delivery_otp_max_attempts",
   "enforce_geofence",
   "geofence_radius_m",
   "performance_section",
@@ -141,6 +143,24 @@
    "fieldname": "enforce_delivery_otp",
    "fieldtype": "Check",
    "label": "Enforce Delivery OTP"
+  },
+  {
+   "default": "10",
+   "depends_on": "enforce_delivery_otp",
+   "description": "Minutes after issue before a delivery OTP becomes invalid.",
+   "fieldname": "delivery_otp_expiry_minutes",
+   "fieldtype": "Int",
+   "label": "Delivery OTP Expiry (minutes)",
+   "non_negative": 1
+  },
+  {
+   "default": "5",
+   "depends_on": "enforce_delivery_otp",
+   "description": "Failed entries allowed before the current delivery OTP is locked. Resending issues a fresh OTP.",
+   "fieldname": "delivery_otp_max_attempts",
+   "fieldtype": "Int",
+   "label": "Delivery OTP Maximum Attempts",
+   "non_negative": 1
   },
   {
    "fieldname": "enforce_geofence",

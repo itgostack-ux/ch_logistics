@@ -252,7 +252,9 @@ def assign_driver(manifest, driver, courier_partner=None, vehicle_number=None,
         vehicle=vehicle,
         external_booking_id=external_booking_id,
     )
-    _send_delivery_otp(doc, getattr(doc.flags, "delivery_otp_plaintext", None))
+    plaintext_otp = getattr(doc.flags, "delivery_otp_plaintext", None)
+    if plaintext_otp:
+        _send_delivery_otp(doc, plaintext_otp)
     return {"status": doc.status, "vehicle": doc.get("custom_vehicle")}
 
 
@@ -422,13 +424,35 @@ def complete_delivery(manifest, delivery_photo, receiver_name, otp=None,
     _token, _minted = doc.ensure_secure_qr_token()
     if _minted:
         scanned_qr = _token
-    doc.complete_delivery(
-        delivery_photo=delivery_photo,
-        receiver_name=receiver_name,
-        otp=otp, lat=lat, lng=lng,
-        scanned_qr=scanned_qr,
+    from ch_logistics.logistics.doctype.ch_logistics_otp_log.ch_logistics_otp_log import (
+        DeliveryOTPError,
     )
-    return {"status": doc.status}
+
+    try:
+        doc.complete_delivery(
+            delivery_photo=delivery_photo,
+            receiver_name=receiver_name,
+            otp=otp, lat=lat, lng=lng,
+            scanned_qr=scanned_qr,
+        )
+    except DeliveryOTPError as exc:
+        # Returning a normal response is deliberate: Frappe rolls the whole
+        # request back for an uncaught exception, which previously made failed
+        # OTP attempts disappear from the audit trail.
+        return {
+            "ok": False,
+            "otp_valid": False,
+            "status": doc.status,
+            "message": str(exc),
+            "attempts": cint(doc.get("delivery_otp_attempts")),
+        }
+    return {
+        "ok": True,
+        "otp_valid": bool(doc.delivery_otp_verified),
+        "status": doc.status,
+        "delivery_datetime": str(doc.delivery_datetime),
+        "otp_log": doc.get("delivery_otp_log"),
+    }
 
 
 @frappe.whitelist(methods=["POST"])
@@ -510,10 +534,27 @@ def driver_close_manifest(manifest, close_note=None) -> dict:
 # ── Recall / Reversal ────────────────────────────────────────────────────────
 
 @frappe.whitelist(methods=["POST"])
+def cancel_manifest(manifest, reason) -> dict:
+    """Cancel a pre-departure manifest and restore all linked stock."""
+    if not str(reason or "").strip():
+        frappe.throw(_("Cancellation reason is required."), title=_("API Error"))
+    _require_stage_role("initiate_recall")
+    doc = frappe.get_doc("CH Transfer Manifest", manifest)
+    doc.check_permission("write")
+    scope_guard.assert_manifest_scope(doc.as_dict(), side="source")
+    reversed_ses = doc.cancel_before_departure(reason=reason)
+    return {
+        "status": doc.status,
+        "reversed_stock_entries": reversed_ses,
+        "message": _("Manifest cancelled and stock restored to source."),
+    }
+
+
+@frappe.whitelist(methods=["POST"])
 def initiate_recall(manifest, reason, notes=None) -> dict:
     """Initiate a transfer recall. Notifies driver and stores via email + in-app.
 
-    Allowed statuses: Packed, Assigned, In Transit, Delivered.
+    Allowed statuses: Packed, Assigned, Pickup Started, In Transit, Delivered.
     """
     if not reason:
         frappe.throw(_("Recall reason is required."), title=_("API Error"))
@@ -529,8 +570,26 @@ def initiate_recall(manifest, reason, notes=None) -> dict:
     }
 
 
+@frappe.whitelist()
+def get_return_requirements(manifest) -> dict:
+    """Ledger-derived IMEIs and quantities expected back at source."""
+    doc = frappe.get_doc("CH Transfer Manifest", manifest)
+    doc.check_permission("read")
+    scope_guard.assert_manifest_scope(doc.as_dict(), side="source")
+    if doc.status != "Recall Initiated":
+        frappe.throw(
+            _("Return requirements are available only after recall is initiated.")
+        )
+    return doc.get_return_requirements()
+
+
 @frappe.whitelist(methods=["POST"])
-def confirm_return(manifest, return_photo) -> dict:
+def confirm_return(
+    manifest,
+    return_photo,
+    returned_serials=None,
+    returned_quantities=None,
+) -> dict:
     """Delivery person confirms all items returned to source warehouse.
 
     Cancels/reverses the underlying Stock Entries to reinstate stock.
@@ -544,6 +603,8 @@ def confirm_return(manifest, return_photo) -> dict:
     scope_guard.assert_manifest_scope(doc.as_dict(), side="source")
     reversed_ses = doc.confirm_return(
         return_photo=return_photo,
+        returned_serials=returned_serials,
+        returned_quantities=returned_quantities,
     )
     return {
         "status": doc.status,
@@ -569,7 +630,7 @@ def resend_otp(manifest) -> dict:
     assert_manifest_driver_access(doc, scope_side="destination")
     if doc.status not in ("Assigned", "In Transit"):
         frappe.throw(_("OTP can only be resent in Assigned/In Transit status."), title=_("API Error"))
-    plaintext_otp = doc._generate_delivery_otp()
+    plaintext_otp = doc._generate_delivery_otp(request_source="Manual Resend")
     doc.flags.ignore_validate_update_after_submit = True
     doc.save()
     _send_delivery_otp(doc, plaintext_otp)
@@ -827,7 +888,17 @@ def _send_delivery_otp(doc, plaintext_otp=None) -> dict:
             f"OTP for manifest {doc.name} could not be sent — no destination store contact.",
             "Manifest OTP Delivery",
         )
-        return {"emails": [], "mobiles": [], "manager_users": []}
+        recipients = {
+            "emails": [],
+            "mobiles": [],
+            "manager_users": [],
+            "dispatch_status": "No Recipient",
+        }
+        from ch_logistics.logistics.doctype.ch_logistics_otp_log.ch_logistics_otp_log import (
+            record_otp_dispatch,
+        )
+        record_otp_dispatch(doc, recipients, "No Recipient")
+        return recipients
 
     subject = _("Delivery OTP for Manifest {0}").format(doc.name)
     manifest_url = frappe.utils.get_url_to_form("CH Transfer Manifest", doc.name)
@@ -859,6 +930,7 @@ def _send_delivery_otp(doc, plaintext_otp=None) -> dict:
         manifest_url=manifest_url,
     )
 
+    in_app_sent = []
     for user in manager_users:
         try:
             frappe.publish_realtime(
@@ -873,9 +945,11 @@ def _send_delivery_otp(doc, plaintext_otp=None) -> dict:
                 },
                 user=user,
             )
+            in_app_sent.append(user)
         except Exception:
             pass
 
+    sms_sent = False
     if sms_recipients:
         try:
             from frappe.core.doctype.sms_settings.sms_settings import send_sms
@@ -883,9 +957,11 @@ def _send_delivery_otp(doc, plaintext_otp=None) -> dict:
                 "CH Logistics: Delivery OTP {0} for Manifest {1}. Share only after item verification."
             ).format(plaintext_otp, doc.name)
             send_sms(sms_recipients, sms_message)
+            sms_sent = True
         except Exception:
             frappe.log_error(frappe.get_traceback(), f"Manifest OTP SMS failed: {doc.name}")
 
+    email_sent = False
     try:
         default_outgoing = frappe.db.get_value(
             "Email Account", {"default_outgoing": 1, "enable_outgoing": 1}, "name"
@@ -899,14 +975,26 @@ def _send_delivery_otp(doc, plaintext_otp=None) -> dict:
                 reference_name=doc.name,
                 delayed=False,
             )
+            email_sent = True
     except Exception:
         frappe.log_error(frappe.get_traceback(), f"Manifest OTP email failed: {doc.name}")
 
-    return {
+    recipients = {
         "emails": email_recipients,
         "mobiles": sms_recipients,
         "manager_users": manager_users,
     }
+    from ch_logistics.logistics.doctype.ch_logistics_otp_log.ch_logistics_otp_log import (
+        record_otp_dispatch,
+    )
+    dispatch_status = "Sent" if (in_app_sent or sms_sent or email_sent) else "Failed"
+    recipients["dispatch_status"] = dispatch_status
+    record_otp_dispatch(
+        doc,
+        recipients,
+        dispatch_status,
+    )
+    return recipients
 
 
 @frappe.whitelist(methods=["POST"])
@@ -941,7 +1029,7 @@ def request_delivery_otp(manifest) -> dict:
             .format(doc.status),
             title=_("API Error"),
         )
-    plaintext_otp = doc._generate_delivery_otp()
+    plaintext_otp = doc._generate_delivery_otp(request_source="Driver App")
     doc.flags.ignore_validate_update_after_submit = True
     doc.save()
     recipients = _send_delivery_otp(doc, plaintext_otp) or {}

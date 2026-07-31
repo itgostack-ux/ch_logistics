@@ -56,6 +56,13 @@
   "receiver_name",
   "delivery_otp",
   "delivery_otp_verified",
+  "delivery_otp_log",
+  "delivery_otp_generated_at",
+  "delivery_otp_expires_at",
+  "delivery_otp_sent_at",
+  "delivery_otp_attempts",
+  "delivery_otp_verified_at",
+  "delivery_otp_verified_by",
   "sec_receiving",
   "received_by",
   "received_datetime",
@@ -79,6 +86,10 @@
   "return_confirmed_by",
   "return_confirmed_at",
   "reversed_stock_entries",
+  "sec_cancellation",
+  "cancellation_reason",
+  "cancelled_by",
+  "cancelled_on",
   "sec_freight",
   "total_weight_kg",
   "freight_amount",
@@ -257,7 +268,7 @@
    "fieldname": "ewaybill_status",
    "fieldtype": "Select",
    "label": "e-Way Bill Status",
-   "options": "Not Required\nNot Generated\nGenerating\nPartial\nGenerated\nFailed",
+   "options": "Not Required\nNot Generated\nGenerating\nPartial\nGenerated\nCancelled\nFailed",
    "default": "Not Generated",
    "read_only": 1,
    "in_list_view": 1,
@@ -411,6 +422,59 @@
    "read_only": 1
   },
   {
+   "fieldname": "delivery_otp_log",
+   "fieldtype": "Link",
+   "label": "OTP Audit Log",
+   "no_copy": 1,
+   "options": "CH Logistics OTP Log",
+   "read_only": 1
+  },
+  {
+   "fieldname": "delivery_otp_generated_at",
+   "fieldtype": "Datetime",
+   "label": "OTP Generated At",
+   "no_copy": 1,
+   "read_only": 1
+  },
+  {
+   "fieldname": "delivery_otp_expires_at",
+   "fieldtype": "Datetime",
+   "label": "OTP Expires At",
+   "no_copy": 1,
+   "read_only": 1
+  },
+  {
+   "fieldname": "delivery_otp_sent_at",
+   "fieldtype": "Datetime",
+   "label": "OTP Sent At",
+   "no_copy": 1,
+   "read_only": 1
+  },
+  {
+   "default": "0",
+   "fieldname": "delivery_otp_attempts",
+   "fieldtype": "Int",
+   "label": "OTP Attempts",
+   "no_copy": 1,
+   "non_negative": 1,
+   "read_only": 1
+  },
+  {
+   "fieldname": "delivery_otp_verified_at",
+   "fieldtype": "Datetime",
+   "label": "OTP Verified At",
+   "no_copy": 1,
+   "read_only": 1
+  },
+  {
+   "fieldname": "delivery_otp_verified_by",
+   "fieldtype": "Link",
+   "label": "OTP Verified By",
+   "no_copy": 1,
+   "options": "User",
+   "read_only": 1
+  },
+  {
    "fieldname": "sec_receiving",
    "fieldtype": "Section Break",
    "depends_on": "eval:['Received','Closed'].includes(doc.status)",
@@ -543,6 +607,32 @@
    "read_only": 1,
    "hidden": 0,
    "depends_on": "eval:doc.status=='Returned'"
+  },
+  {
+   "fieldname": "sec_cancellation",
+   "fieldtype": "Section Break",
+   "label": "Cancellation Audit",
+   "collapsible": 1,
+   "depends_on": "eval:doc.status=='Cancelled'"
+  },
+  {
+   "fieldname": "cancellation_reason",
+   "fieldtype": "Small Text",
+   "label": "Cancellation Reason",
+   "read_only": 1
+  },
+  {
+   "fieldname": "cancelled_by",
+   "fieldtype": "Link",
+   "label": "Cancelled By",
+   "options": "User",
+   "read_only": 1
+  },
+  {
+   "fieldname": "cancelled_on",
+   "fieldtype": "Datetime",
+   "label": "Cancelled On",
+   "read_only": 1
   },
   {
    "fieldname": "sec_freight",

@@ -6,12 +6,13 @@ Lifecycle:
 
 import hashlib
 import hmac
+import math
 import secrets
 
 import frappe
 from frappe import _
 from frappe.model.document import Document
-from frappe.utils import now_datetime, cint, flt, getdate, nowdate
+from frappe.utils import add_to_date, get_datetime, now_datetime, cint, flt, getdate, nowdate
 from frappe.utils.password import get_encryption_key
 
 
@@ -48,11 +49,15 @@ class CHTransferManifest(Document):
         "pickup_datetime", "pickup_photo", "pickup_lat", "pickup_lng",
         "arrival_datetime", "arrival_lat", "arrival_lng",
         "delivery_datetime", "delivery_photo", "delivery_lat", "delivery_lng",
-        "receiver_name", "delivery_otp", "delivery_otp_verified", "qr_payload",
+        "receiver_name", "delivery_otp", "delivery_otp_verified",
+        "delivery_otp_log", "delivery_otp_generated_at", "delivery_otp_expires_at",
+        "delivery_otp_sent_at", "delivery_otp_attempts", "delivery_otp_verified_at",
+        "delivery_otp_verified_by", "qr_payload",
         "tracking_token", "received_by", "received_at", "closed_by", "closed_at",
         "rejected_by", "rejected_at", "rejected_during", "rejection_reason",
         "rejection_photo", "rejection_notes", "recall_initiated_by",
         "recall_initiated_at", "return_confirmed_by", "return_confirmed_at",
+        "cancellation_reason", "cancelled_by", "cancelled_on",
     })
 
     def validate(self):
@@ -187,13 +192,15 @@ class CHTransferManifest(Document):
         self._update_stock_entries_manifest()
 
     def on_cancel(self):
-        if self.status in ("In Transit", "Delivered", "Received", "Partially Received"):
+        if not self.flags.get("stock_reversal_completed"):
             frappe.throw(
-                frappe._("Manifest {0} is {1}. Use 'Initiate Recall' to return goods first.").format(self.name, self.status),
-                title=frappe._("Cannot Cancel In-Transit Manifest")
+                _(
+                    "Use the 'Cancel & Return Stock' action. A manifest cannot be "
+                    "cancelled until every linked Stock Entry has been reversed."
+                ),
+                title=_("Controlled Cancellation Required"),
             )
         self.db_set("status", "Cancelled")
-        self._clear_stock_entries_manifest()
         self._maybe_auto_close_parent_trip()
 
     # ── Helpers ─────────────────────────────────────────────────────────
@@ -445,7 +452,8 @@ class CHTransferManifest(Document):
                 pass
 
             self.status = "Assigned"
-            self._generate_delivery_otp()
+            if self._delivery_otp_required():
+                self._generate_delivery_otp(request_source="Driver Assignment")
             # Seed the pickup-scan token so QR enforcement has something to
             # match against (older manifests are backfilled lazily here).
             if not self.qr_payload or self.qr_payload == self.name:
@@ -1157,7 +1165,8 @@ class CHTransferManifest(Document):
             frappe.db.sql("SELECT RELEASE_LOCK(%s)", (lock_key,))
 
     def complete_delivery(self, delivery_photo, receiver_name, otp=None,
-                          lat=None, lng=None, scanned_qr=None):
+                          lat=None, lng=None, scanned_qr=None,
+                          otp_preverified=False):
         lock_key = f"manifest_status_{frappe.scrub(self.name)}"
         lock_result = frappe.db.sql("SELECT GET_LOCK(%s, 10)", (lock_key,))[0][0]
         if not lock_result:
@@ -1186,12 +1195,19 @@ class CHTransferManifest(Document):
             self._validate_delivery_qr(scanned_qr)
             # Mandatory driver GPS at the receiver's doorstep (proof of presence).
             lat_f, lng_f = self._validate_geo(lat, lng, kind="delivery")
-            # OTP verification (secondary factor, gated by its own flag).
-            if self.delivery_otp:
-                if not otp:
-                    frappe.throw(_("Delivery OTP is required."), title=_("Ch Transfer Manifest Error"))
-                if not verify_delivery_otp(self.delivery_otp, otp):
-                    frappe.throw(_("Invalid OTP. Please check and try again."), title=_("Ch Transfer Manifest Error"))
+            # OTP verification is auditable. The active digest remains hashed
+            # at rest; the linked log retains generation, dispatch, attempts,
+            # expiry and verifier evidence after this one-time digest is cleared.
+            if self.delivery_otp or self._delivery_otp_required():
+                from ch_logistics.logistics.doctype.ch_logistics_otp_log.ch_logistics_otp_log import (
+                    DeliveryOTPError,
+                    verify_manifest_otp,
+                )
+
+                if not otp_preverified:
+                    verification = verify_manifest_otp(self, otp)
+                    if not verification.get("valid"):
+                        raise DeliveryOTPError(verification.get("message") or _("Invalid delivery OTP."))
                 self.delivery_otp_verified = 1
                 self.delivery_otp = None
 
@@ -1617,11 +1633,30 @@ class CHTransferManifest(Document):
             frappe.log_error(frappe.get_traceback(), f"Freight GL failed for manifest {self.name}")
             frappe.throw(frappe._("Freight GL posting failed for manifest {0}. Check Error Log and retry.").format(self.name))
 
-    def _generate_delivery_otp(self):
-        plaintext = str(secrets.randbelow(900000) + 100000)
-        self.delivery_otp = delivery_otp_digest(plaintext)
-        self.delivery_otp_verified = 0
-        self.flags.delivery_otp_plaintext = plaintext
+    def _delivery_otp_required(self) -> bool:
+        try:
+            configured = frappe.db.get_single_value(
+                "CH Logistics Settings", "enforce_delivery_otp"
+            )
+        except Exception:
+            configured = None
+        return configured is None or bool(cint(configured))
+
+    def _generate_delivery_otp(self, request_source="Driver App", stop_sequence=None,
+                               plaintext_otp=None):
+        plaintext = str(
+            plaintext_otp or (secrets.randbelow(900000) + 100000)
+        ).strip()
+        from ch_logistics.logistics.doctype.ch_logistics_otp_log.ch_logistics_otp_log import (
+            issue_manifest_otp,
+        )
+
+        issue_manifest_otp(
+            self,
+            plaintext,
+            request_source=request_source,
+            stop_sequence=stop_sequence,
+        )
         return plaintext
 
     def _sync_logistics_status_to_entries(self, logistics_status):
@@ -1903,10 +1938,80 @@ class CHTransferManifest(Document):
 
     # ── Recall / Reversal ───────────────────────────────────────────────
 
+    def cancel_before_departure(self, reason):
+        """Cancel a pre-departure manifest and atomically restore its stock.
+
+        Once physical pickup has begun the accounting document must not be
+        represented as if dispatch never happened; that path is a recall.
+        """
+        reason = str(reason or "").strip()
+        if not reason:
+            frappe.throw(_("Cancellation reason is mandatory."))
+
+        lock_key = f"manifest_cancel_{frappe.scrub(self.name)}"
+        lock_result = frappe.db.sql("SELECT GET_LOCK(%s, 10)", (lock_key,))[0][0]
+        if not lock_result:
+            frappe.throw(
+                _("Manifest {0} is being cancelled by another user.").format(self.name)
+            )
+        try:
+            current_status = frappe.db.get_value(
+                "CH Transfer Manifest", self.name, "status"
+            ) or "Draft"
+            self.status = current_status
+            allowed = ("Draft", "Packed", "Assigned")
+            if self.status not in allowed or self.pickup_datetime:
+                frappe.throw(
+                    _(
+                        "Manifest {0} has already entered physical movement "
+                        "(status: {1}). Use Initiate Recall instead."
+                    ).format(self.name, self.status),
+                    title=_("Recall Required"),
+                )
+
+            reversed_ses = self._reverse_stock_entries(
+                reason=reason,
+                reference=f"manifest {self.name} pre-departure cancellation",
+                allow_original_cancellation=True,
+            )
+            self.reversed_stock_entries = ", ".join(reversed_ses) if reversed_ses else "—"
+            if cint(self.get("ewaybill_count")) or self.get("ewaybill_status") in (
+                "Generated",
+                "Partial",
+            ):
+                self.ewaybill_status = "Cancelled"
+            self.cancellation_reason = reason
+            self.cancelled_by = frappe.session.user
+            self.cancelled_on = now_datetime()
+            self.status = "Cancelled"
+            self.flags.ignore_validate_update_after_submit = True
+
+            if self.docstatus == 1:
+                self.save(ignore_permissions=True)
+                self.flags.stock_reversal_completed = True
+                self.cancel()
+            else:
+                self.save(ignore_permissions=True)
+
+            self.add_comment(
+                "Comment",
+                _(
+                    "Manifest cancelled before departure by {0}. Reason: {1}. "
+                    "Stock reversal: {2}"
+                ).format(
+                    self.cancelled_by,
+                    reason,
+                    self.reversed_stock_entries,
+                ),
+            )
+            return reversed_ses
+        finally:
+            frappe.db.sql("SELECT RELEASE_LOCK(%s)", (lock_key,))
+
     def initiate_recall(self, reason, notes=None):
         """Store/warehouse manager initiates a transfer recall.
 
-        Allowed from: Packed, Assigned, In Transit, Delivered.
+        Allowed from: Packed, Assigned, Pickup Started, In Transit, Delivered.
         Sends email + in-app notification to driver and store contacts.
         """
         lock_key = f"manifest_recall_{frappe.scrub(self.name)}"
@@ -1914,7 +2019,7 @@ class CHTransferManifest(Document):
         if not lock_result:
             frappe.throw(frappe._("Manifest {0} is being recalled by another user. Please refresh and try again.").format(self.name))
         try:
-            allowed = ("Packed", "Assigned", "In Transit", "Delivered")
+            allowed = ("Packed", "Assigned", "Pickup Started", "In Transit", "Delivered")
             if self.status not in allowed:
                 frappe.throw(
                     _("Recall can only be initiated when status is one of: {0}. Current status: {1}.").format(
@@ -1933,6 +2038,18 @@ class CHTransferManifest(Document):
             self.status = "Recall Initiated"
             self.flags.ignore_validate_update_after_submit = True
             self.save()
+
+            # Freeze every linked custom transit Stock Entry before notifying
+            # the driver. If any entry is already received, the whole request
+            # rolls back and a new reverse transfer is required instead.
+            from ch_erp15.ch_erp15.custom.stock_entry import request_transfer_return
+
+            for row in self.transfers:
+                request_transfer_return(
+                    row.stock_entry,
+                    reason=reason,
+                    reference=f"manifest {self.name}",
+                )
 
             self.add_comment(
                 "Comment",
@@ -1954,11 +2071,84 @@ class CHTransferManifest(Document):
         finally:
             frappe.db.sql("SELECT RELEASE_LOCK(%s)", (lock_key,))
 
-    def confirm_return(self, return_photo):
+    def get_return_requirements(self):
+        """Return ledger-derived quantities/IMEIs required at source."""
+        from ch_erp15.ch_erp15.custom.stock_entry import get_transfer_return_inventory
+
+        inventory = []
+        for row in self.transfers:
+            inventory.extend(get_transfer_return_inventory(row.stock_entry))
+        serials = list(dict.fromkeys(
+            serial_no
+            for item in inventory
+            for serial_no in item.get("serials", [])
+        ))
+        return {
+            "items": inventory,
+            "serials": serials,
+            "serial_count": len(serials),
+            "total_qty": sum(flt(item.get("qty")) for item in inventory),
+        }
+
+    @staticmethod
+    def _parse_returned_serials(returned_serials):
+        if returned_serials is None:
+            return []
+        if isinstance(returned_serials, str):
+            value = returned_serials.strip()
+            if value.startswith("["):
+                returned_serials = frappe.parse_json(value)
+            else:
+                returned_serials = value.replace(",", "\n").splitlines()
+        if not isinstance(returned_serials, (list, tuple)):
+            frappe.throw(_("Returned IMEIs must be a list or one value per line."))
+        serials = [str(value).strip() for value in returned_serials if str(value).strip()]
+        if len(serials) != len(set(serials)):
+            frappe.throw(
+                _("The same returned IMEI was scanned more than once."),
+                title=_("Duplicate Return Scan"),
+            )
+        return serials
+
+    @staticmethod
+    def _parse_returned_quantities(returned_quantities):
+        if returned_quantities is None:
+            return {}
+        if isinstance(returned_quantities, str):
+            returned_quantities = frappe.parse_json(returned_quantities)
+        if not isinstance(returned_quantities, (list, tuple)):
+            frappe.throw(_("Returned quantities must be a list of counted rows."))
+
+        counts = {}
+        for row in returned_quantities:
+            row = frappe._dict(row or {})
+            key = (str(row.stock_entry or "").strip(), str(row.row_name or "").strip())
+            if not all(key):
+                frappe.throw(_("Every returned quantity row requires its Stock Entry and row ID."))
+            if key in counts:
+                frappe.throw(
+                    _("The same non-serialized return row was counted more than once."),
+                    title=_("Duplicate Return Count"),
+                )
+            try:
+                qty = float(row.qty)
+            except (TypeError, ValueError):
+                qty = -1
+            if not math.isfinite(qty) or qty < 0:
+                frappe.throw(_("Returned quantity must be a non-negative number."))
+            counts[key] = qty
+        return counts
+
+    def confirm_return(
+        self,
+        return_photo,
+        returned_serials=None,
+        returned_quantities=None,
+    ):
         """Delivery person confirms all items have been physically returned to source.
 
-        Creates reverse Stock Entries (cancels original SEs) to reinstate stock at source.
-        Status → Returned.
+        Exact IMEI reconciliation is mandatory for serialized inventory. The
+        manifest becomes Returned only after every stock reversal succeeds.
         """
         lock_key = f"manifest_return_{frappe.scrub(self.name)}"
         lock_result = frappe.db.sql("SELECT GET_LOCK(%s, 10)", (lock_key,))[0][0]
@@ -1977,11 +2167,68 @@ class CHTransferManifest(Document):
             if not return_photo:
                 frappe.throw(_("Return photo is mandatory."), title=_("Transfer Return Error"))
 
+            requirements = self.get_return_requirements()
+            expected = set(requirements["serials"])
+            scanned_values = self._parse_returned_serials(returned_serials)
+            scanned = set(scanned_values)
+            if expected != scanned:
+                missing = sorted(expected - scanned)
+                unexpected = sorted(scanned - expected)
+                details = []
+                if missing:
+                    details.append(_("missing: {0}").format(", ".join(missing)))
+                if unexpected:
+                    details.append(_("not on manifest: {0}").format(", ".join(unexpected)))
+                frappe.throw(
+                    _(
+                        "Returned IMEI reconciliation failed ({0}). Scan every "
+                        "serialized device physically received at the source."
+                    ).format("; ".join(details) or _("scan mismatch")),
+                    title=_("Return Scan Mismatch"),
+                )
+
+            expected_counts = {
+                (str(row.get("stock_entry") or ""), str(row.get("row_name") or "")): flt(
+                    row.get("qty")
+                )
+                for row in requirements["items"]
+                if not row.get("serials") and flt(row.get("qty")) > 0
+            }
+            counted = self._parse_returned_quantities(returned_quantities)
+            quantity_errors = []
+            for key, expected_qty in expected_counts.items():
+                if key not in counted:
+                    quantity_errors.append(
+                        _("{0}/{1}: count not entered").format(key[0], key[1])
+                    )
+                elif abs(counted[key] - expected_qty) > 0.000001:
+                    quantity_errors.append(
+                        _("{0}/{1}: expected {2}, counted {3}").format(
+                            key[0], key[1], expected_qty, counted[key]
+                        )
+                    )
+            unexpected_counts = sorted(set(counted) - set(expected_counts))
+            quantity_errors.extend(
+                _("{0}/{1}: row is not expected on this return").format(*key)
+                for key in unexpected_counts
+            )
+            if quantity_errors:
+                frappe.throw(
+                    _(
+                        "Non-serialized quantity reconciliation failed:<br>{0}"
+                    ).format("<br>".join(quantity_errors)),
+                    title=_("Return Count Mismatch"),
+                )
+
             self.return_photo = return_photo
             self.return_confirmed_by = frappe.session.user
             self.return_confirmed_at = now_datetime()
 
-            reversed_ses = self._reverse_stock_entries()
+            reversed_ses = self._reverse_stock_entries(
+                reason=self.recall_reason or _("Manifest recall"),
+                reference=f"manifest {self.name} confirmed return",
+                allow_original_cancellation=False,
+            )
             self.reversed_stock_entries = ", ".join(reversed_ses) if reversed_ses else "—"
 
             self.status = "Returned"
@@ -1998,71 +2245,273 @@ class CHTransferManifest(Document):
 
             self.add_comment(
                 "Comment",
-                _("Return confirmed by {0} at {1}. Stock reversed: {2}").format(
+                _(
+                    "Return confirmed by {0} at {1}. IMEIs reconciled: {2}; "
+                    "non-serialized rows counted: {3}. Stock reversed: {4}"
+                ).format(
                     self.return_confirmed_by,
                     self.return_confirmed_at,
+                    len(scanned),
+                    len(counted),
                     self.reversed_stock_entries,
                 ),
             )
 
+            self._maybe_finalize_recalled_trip()
+            self._maybe_auto_close_parent_trip()
             return reversed_ses
         finally:
             frappe.db.sql("SELECT RELEASE_LOCK(%s)", (lock_key,))
 
-    def _reverse_stock_entries(self):
-        """Cancel the underlying submitted Stock Entries to return stock to source.
+    def _reverse_stock_entries(
+        self,
+        reason,
+        reference=None,
+        allow_original_cancellation=False,
+    ):
+        """Reverse every linked Stock Entry or fail the whole transaction.
 
-        Falls back to creating a reverse Material Transfer SE if cancel fails
-        (e.g. dependent documents exist).
-        Returns list of action strings for audit log.
+        Custom CH transit entries use their own in-transit ledger and must be
+        reversed through that service. Before departure, plain submitted
+        ERPNext Material Transfers may use immutable-ledger cancellation.
+        After departure, the original is never cancelled: a current-date
+        compensating Stock Entry preserves the legal and accounting history.
         """
+        from ch_erp15.ch_erp15.custom.stock_entry import reverse_transfer_to_source
+
+        if allow_original_cancellation:
+            # Do the statutory preflight for every document before touching
+            # stock, so one non-cancellable e-Way Bill cannot leave a
+            # multi-document manifest partially reversed.
+            for row in self.transfers:
+                se = frappe.get_doc("Stock Entry", row.stock_entry)
+                custom_status = (se.get("custom_status") or "").strip()
+                if se.docstatus == 1 and not custom_status:
+                    self._validate_ewaybill_cancellation(se)
+
         results = []
         for row in self.transfers:
             se_name = row.stock_entry
-            try:
-                se = frappe.get_doc("Stock Entry", se_name)
-                if se.docstatus != 1:
-                    results.append(f"{se_name} (skipped — not submitted)")
-                    continue
-                se.cancel()
-                results.append(f"{se_name} (cancelled)")
-            except Exception as primary_err:
-                # Cancel failed — create a reverse SE instead
+            se = frappe.get_doc("Stock Entry", se_name)
+
+            custom_action = reverse_transfer_to_source(
+                se,
+                reason=reason,
+                reference=reference or f"manifest {self.name}",
+            )
+            if custom_action:
+                results.append(custom_action)
+                continue
+
+            if se.docstatus == 2:
+                results.append(f"{se_name} (already cancelled)")
+                continue
+            if se.docstatus == 0:
+                results.append(f"{se_name} (no posted stock movement)")
+                continue
+
+            if not allow_original_cancellation:
                 try:
-                    reverse_name = self._create_reverse_se(se_name)
+                    reverse_name = self._create_reverse_se(se_name, reason=reason)
                     results.append(f"{se_name} → reverse {reverse_name}")
-                except Exception as reverse_err:
+                except Exception:
                     frappe.log_error(
                         frappe.get_traceback(),
                         f"Recall: could not reverse SE {se_name} for manifest {self.name}",
                     )
-                    results.append(f"{se_name} (ERROR: {str(primary_err)[:80]})")
+                    frappe.throw(
+                        _(
+                            "Compensating Stock Entry failed for {0}. Manifest "
+                            "{1} remains in Recall Initiated; correct the stock "
+                            "dependency and retry."
+                        ).format(se_name, self.name),
+                        title=_("Atomic Stock Reversal Failed"),
+                    )
+                continue
+
+            ewaybill = (se.get("ewaybill") or "").strip()
+            savepoint = f"manifest_reverse_{frappe.generate_hash(length=10)}"
+            frappe.db.savepoint(savepoint)
+            try:
+                se.cancel()
+                if ewaybill and frappe.db.get_value("Stock Entry", se_name, "ewaybill"):
+                    frappe.throw(
+                        _(
+                            "e-Way Bill {0} is still active after cancellation "
+                            "of Stock Entry {1}."
+                        ).format(ewaybill, se_name),
+                        title=_("e-Way Bill Cancellation Failed"),
+                    )
+                results.append(f"{se_name} (cancelled)")
+                frappe.db.release_savepoint(savepoint)
+            except Exception:
+                frappe.db.rollback(save_point=savepoint)
+                if ewaybill:
+                    frappe.throw(
+                        _(
+                            "Stock Entry {0} was not cancelled because e-Way "
+                            "Bill {1} could not be cancelled safely. Resolve it "
+                            "in India Compliance and retry."
+                        ).format(se_name, ewaybill),
+                        title=_("Statutory Cancellation Blocked"),
+                    )
+                try:
+                    reverse_name = self._create_reverse_se(se_name, reason=reason)
+                    results.append(f"{se_name} → reverse {reverse_name}")
+                except Exception:
+                    frappe.log_error(
+                        frappe.get_traceback(),
+                        f"Recall: could not reverse SE {se_name} for manifest {self.name}",
+                    )
+                    frappe.throw(
+                        _(
+                            "Stock reversal failed for {0}. Manifest {1} remains "
+                            "unchanged; resolve the Stock Entry dependency and retry."
+                        ).format(se_name, self.name),
+                        title=_("Atomic Stock Reversal Failed"),
+                    )
         return results
 
-    def _create_reverse_se(self, se_name):
-        """Create a new Material Transfer SE that reverses the direction (dest → source)."""
+    @staticmethod
+    def _validate_ewaybill_cancellation(stock_entry):
+        """Block pre-departure cancellation unless its live EWB can be retired.
+
+        India Compliance auto-cancels only within the statutory 24-hour
+        window. Its default hook otherwise permits the accounting document to
+        cancel while the portal EWB remains live, which is not acceptable for
+        this controlled logistics action.
+        """
+        ewaybill = (stock_entry.get("ewaybill") or "").strip()
+        if not ewaybill:
+            return
+
+        log = frappe.db.get_value(
+            "e-Waybill Log",
+            ewaybill,
+            ["is_cancelled", "created_on"],
+            as_dict=True,
+        )
+        if not log:
+            frappe.throw(
+                _(
+                    "e-Way Bill {0} on Stock Entry {1} has no India Compliance "
+                    "log. Synchronize the EWB before cancelling the manifest."
+                ).format(ewaybill, stock_entry.name),
+                title=_("e-Way Bill Audit Missing"),
+            )
+        if cint(log.is_cancelled):
+            frappe.throw(
+                _(
+                    "e-Way Bill {0} is already cancelled on the portal but is "
+                    "still linked to Stock Entry {1}. Refresh/synchronize the "
+                    "Stock Entry before retrying."
+                ).format(ewaybill, stock_entry.name),
+                title=_("e-Way Bill Sync Required"),
+            )
+
+        try:
+            from india_compliance.gst_india.utils import is_api_enabled
+
+            settings = frappe.get_cached_doc("GST Settings")
+        except (ImportError, frappe.DoesNotExistError):
+            settings = None
+
+        if not (
+            settings
+            and settings.enable_e_waybill
+            and settings.auto_cancel_e_waybill
+            and settings.reason_for_e_waybill_cancellation
+            and is_api_enabled(settings)
+        ):
+            frappe.throw(
+                _(
+                    "Stock Entry {0} has active e-Way Bill {1}. Enable API "
+                    "auto-cancellation and its cancellation reason in GST "
+                    "Settings, or cancel the EWB manually before cancelling "
+                    "this manifest."
+                ).format(stock_entry.name, ewaybill),
+                title=_("e-Way Bill Cancellation Required"),
+            )
+
+        if not log.created_on or add_to_date(
+            get_datetime(log.created_on), days=1
+        ) < now_datetime():
+            frappe.throw(
+                _(
+                    "e-Way Bill {0} is outside the 24-hour cancellation window. "
+                    "The manifest cannot be represented as cancelled; use the "
+                    "documented statutory exception/return process."
+                ).format(ewaybill),
+                title=_("Statutory Cancellation Window Closed"),
+            )
+
+    def _create_reverse_se(self, se_name, reason=None):
+        """Create a current-date compensating transfer (destination → source)."""
+        from ch_erp15.ch_erp15.custom.stock_entry import _transfer_item_serials
+
         original = frappe.get_doc("Stock Entry", se_name)
         reverse = frappe.new_doc("Stock Entry")
         reverse.stock_entry_type = "Material Transfer"
         reverse.from_warehouse = original.to_warehouse
         reverse.to_warehouse = original.from_warehouse
         reverse.company = original.company
-        reverse.remarks = _("Reverse transfer for recall of manifest {0} (original SE: {1})").format(
-            self.name, se_name
+        if reverse.meta.has_field("custom_transfer_type"):
+            reverse.custom_transfer_type = (
+                original.get("custom_transfer_type") or "Warehouse Transfer"
+            )
+        reverse.remarks = _(
+            "Compensating transfer for manifest {0}; original Stock Entry {1}. "
+            "Reason: {2}"
+        ).format(
+            self.name, se_name, reason or self.recall_reason or _("Manifest reversal")
         )
         for item in original.items:
-            reverse.append("items", {
+            source = item.t_warehouse or original.to_warehouse
+            target = item.s_warehouse or original.from_warehouse
+            values = {
                 "item_code": item.item_code,
                 "qty": item.qty,
                 "uom": item.uom,
-                "serial_no": item.serial_no,
                 "batch_no": item.batch_no,
-                "s_warehouse": original.to_warehouse,
-                "t_warehouse": original.from_warehouse,
-            })
+                "s_warehouse": source,
+                "t_warehouse": target,
+            }
+            serials = _transfer_item_serials(item)
+            if serials:
+                values["serial_no"] = "\n".join(serials)
+            reverse.append("items", values)
         reverse.insert(ignore_permissions=True)
+        # This is the controlled system-generated compensating document. The
+        # normal UI guard correctly blocks ad-hoc direct Material Transfers.
+        reverse.flags.ignore_procurement_guardrails = True
         reverse.submit()
         return reverse.name
+
+    def _maybe_finalize_recalled_trip(self):
+        """Cancel an aborted trip only after all manifests are reconciled."""
+        trip_name = self.get("trip")
+        if not trip_name:
+            return
+        trip = frappe.get_doc("CH Logistics Trip", trip_name)
+        if not trip.get("cancellation_reason") or trip.status in ("Closed", "Cancelled"):
+            return
+        rows = frappe.get_all(
+            "CH Transfer Manifest",
+            filters={"trip": trip_name, "docstatus": ["<", 2]},
+            fields=["name", "status"],
+        )
+        blocking = [
+            row.name
+            for row in rows
+            if (row.status or "Draft") not in ("Returned", "Cancelled")
+        ]
+        if blocking:
+            return
+        trip.mark_cancelled_after_recall()
+        trip.save(ignore_permissions=True)
+        if trip.driver:
+            from ch_logistics.api.logistics_api import _set_driver_availability
+            _set_driver_availability(trip.driver, "Available", None)
 
     def _notify_recall_driver(self):
         """Send email + in-app notification to the assigned driver."""
