@@ -384,7 +384,7 @@ class DeliveryApp {
                     <i class="fa fa-exclamation-triangle"></i> ${__("Failed Delivery (mid-trip)")}
                 </button>`;
             }
-        } else if (d.status === "Received" || d.status === "Partially Received") {
+        } else if (d.status === "Received") {
             action_html = `<button id="da-manifest-close-btn" class="btn btn-success btn-lg btn-block da-action-btn">
                 <i class="fa fa-archive"></i> ${__("Close Manifest")}
             </button>`;
@@ -1190,7 +1190,7 @@ class DeliveryApp {
                      data-name="${frappe.utils.escape_html(m.name)}">
                     <span><i class="fa fa-file-text-o"></i> ${frappe.utils.escape_html(m.name)}</span>
                     <span class="da-card-status da-status-${(m.status || "").toLowerCase().replace(/\s+/g, "-")}">${frappe.utils.escape_html(m.status)}</span>
-                    ${["Received", "Partially Received"].includes(m.status)
+                    ${m.status === "Received"
                         ? `<button class="btn btn-xs btn-success da-stop-manifest-close-btn" data-name="${frappe.utils.escape_html(m.name)}"><i class="fa fa-archive"></i> ${__("Close")}</button>`
                         : (m.status === "Delivered"
                             ? `<span class="da-awaiting-pill text-muted" style="font-size:11px;" title="${__("The destination store must Scan & Receive this shipment")}"><i class="fa fa-clock-o"></i> ${__("Awaiting receipt")}</span>`

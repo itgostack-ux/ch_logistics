@@ -1649,7 +1649,10 @@ class LogisticsCommandCenter {
 				$input.val("");
 				if (!value) return;
 				if (!expected.has(value)) {
-					frappe.show_alert({ message: __("IMEI {0} is not expected", [value]), indicator: "red" }, 5);
+					frappe.show_alert({
+						message: __("Scanned IMEI is wrong. Please scan the correct item."),
+						indicator: "red",
+					}, 5);
 					return;
 				}
 				if (scanned.has(value)) {

@@ -874,7 +874,7 @@ async function show_return_confirm_dialog(frm, api) {
             if (!value) return;
             if (!expected.has(value)) {
                 frappe.show_alert({
-                    message: __("IMEI {0} is not expected on this manifest", [value]),
+                    message: __("Scanned IMEI is wrong. Please scan the correct item."),
                     indicator: "red",
                 }, 5);
                 return;

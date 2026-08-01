@@ -41,6 +41,27 @@ class _FakeDocument(dict):
 
 
 class TestLogisticsReleaseSecurityBoundaries(unittest.TestCase):
+    def test_trip_assignment_promotes_draft_and_packed_manifests_to_assigned(self):
+        rows = [
+            frappe._dict(name="MAN-DRAFT", docstatus=0, status="Draft", driver=None),
+            frappe._dict(name="MAN-PACKED", docstatus=0, status="Packed", driver=None),
+        ]
+        with (
+            patch.object(logistics_api, "_has_manifest_trip_field", return_value=True),
+            patch.object(logistics_api.role_registry, "get_int_setting", return_value=500),
+            patch.object(logistics_api.frappe, "get_all", return_value=rows),
+            patch.object(logistics_api.frappe.db, "get_value", return_value=None),
+            patch.object(logistics_api.frappe.db, "bulk_update") as bulk_update,
+        ):
+            propagated = logistics_api._propagate_trip_driver_to_manifests(
+                "TRIP-2", "DRIVER-1"
+            )
+
+        self.assertEqual(propagated, ["MAN-DRAFT", "MAN-PACKED"])
+        updates = bulk_update.call_args.args[1]
+        self.assertEqual(updates["MAN-DRAFT"]["status"], "Assigned")
+        self.assertEqual(updates["MAN-PACKED"]["status"], "Assigned")
+
     def test_notification_policy_excludes_privileged_and_configured_roles(self):
         with (
             patch.object(

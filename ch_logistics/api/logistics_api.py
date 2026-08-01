@@ -245,10 +245,11 @@ def _propagate_trip_driver_to_manifests(trip, driver, vehicle=None):
             payload["driver_phone"] = drv_phone
         if vehicle and frappe.get_meta("CH Transfer Manifest").has_field("vehicle"):
             payload["vehicle"] = vehicle
-        # If the manifest is still Packed and the trip-level assignment is
-        # what's putting a driver on it, also flip it to Assigned so the
-        # driver app shows it under "To Pick Up".
-        if r.get("status") == "Packed":
+        # Every attached pre-pickup manifest must enter the scannable state.
+        # Leaving Draft rows as Draft made a driver's next trip visible while
+        # the Delivery App hid its barcode controls (it only scans Assigned /
+        # Pickup Started / In Transit manifests).
+        if r.get("status") in ("Draft", "Packed"):
             payload["status"] = "Assigned"
         updates[r.name] = payload
     if updates:

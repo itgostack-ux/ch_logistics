@@ -1323,8 +1323,8 @@ class CHTransferManifest(Document):
             frappe.db.sql("SELECT RELEASE_LOCK(%s)", (lock_key,))
 
     def close_manifest(self):
-        if self.status not in ("Received", "Partially Received"):
-            frappe.throw(_("Can only close when status is Received or Partially Received."), title=_("Ch Transfer Manifest Error"))
+        if self.status != "Received":
+            frappe.throw(_("Can only close when status is Received."), title=_("Ch Transfer Manifest Error"))
         self.status = "Closed"
         self.flags.ignore_validate_update_after_submit = True
         self.save()

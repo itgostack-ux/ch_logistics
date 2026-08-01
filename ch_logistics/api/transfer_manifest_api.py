@@ -506,7 +506,7 @@ def driver_close_manifest(manifest, close_note=None) -> dict:
     if doc.status == "Closed":
         return {"status": doc.status, "trip": doc.trip}
 
-    if doc.status in ("Received", "Partially Received"):
+    if doc.status == "Received":
         if close_note:
             doc.add_comment("Comment", _("Driver close note: {0}").format(close_note))
         doc.close_manifest()
@@ -527,7 +527,7 @@ def driver_close_manifest(manifest, close_note=None) -> dict:
         )
 
     frappe.throw(
-        _("Manifest can be closed only after it is Received (current: {0}).").format(doc.status)
+        _("Manifest can be closed only after it is fully Received (current: {0}).").format(doc.status)
     )
 
 
