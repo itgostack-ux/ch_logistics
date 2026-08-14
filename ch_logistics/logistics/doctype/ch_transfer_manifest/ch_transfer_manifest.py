@@ -68,6 +68,33 @@ class CHTransferManifest(Document):
         self._compute_totals()
         self._validate_packing()
         self._validate_transfers()
+        # Must run AFTER _validate_server_managed_fields(): qr_payload is a
+        # server-managed field, so seeding it before that check would trip the
+        # forgery guard on the very save that mints it.
+        self._ensure_qr_payload()
+
+    def _ensure_qr_payload(self):
+        """Mint the pickup-scan token at save time, not at driver assignment.
+
+        Box labels are printed at pack time — before a driver is assigned — so
+        a token minted only at assignment leaves the printed QR encoding the
+        manifest name. ``start_pickup`` then mints a fresh token and
+        auto-authorises whatever the driver scanned, which silently turns the
+        scan gate into a no-op. Minting here keeps one stable token from the
+        first save through pickup, so the printed label stays valid and the
+        gate stays real.
+
+        Draft-only by design: ``qr_payload`` is not ``allow_on_submit``, so
+        assigning it here on a submitted manifest would trip Frappe's
+        "not allowed to change after submit" guard. Submitted rows that predate
+        this are covered by ``ensure_secure_qr_token()``, which uses ``db_set``
+        and is safe post-submit.
+        """
+        if self.docstatus != 0:
+            return
+        token = (self.qr_payload or "").strip()
+        if len(token) < 22 or token == self.name:
+            self.qr_payload = frappe.generate_hash(length=32)
 
     def _validate_server_managed_fields(self):
         """Prevent ordinary CRUD from forging logistics lifecycle evidence."""

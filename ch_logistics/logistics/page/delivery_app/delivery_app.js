@@ -467,6 +467,7 @@ class DeliveryApp {
                 {
                     fieldname: "scanned_qr",
                     fieldtype: "Data",
+                    options: "Barcode",
                     label: __("Scan / Enter Manifest QR"),
                     reqd: 1,
                     description: __("Scan the manifest/order QR. Pickup is blocked until it matches."),
@@ -690,6 +691,7 @@ class DeliveryApp {
                 {
                     fieldname: "scanned_qr",
                     fieldtype: "Data",
+                    options: "Barcode",
                     label: __("Scan / Enter Manifest QR"),
                     reqd: 1,
                     description: __("Scan the manifest/order QR at the receiver. Delivery is blocked until it matches."),
@@ -1538,6 +1540,7 @@ class DeliveryApp {
         const qr_fields = source_manifests.map((m) => ({
             fieldname: `qr__${m.name.replace(/[^A-Za-z0-9_]/g, "_")}`,
             fieldtype: "Data",
+            options: "Barcode",
             label: __("Scan QR for {0}", [m.name]),
             reqd: 1,
         }));
@@ -1996,6 +1999,7 @@ class DeliveryApp {
         const qr_fields = candidates.map((m) => ({
             fieldname: `qr__${m.name.replace(/[^A-Za-z0-9_]/g, "_")}`,
             fieldtype: "Data",
+            options: "Barcode",
             label: __("QR for {0}", [m.name]),
             reqd: 1,
         }));
@@ -2203,6 +2207,7 @@ class DeliveryApp {
             per_manifest_fields.push({
                 fieldname: `qr__${safe}`,
                 fieldtype: "Data",
+                options: "Barcode",
                 label: __("Scan QR for {0}", [r.manifest.name]),
                 reqd: 1,
             });
@@ -2356,6 +2361,7 @@ class DeliveryApp {
             {
                 fieldname: "scanned_qr",
                 fieldtype: "Data",
+                options: "Barcode",
                 label: __("Scan Stop Pickup QR"),
                 reqd: 1,
                 description: __("Scan the consolidated pickup label printed at dispatch. Pickup is blocked until it matches."),
@@ -2507,6 +2513,7 @@ class DeliveryApp {
             {
                 fieldname: "scanned_qr",
                 fieldtype: "Data",
+                options: "Barcode",
                 label: __("Scan Stop Delivery QR"),
                 reqd: 1,
                 description: __("Scan the consolidated drop label printed at dispatch. Delivery is blocked until it matches."),
