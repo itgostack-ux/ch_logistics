@@ -206,6 +206,17 @@ def _sweep_store_tree_warehouses():
     fragment instead, and delete leaves before the groups they hang off.
     """
     code = _TAG.replace("-", "")
+    # POS Profiles first. CH Store auto-provisions one per store, and the
+    # warehouse delete below passes force=1 which skips link validation — so
+    # leaving them behind strands profiles pointing at warehouses that no
+    # longer exist.
+    for p in frappe.get_all("POS Profile", filters={"name": ["like", f"%{code}%"]},
+                            pluck="name"):
+        try:
+            frappe.delete_doc("POS Profile", p, force=1,
+                              ignore_permissions=True, delete_permanently=True)
+        except Exception:
+            pass
     rows = frappe.get_all("Warehouse", filters={"name": ["like", f"%{code}%"]},
                           fields=["name", "is_group"])
     for w in sorted(rows, key=lambda r: r.is_group):
