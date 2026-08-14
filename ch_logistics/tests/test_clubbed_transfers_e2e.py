@@ -63,15 +63,38 @@ def _ensure_warehouse(name, abbr):
     return wh.name
 
 
+def _store_location():
+    """Resolve a (city, zone) pair for this test's company.
+
+    ``CH Store._validate_operational_location`` requires Company + City + Zone
+    on any Active store, and it runs *before*
+    ``validate_store_location_contract`` — which is what would otherwise derive
+    city from zone. So the fixture has to supply both explicitly.
+    """
+    company = _company()
+    zone = frappe.db.get_value(
+        "CH Store Zone", {"company": company}, ["name", "city"], as_dict=True
+    ) or frappe.db.get_value("CH Store Zone", {}, ["name", "city"], as_dict=True)
+    if not zone:
+        raise RuntimeError("No CH Store Zone exists; seed store zones before running this test.")
+    city = zone.city or frappe.db.get_value("CH City", {}, "name")
+    if not city:
+        raise RuntimeError("No CH City exists; seed cities before running this test.")
+    return city, zone.name
+
+
 def _ensure_store(name, warehouse):
     # CH Store autonames by store code — look up by store_name.
     existing = frappe.db.get_value("CH Store", {"store_name": name, "company": _company()})
     if existing:
         return existing
+    city, zone = _store_location()
     s = frappe.new_doc("CH Store")
     s.store_name = name
     s.company = _company()
     s.warehouse = warehouse
+    s.city = city
+    s.zone = zone
     s.insert(ignore_permissions=True)
     return s.name
 
@@ -105,6 +128,11 @@ def _build_fixtures():
     s2_wh = _ensure_warehouse(f"{_TAG}-S2", abbr)
     store_1 = _ensure_store(f"{_TAG}-Store1", s1_wh)
     store_2 = _ensure_store(f"{_TAG}-Store2", s2_wh)
+    # CH Store.on_update restructures the store tree and renames the sellable
+    # leaf to its canonical path, so the names captured above are stale the
+    # moment the store exists. Re-read them from the store.
+    s1_wh = frappe.db.get_value("CH Store", store_1, "warehouse") or s1_wh
+    s2_wh = frappe.db.get_value("CH Store", store_2, "warehouse") or s2_wh
 
     # Five manifests in the dispatcher's order of arrival.
     m1 = _make_manifest(source_wh, s1_wh, store_1, 1)  # 10:00 → S1
@@ -164,7 +192,28 @@ def _teardown():
                               ignore_permissions=True, delete_permanently=True)
         except Exception:
             pass
+    _sweep_store_tree_warehouses()
     frappe.db.commit()
+
+
+def _sweep_store_tree_warehouses():
+    """Delete the warehouse tree CH Store.on_update builds for the fixtures.
+
+    restructure_store_tree renames the sellable leaf and creates the store's
+    bin tree (Buyback / Damaged / Demo plus the group) under a canonical
+    GG-<STORECODE>-N name. None of those match ``{_TAG}-%``, so the sweep above
+    misses them and every run leaks a fresh set. Match on the store-code
+    fragment instead, and delete leaves before the groups they hang off.
+    """
+    code = _TAG.replace("-", "")
+    rows = frappe.get_all("Warehouse", filters={"name": ["like", f"%{code}%"]},
+                          fields=["name", "is_group"])
+    for w in sorted(rows, key=lambda r: r.is_group):
+        try:
+            frappe.delete_doc("Warehouse", w.name, force=1,
+                              ignore_permissions=True, delete_permanently=True)
+        except Exception:
+            pass
 
 
 def run():

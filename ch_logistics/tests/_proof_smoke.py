@@ -21,11 +21,19 @@ from ch_logistics.logistics.doctype.ch_transfer_manifest.ch_transfer_manifest im
 )
 
 
+# A real qr_payload is a 32-char random hash. The stub must NOT reuse the
+# manifest name: the QR validators treat a name-equals-token (or anything
+# under 22 chars) as a legacy row and throw "missing a secure QR token"
+# before they ever compare the scan — which would mask the mismatch contract
+# this smoke test exists to lock.
+_SMOKE_TOKEN = "0123456789abcdef0123456789abcdef"
+
+
 def _stub():
     """Build an in-memory manifest stub against the live class (no insert)."""
     doc = frappe.new_doc("CH Transfer Manifest")
     doc.name = "TM-SMOKE-0001"
-    doc.qr_payload = "TM-SMOKE-0001"
+    doc.qr_payload = _SMOKE_TOKEN
     return doc
 
 
@@ -71,7 +79,7 @@ def run():
     _expect(lambda: doc._validate_delivery_qr("WRONG-QR"),
             contains="does not match", label="delivery QR: mismatch throws")
     # Happy path
-    doc._validate_delivery_qr("TM-SMOKE-0001")
+    doc._validate_delivery_qr(_SMOKE_TOKEN)
     print("  PASS  delivery QR: matching token accepted")
 
     # When the flag is off, no scan required.
