@@ -72,7 +72,13 @@ def run():
     print(f"  PASS  pickup: valid Bangalore coords parsed to {lat},{lng}")
 
     print("== mandatory delivery QR validator ==")
-    # Ensure the flag is ON (matches doctype default).
+    # Snapshot the tenant's real setting. This used to hard-code a "restore"
+    # to 1 at the end, so running the smoke test on a site that had delivery-QR
+    # enforcement switched OFF silently switched it ON and committed — a test
+    # changing production policy behind the operator's back.
+    prior_enforce_delivery_qr = frappe.db.get_single_value(
+        "CH Logistics Settings", "enforce_delivery_qr"
+    )
     frappe.db.set_single_value("CH Logistics Settings", "enforce_delivery_qr", 1)
     _expect(lambda: doc._validate_delivery_qr(None),
             contains="mandatory", label="delivery QR: empty throws")
@@ -87,8 +93,10 @@ def run():
     doc._validate_delivery_qr(None)
     doc._validate_delivery_qr("anything")
     print("  PASS  delivery QR: bypassed when enforce_delivery_qr=0")
-    # Restore default.
-    frappe.db.set_single_value("CH Logistics Settings", "enforce_delivery_qr", 1)
+    # Restore what the tenant had, not what this test would prefer.
+    frappe.db.set_single_value(
+        "CH Logistics Settings", "enforce_delivery_qr", prior_enforce_delivery_qr
+    )
 
     print("== complete_delivery signature accepts scanned_qr ==")
     import inspect
