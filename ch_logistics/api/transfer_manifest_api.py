@@ -260,7 +260,8 @@ def assign_driver(manifest, driver, courier_partner=None, vehicle_number=None,
 
 @frappe.whitelist(methods=["POST"])
 def start_pickup(manifest, pickup_photo, lat=None, lng=None, notes=None,
-                 scanned_qr=None) -> dict:
+                 scanned_qr=None, gps_accuracy_m=None,
+                 geofence_override_reason=None) -> dict:
     _require_stage_role("start_pickup")
     doc = frappe.get_doc("CH Transfer Manifest", manifest)
     doc.check_permission("write")
@@ -294,7 +295,8 @@ def start_pickup(manifest, pickup_photo, lat=None, lng=None, notes=None,
             title=frappe._("Label Out Of Date"),
         )
     doc.start_pickup(pickup_photo=pickup_photo, lat=lat, lng=lng, notes=notes,
-                     scanned_qr=scanned_qr)
+                     scanned_qr=scanned_qr, gps_accuracy_m=gps_accuracy_m,
+                     geofence_override_reason=geofence_override_reason)
     return {"status": doc.status}
 
 
@@ -401,7 +403,8 @@ def bulk_reject_other_assignments(accepted_manifest, rejection_reason,
 
 
 @frappe.whitelist(methods=["POST"])
-def mark_reached_destination(manifest, lat, lng) -> dict:
+def mark_reached_destination(manifest, lat, lng, gps_accuracy_m=None,
+                             geofence_override_reason=None) -> dict:
     """Driver \"Reached Location\" ping at the destination.
 
     Captures arrival GPS + timestamp on the manifest while keeping status
@@ -418,7 +421,9 @@ def mark_reached_destination(manifest, lat, lng) -> dict:
     from ch_logistics.api import driver_status as ds
 
     ds.assert_not_on_break(doc.driver)
-    info = doc.mark_reached_destination(lat=lat, lng=lng)
+    info = doc.mark_reached_destination(
+        lat=lat, lng=lng, gps_accuracy_m=gps_accuracy_m,
+        geofence_override_reason=geofence_override_reason)
     return {
         "status": doc.status,
         "arrival_datetime": info.get("arrival_datetime"),
@@ -434,7 +439,8 @@ def mark_reached_destination(manifest, lat, lng) -> dict:
 )
 def complete_delivery(manifest, delivery_photo, receiver_name, otp=None,
                       lat=None, lng=None, scanned_qr=None,
-                      seal_numbers=None) -> dict:
+                      seal_numbers=None, gps_accuracy_m=None,
+                      geofence_override_reason=None) -> dict:
     _require_stage_role("complete_delivery")
     doc = frappe.get_doc("CH Transfer Manifest", manifest)
     doc.check_permission("write")
@@ -470,6 +476,8 @@ def complete_delivery(manifest, delivery_photo, receiver_name, otp=None,
             otp=otp, lat=lat, lng=lng,
             scanned_qr=scanned_qr,
             seal_numbers=seal_numbers,
+            gps_accuracy_m=gps_accuracy_m,
+            geofence_override_reason=geofence_override_reason,
         )
     except DeliveryOTPError as exc:
         # Returning a normal response is deliberate: Frappe rolls the whole

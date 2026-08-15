@@ -500,18 +500,19 @@ class DeliveryApp {
             primary_action_label: __("Confirm Pickup"),
             primary_action: (values) => {
                 d.hide();
-                this._capture_gps((lat, lng) => {
-                    frappe.call({
-                        method: API + "start_pickup",
-                        args: {
+                this._capture_gps((lat, lng, accuracy) => {
+                    // Via _call_promise so a geofence refusal offers the
+                    // reasoned override here too, not only in the stop flows.
+                    this._call_promise(API + "start_pickup", {
                             manifest: this.active_manifest,
                             pickup_photo: values.pickup_photo,
                             scanned_qr: values.scanned_qr,
                             lat, lng,
+                            gps_accuracy_m: accuracy,
                             notes: values.notes,
-                        },
-                        callback: (r) => {
-                            const result = (r && r.message) || {};
+                    }).then(
+                        (message) => {
+                            const result = message || {};
                             if (result.ok === false) {
                                 d.show();
                                 frappe.msgprint({
@@ -528,7 +529,8 @@ class DeliveryApp {
                             this.show_manifest_detail(this.active_manifest);
                             this.load_data();
                         },
-                    });
+                        () => {},
+                    );
                 });
             },
         });
@@ -554,13 +556,13 @@ class DeliveryApp {
             return;
         }
         frappe.dom.freeze(__("Capturing GPS…"));
-        this._capture_gps((lat, lng) => {
+        this._capture_gps((lat, lng, accuracy) => {
             frappe.dom.unfreeze();
-            this._show_arrival_dialog(lat, lng);
+            this._show_arrival_dialog(lat, lng, accuracy);
         });
     }
 
-    _show_arrival_dialog(lat, lng) {
+    _show_arrival_dialog(lat, lng, accuracy) {
         let destination = (this.manifests || []).find(
             m => m.name === this.active_manifest) || {};
         let dest_label = destination.destination_store
@@ -606,13 +608,14 @@ class DeliveryApp {
             primary_action: () => {
                 d.hide();
                 frappe.dom.freeze(__("Recording arrival…"));
-                frappe.call({
-                    method: API + "mark_reached_destination",
-                    args: {
+                // Via _call_promise so a geofence refusal offers the reasoned
+                // override here too.
+                this._call_promise(API + "mark_reached_destination", {
                         manifest: this.active_manifest,
                         lat: lat, lng: lng,
-                    },
-                    callback: () => {
+                        gps_accuracy_m: accuracy,
+                }).then(
+                    () => {
                         frappe.dom.unfreeze();
                         frappe.show_alert({
                             message: __("Arrival recorded. You can now Complete Delivery."),
@@ -627,8 +630,8 @@ class DeliveryApp {
                         this.show_manifest_detail(this.active_manifest);
                         this.load_data();
                     },
-                    error: () => frappe.dom.unfreeze(),
-                });
+                    () => frappe.dom.unfreeze(),
+                );
             },
             secondary_action_label: __("Re-capture GPS"),
             secondary_action: () => {
@@ -752,10 +755,10 @@ class DeliveryApp {
             primary_action_label: __("Confirm Delivery"),
             primary_action: (values) => {
                 d.hide();
-                this._capture_gps((lat, lng) => {
-                    frappe.call({
-                        method: API + "complete_delivery",
-                        args: {
+                this._capture_gps((lat, lng, accuracy) => {
+                    // Via _call_promise so a geofence refusal offers the
+                    // reasoned override here too.
+                    this._call_promise(API + "complete_delivery", {
                             manifest: this.active_manifest,
                             delivery_photo: values.delivery_photo,
                             receiver_name: values.receiver_name,
@@ -763,16 +766,15 @@ class DeliveryApp {
                             otp: values.otp,
                             seal_numbers: values.seal_numbers,
                             lat, lng,
-                        },
-                        callback: () => {
-                            frappe.show_alert({
-                                message: __("Delivery completed!"),
-                                indicator: "green",
-                            });
-                            this.show_manifest_detail(this.active_manifest);
-                            this.load_data();
-                        },
-                    });
+                            gps_accuracy_m: accuracy,
+                    }).then(() => {
+                        frappe.show_alert({
+                            message: __("Delivery completed!"),
+                            indicator: "green",
+                        });
+                        this.show_manifest_detail(this.active_manifest);
+                        this.load_data();
+                    }, () => {});
                 });
             },
             secondary_action_label: __("Resend OTP"),
@@ -1020,7 +1022,9 @@ class DeliveryApp {
             return;
         }
         navigator.geolocation.getCurrentPosition(
-            (pos) => callback(pos.coords.latitude, pos.coords.longitude),
+            // accuracy is passed through so the server can widen the geofence
+            // by the fix's own margin of error instead of trusting it blindly.
+            (pos) => callback(pos.coords.latitude, pos.coords.longitude, pos.coords.accuracy),
             (err) => {
                 frappe.msgprint({
                     title: __("Location Required"),
@@ -1665,8 +1669,8 @@ class DeliveryApp {
         frappe.dom.freeze(__("Accepting trip & loading manifests…"));
         let captured_gps = null;
         return this._capture_gps_promise()
-            .then(({ lat, lng }) => {
-                captured_gps = { lat, lng };
+            .then(({ lat, lng, accuracy }) => {
+                captured_gps = { lat, lng, accuracy };
                 // Step 1: flip Assigned → Started so subsequent stop_arrive /
                 // stop_complete calls are allowed by the server.
                 return this._call_promise(TRIP_API + "driver_accept_trip", {
@@ -1683,6 +1687,7 @@ class DeliveryApp {
                         pickup_photo: values.pickup_photo,
                         scanned_qr: values[qr_key],
                         lat: captured_gps.lat, lng: captured_gps.lng,
+                        gps_accuracy_m: captured_gps.accuracy,
                         notes: values.notes,
                     });
                 });
@@ -1946,6 +1951,54 @@ class DeliveryApp {
         });
     }
 
+    _is_geofence_error(payload) {
+        // The server raises a dedicated GeofenceError so this check does not
+        // depend on a translated message string.
+        const exc = (payload && (payload.exc_type || payload.exc)) || "";
+        return String(exc).indexOf("GeofenceError") !== -1;
+    }
+
+    _prompt_geofence_override() {
+        // Market-standard escape hatch: a driver whose device reports a poor
+        // fix (common inside a warehouse) must not be stranded mid-route. The
+        // reason is mandatory and lands on the manifest and its trip, so the
+        // override is auditable rather than silent.
+        return new Promise((resolve) => {
+            const d = new frappe.ui.Dialog({
+                title: __("Confirm You Are At This Location"),
+                fields: [
+                    {
+                        fieldtype: "HTML",
+                        options: `<div class="alert alert-warning" style="padding:8px 10px;border-radius:6px;">
+                            ${__("Your device's location does not match this stop. If you ARE at the right place, say why — this is recorded against the shipment.")}
+                        </div>`,
+                    },
+                    {
+                        fieldname: "reason",
+                        fieldtype: "Small Text",
+                        label: __("Reason"),
+                        reqd: 1,
+                        description: __("e.g. weak GPS indoors, store entrance is around the back, address pin is wrong."),
+                    },
+                ],
+                primary_action_label: __("Confirm & Continue"),
+                primary_action: (v) => {
+                    const reason = (v.reason || "").trim();
+                    if (reason.length < 10) {
+                        frappe.msgprint(__("Please give a bit more detail (at least 10 characters)."));
+                        return;
+                    }
+                    d.hide();
+                    resolve(reason);
+                },
+                secondary_action_label: __("Cancel"),
+                secondary_action: () => { d.hide(); resolve(null); },
+            });
+            d.onhide = () => resolve(null);
+            d.show();
+        });
+    }
+
     _call_promise(method, args) {
         // Promisified frappe.call so we can chain the multi-manifest sequence
         // without nesting callbacks five levels deep. Server-side messages
@@ -1969,7 +2022,25 @@ class DeliveryApp {
                     }
                     resolve(result);
                 },
-                error: (err) => reject(err),
+                error: (err) => {
+                    // A geofence refusal is recoverable: offer the reasoned
+                    // override and retry once. Anything else propagates as
+                    // before. The retry carries the reason so the server can
+                    // record it — it never simply skips the check.
+                    if (!args || args.geofence_override_reason || !this._is_geofence_error(err)) {
+                        reject(err);
+                        return;
+                    }
+                    this._prompt_geofence_override().then((reason) => {
+                        if (!reason) {
+                            reject(err);
+                            return;
+                        }
+                        this._call_promise(method, Object.assign({}, args, {
+                            geofence_override_reason: reason,
+                        })).then(resolve, reject);
+                    });
+                },
             });
         });
     }
@@ -1991,7 +2062,7 @@ class DeliveryApp {
                 return;
             }
             navigator.geolocation.getCurrentPosition(
-                (pos) => resolve({ lat: pos.coords.latitude, lng: pos.coords.longitude }),
+                (pos) => resolve({ lat: pos.coords.latitude, lng: pos.coords.longitude, accuracy: pos.coords.accuracy }),
                 (err) => {
                     frappe.msgprint({
                         title: __("Location Required"),
@@ -2159,7 +2230,7 @@ class DeliveryApp {
     _submit_stop_pickup(seq, candidates, values) {
         frappe.dom.freeze(__("Recording arrival & pickup…"));
         return this._record_stop_arrival(seq)
-            .then(({ lat, lng }) => {
+            .then(({ lat, lng, accuracy }) => {
                 return this._run_sequential(candidates, (m) => {
                     const qr_key = `qr__${m.name.replace(/[^A-Za-z0-9_]/g, "_")}`;
                     return this._call_promise(API + "start_pickup", {
@@ -2167,6 +2238,7 @@ class DeliveryApp {
                         pickup_photo: values.pickup_photo,
                         scanned_qr: values[qr_key],
                         lat, lng,
+                        gps_accuracy_m: accuracy,
                         notes: values.notes,
                     });
                 });

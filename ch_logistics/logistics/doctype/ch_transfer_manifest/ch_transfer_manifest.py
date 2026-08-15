@@ -41,6 +41,15 @@ def verify_delivery_otp(stored: str | None, candidate: str | None) -> bool:
     return hmac.compare_digest(stored, candidate)
 
 
+class GeofenceError(frappe.ValidationError):
+    """Raised when a driver's location fails the geofence.
+
+    A distinct class so the driver app can recognise this specific refusal and
+    offer the reasoned override, rather than string-matching a message that
+    changes with translation.
+    """
+
+
 class CHTransferManifest(Document):
 
     _SERVER_MANAGED_FIELDS = frozenset({
@@ -767,7 +776,8 @@ class CHTransferManifest(Document):
                 alert=True,
             )
 
-    def start_pickup(self, pickup_photo, lat=None, lng=None, notes=None, scanned_qr=None):
+    def start_pickup(self, pickup_photo, lat=None, lng=None, notes=None, scanned_qr=None,
+                     gps_accuracy_m=None, geofence_override_reason=None):
         lock_key = f"manifest_status_{frappe.scrub(self.name)}"
         lock_result = frappe.db.sql("SELECT GET_LOCK(%s, 10)", (lock_key,))[0][0]
         if not lock_result:
@@ -784,7 +794,9 @@ class CHTransferManifest(Document):
             if not pickup_photo:
                 frappe.throw(_("Pickup photo is mandatory."), title=_("Ch Transfer Manifest Error"))
             # Mandatory driver GPS at pickup location (proof of presence).
-            lat_f, lng_f = self._validate_geo(lat, lng, kind="pickup")
+            lat_f, lng_f = self._validate_geo(lat, lng, kind="pickup",
+                                              accuracy_m=gps_accuracy_m,
+                                              override_reason=geofence_override_reason)
             self.pickup_photo = pickup_photo
             self.pickup_datetime = now_datetime()
             self.pickup_lat = lat_f
@@ -871,7 +883,7 @@ class CHTransferManifest(Document):
             return token, True
         return token, False
 
-    def _validate_geo(self, lat, lng, kind: str):
+    def _validate_geo(self, lat, lng, kind: str, accuracy_m=None, override_reason=None):
         """Mandatory driver-location proof for pickup/delivery.
 
         Treats null / blank / non-numeric / sentinel (0, 0) / out-of-bounds
@@ -903,14 +915,33 @@ class CHTransferManifest(Document):
         # Geofence: the driver must physically be at the correct location — so a
         # parcel can't be picked up at the wrong source or delivered to the wrong
         # store even if the right QR is scanned.
-        self._validate_geofence(lat_f, lng_f, kind)
+        self._validate_geofence(lat_f, lng_f, kind, accuracy_m=accuracy_m,
+                                override_reason=override_reason)
         return lat_f, lng_f
 
-    def _validate_geofence(self, lat_f, lng_f, kind: str):
-        """Reject a pickup/arrival tap that is too far from the expected
-        warehouse. Skips silently when disabled or when the target warehouse has
-        no coordinates (can't compare). Radius + on/off from CH Logistics
-        Settings (default: on, 300 m)."""
+    def _validate_geofence(self, lat_f, lng_f, kind: str, accuracy_m=None,
+                           override_reason=None):
+        """Reject a pickup/arrival/delivery tap that is too far from the expected
+        warehouse.
+
+        Three things this has to get right, none of which it did before:
+
+        * **Fix quality.** A phone inside a warehouse routinely falls back to a
+          network fix accurate to kilometres. Comparing that against a 300 m
+          fence produces a confident "you are 1,840 m away" while the driver
+          stands on the dock. The reported accuracy is now part of the
+          comparison: the fence is widened by it, and a fix too coarse to
+          decide anything is reported as such instead of being read as a
+          location error.
+        * **A way out.** There was none — the message said "report an issue if
+          this is wrong" and no such path existed, so a bad fix stranded the
+          driver mid-route. An explicit reason now overrides the distance check
+          and is recorded against the manifest and its trip.
+        * **Honest coverage.** A location with no coordinates still cannot be
+          checked, but that now leaves an audit note rather than passing
+          silently, so "geofencing is on" cannot be mistaken for
+          "geofencing is enforced everywhere".
+        """
         enforce = frappe.db.get_single_value("CH Logistics Settings", "enforce_geofence")
         if enforce is not None and not int(enforce):
             return
@@ -923,19 +954,76 @@ class CHTransferManifest(Document):
         except Exception:
             return
         if not coords:
-            return  # no target geo → cannot validate, don't block
-        radius_m = cint(frappe.db.get_single_value("CH Logistics Settings", "geofence_radius_m")) or 300
-        dist_m = haversine_km(lat_f, lng_f, coords[0], coords[1]) * 1000.0
-        if dist_m > radius_m:
-            place = (self.source_store or self.source_warehouse) if kind == "pickup" \
-                else (self.destination_store or self.destination_warehouse)
-            action = _("pick up here") if kind == "pickup" else _("deliver here")
-            frappe.throw(
-                _("You are {0} m from {1} (must be within {2} m to {3}). "
-                  "Go to the correct location, or report an issue if this is wrong.")
-                .format(int(dist_m), place, radius_m, action),
-                title=_("Wrong Location"),
+            # Cannot compare — but say so, so an ungeocoded hub is visible as a
+            # gap instead of looking like a location that passed the check.
+            self._note_geofence_event(
+                _("Geofence not applied at {0}: {1} has no coordinates.").format(kind, target_wh)
             )
+            return
+
+        radius_m = cint(frappe.db.get_single_value("CH Logistics Settings", "geofence_radius_m")) or 300
+        place = (self.source_store or self.source_warehouse) if kind == "pickup" \
+            else (self.destination_store or self.destination_warehouse)
+
+        try:
+            acc_m = float(accuracy_m) if accuracy_m not in (None, "") else None
+        except (TypeError, ValueError):
+            acc_m = None
+        if acc_m is not None and acc_m < 0:
+            acc_m = None
+
+        # A fix coarser than this cannot distinguish "at the dock" from "in the
+        # next suburb", so treat it as a failed capture rather than a failed
+        # location. Derived from the radius so tuning the fence tunes this too.
+        max_usable_accuracy_m = radius_m * 3
+        if acc_m is not None and acc_m > max_usable_accuracy_m and not override_reason:
+            frappe.throw(
+                _("Your device reported a location accurate only to {0} m, which is too "
+                  "imprecise to confirm you are at {1}. Step outside for a clearer GPS "
+                  "signal and retry.").format(int(acc_m), place),
+                exc=GeofenceError,
+                title=_("Location Too Imprecise"),
+            )
+
+        dist_m = haversine_km(lat_f, lng_f, coords[0], coords[1]) * 1000.0
+        # Widen the fence by the fix's own margin of error: a reading 400 m out
+        # with +/-300 m accuracy is not evidence the driver is elsewhere.
+        allowance_m = radius_m + min(acc_m or 0.0, max_usable_accuracy_m)
+        if dist_m <= allowance_m:
+            return
+
+        if override_reason and str(override_reason).strip():
+            self._note_geofence_event(
+                _("Geofence overridden at {0}: {1} m from {2} (limit {3} m). Reason: {4}")
+                .format(kind, int(dist_m), place, int(allowance_m), str(override_reason).strip())
+            )
+            return
+
+        action = _("pick up here") if kind == "pickup" else _("deliver here")
+        frappe.throw(
+            _("You are {0} m from {1} (must be within {2} m to {3}). "
+              "Go to the correct location, or confirm with a reason if this is wrong.")
+            .format(int(dist_m), place, int(allowance_m), action),
+            exc=GeofenceError,
+            title=_("Wrong Location"),
+        )
+
+    def _note_geofence_event(self, message: str):
+        """Record a geofence override / gap against the manifest and its trip.
+
+        Deliberately a comment rather than a CH Logistics Exception row: open
+        exceptions block trip completion, and an override that silently stops
+        the driver closing the trip an hour later is its own trap. The comment
+        is attributed and timestamped, and mirroring it onto the trip is what
+        puts it in front of ops.
+        """
+        try:
+            self.add_comment("Comment", message)
+            if self.get("trip"):
+                frappe.get_doc("CH Logistics Trip", self.trip).add_comment("Comment", message)
+        except Exception:
+            # Audit must never be the reason a handover fails.
+            frappe.log_error(frappe.get_traceback(), "geofence audit note failed")
 
     def _sync_driver_state_after_action(self, target_hint: str | None = None):
         """Reconcile the driver's operational status after a manifest action.
@@ -1147,7 +1235,8 @@ class CHTransferManifest(Document):
             frappe.log_error(title=f"rejection notify failed for {self.name}",
                              message=frappe.get_traceback())
 
-    def mark_reached_destination(self, lat, lng):
+    def mark_reached_destination(self, lat, lng, gps_accuracy_m=None,
+                                 geofence_override_reason=None):
         """Driver taps 'Reached Location' when they arrive at the receiver.
 
         Operationally this is the arrival-geofence ping used by every major
@@ -1175,7 +1264,9 @@ class CHTransferManifest(Document):
                 frappe.throw(_("Arrival capture fields not installed. Run patch "
                                "ch_logistics.patches.v0_0_6.add_arrival_location_fields."),
                              title=_("Schema Mismatch"))
-            lat_f, lng_f = self._validate_geo(lat, lng, kind="arrival")
+            lat_f, lng_f = self._validate_geo(lat, lng, kind="arrival",
+                                              accuracy_m=gps_accuracy_m,
+                                              override_reason=geofence_override_reason)
             self.arrival_datetime = now_datetime()
             self.arrival_lat = lat_f
             self.arrival_lng = lng_f
@@ -1259,7 +1350,8 @@ class CHTransferManifest(Document):
 
     def complete_delivery(self, delivery_photo, receiver_name, otp=None,
                           lat=None, lng=None, scanned_qr=None,
-                          otp_preverified=False, seal_numbers=None):
+                          otp_preverified=False, seal_numbers=None,
+                          gps_accuracy_m=None, geofence_override_reason=None):
         lock_key = f"manifest_status_{frappe.scrub(self.name)}"
         lock_result = frappe.db.sql("SELECT GET_LOCK(%s, 10)", (lock_key,))[0][0]
         if not lock_result:
@@ -1290,7 +1382,9 @@ class CHTransferManifest(Document):
             # presented here. No-op for manifests packed without seals.
             self._validate_seals(seal_numbers)
             # Mandatory driver GPS at the receiver's doorstep (proof of presence).
-            lat_f, lng_f = self._validate_geo(lat, lng, kind="delivery")
+            lat_f, lng_f = self._validate_geo(lat, lng, kind="delivery",
+                                              accuracy_m=gps_accuracy_m,
+                                              override_reason=geofence_override_reason)
             # OTP verification is auditable. The active digest remains hashed
             # at rest; the linked log retains generation, dispatch, attempts,
             # expiry and verifier evidence after this one-time digest is cleared.

@@ -115,6 +115,54 @@ def run():
     _stub()._validate_seals(None)
     print("  PASS  seal: unsealed manifest is unaffected")
 
+    print("== geofence: accuracy, override, coverage ==")
+    prior_geo = frappe.db.get_single_value("CH Logistics Settings", "enforce_geofence")
+    prior_radius = frappe.db.get_single_value("CH Logistics Settings", "geofence_radius_m")
+    frappe.db.set_single_value("CH Logistics Settings", "enforce_geofence", 1)
+    frappe.db.set_single_value("CH Logistics Settings", "geofence_radius_m", 300)
+
+    # A warehouse WITH coordinates is required to exercise the fence at all.
+    from ch_logistics.api import optimizer
+    _real_coords = optimizer._warehouse_coords
+    HUB = (13.0827, 80.2707)          # Chennai
+    FAR = (13.1500, 80.2707)          # ~7.5 km north
+
+    geo = _stub()
+    geo.source_warehouse = "GEO-WH"
+    geo.destination_warehouse = "GEO-WH"
+    optimizer._warehouse_coords = lambda wh: HUB
+    try:
+        # On-site fix passes.
+        geo._validate_geofence(HUB[0], HUB[1], "pickup", accuracy_m=20)
+        print("  PASS  geofence: on-site fix accepted")
+
+        # Far away with a good fix is refused.
+        _expect(lambda: geo._validate_geofence(FAR[0], FAR[1], "pickup", accuracy_m=20),
+                contains="from", label="geofence: far away with good fix refused")
+
+        # Same distance, but the device admits it could be kilometres out —
+        # that is a bad fix, not evidence the driver is elsewhere.
+        _expect(lambda: geo._validate_geofence(FAR[0], FAR[1], "pickup", accuracy_m=5000),
+                contains="too imprecise", label="geofence: unusable fix reported as imprecise")
+
+        # A modest accuracy margin widens the fence rather than failing.
+        geo._validate_geofence(13.0850, 80.2707, "pickup", accuracy_m=400)
+        print("  PASS  geofence: fence widened by reported accuracy")
+
+        # The override lets a stranded driver continue, with a reason.
+        geo._validate_geofence(FAR[0], FAR[1], "pickup", accuracy_m=20,
+                               override_reason="Weak GPS indoors; standing at the dock")
+        print("  PASS  geofence: reasoned override accepted")
+
+        # No coordinates -> cannot check, must not block.
+        optimizer._warehouse_coords = lambda wh: None
+        geo._validate_geofence(FAR[0], FAR[1], "pickup", accuracy_m=20)
+        print("  PASS  geofence: ungeocoded location does not block")
+    finally:
+        optimizer._warehouse_coords = _real_coords
+        frappe.db.set_single_value("CH Logistics Settings", "enforce_geofence", prior_geo)
+        frappe.db.set_single_value("CH Logistics Settings", "geofence_radius_m", prior_radius)
+
     print("== dispatch packing gates ==")
     # These fire in before_submit, which the e2e fixtures skip (they insert
     # with ignore_validate and advance status directly), so without these
