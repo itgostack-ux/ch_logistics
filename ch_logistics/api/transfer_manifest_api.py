@@ -267,6 +267,11 @@ def start_pickup(manifest, pickup_photo, lat=None, lng=None, notes=None,
     from ch_logistics.api.driver_resolver import assert_manifest_driver_access
 
     assert_manifest_driver_access(doc, scope_side="source")
+    from ch_logistics.api import driver_status as ds
+
+    # assert_not_on_break's own contract names "manifest pickup/arrive/deliver"
+    # as the actions it covers; arrive and deliver had it, pickup did not.
+    ds.assert_not_on_break(doc.driver)
     # Mint a token if this manifest somehow has none, but do NOT accept the
     # freshly-minted value as the driver's scan. That is what this did before,
     # and it turned the pickup gate into a no-op: any manifest without a token
@@ -410,6 +415,9 @@ def mark_reached_destination(manifest, lat, lng) -> dict:
     from ch_logistics.api.driver_resolver import assert_manifest_driver_access
 
     assert_manifest_driver_access(doc, scope_side="destination")
+    from ch_logistics.api import driver_status as ds
+
+    ds.assert_not_on_break(doc.driver)
     info = doc.mark_reached_destination(lat=lat, lng=lng)
     return {
         "status": doc.status,
@@ -433,6 +441,9 @@ def complete_delivery(manifest, delivery_photo, receiver_name, otp=None,
     from ch_logistics.api.driver_resolver import assert_manifest_driver_access
 
     assert_manifest_driver_access(doc, scope_side="destination")
+    from ch_logistics.api import driver_status as ds
+
+    ds.assert_not_on_break(doc.driver)
     # Mint if absent, but never accept the minted value as the scan — see
     # start_pickup for why that made the gate authorise itself. The delivery
     # scan is the proof the goods reached the right consignee, so a manifest

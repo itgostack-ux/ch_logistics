@@ -43,6 +43,11 @@ _MANIFEST_UNSETTLED = (
 # trip from closing.
 _MANIFEST_BLOCKS_TRIP_CLOSE = _MANIFEST_PREDELIVERY | {"Rejected"}
 
+# A vehicle is a single physical asset — it cannot be handed to two drivers
+# at once. Only trips still in these statuses represent a live claim on the
+# vehicle; Completed/Closed/Cancelled trips have released it.
+_TRIP_VEHICLE_CONFLICT_STATUSES = {"Draft", "Assigned", "Started"}
+
 
 class CHLogisticsTrip(Document):
     def validate(self):
@@ -51,11 +56,39 @@ class CHLogisticsTrip(Document):
         self._populate_hub_from_route()
         self._validate_actor_scope()
         self._validate_stop_proof_fields()
+        self._validate_vehicle_assignment()
         self._ensure_stop_tokens()
         self._recompute_totals()
 
     def before_save(self):
         self._enforce_status_transition()
+
+    def _validate_vehicle_assignment(self):
+        """Each vehicle is assigned to one driver at a time — block handing the
+        same vehicle to a second driver's trip while the first driver's trip is
+        still active (Draft/Assigned/Started). Mirrors the one-vehicle-per-driver
+        rule enforced when a driver is assigned to a manifest."""
+        if not self.vehicle or not self.driver:
+            return
+        conflict = frappe.db.get_value(
+            "CH Logistics Trip",
+            {
+                "vehicle": self.vehicle,
+                "driver": ("!=", self.driver),
+                "status": ("in", list(_TRIP_VEHICLE_CONFLICT_STATUSES)),
+                "name": ("!=", self.name or ""),
+            },
+            ["name", "driver_name"],
+            as_dict=True,
+        )
+        if conflict:
+            frappe.throw(
+                _("Vehicle {0} is already assigned to driver {1} on active trip {2}. "
+                  "Each vehicle can only be assigned to one driver at a time.").format(
+                      self.vehicle, conflict.driver_name or conflict.name, conflict.name
+                  ),
+                title=_("Vehicle Already Assigned"),
+            )
 
     def _validate_actor_scope(self):
         from ch_logistics import roles as role_registry, scope_guard

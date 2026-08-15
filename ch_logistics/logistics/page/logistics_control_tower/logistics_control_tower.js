@@ -738,6 +738,16 @@ class LogisticsCommandCenter {
 				<i class="fa fa-check"></i> ${__("Mark Packed")}
 			</button>`;
 
+			// Nothing left to pack once remaining hits 0 — keep the button
+			// clickable up to that point, then disable it so a packer can't
+			// try to add another box past the manifest's total qty (server
+			// already rejects overpacking; this just avoids the round-trip).
+			const fully_packed = total_qty > 0 && remaining <= 0;
+			const add_box_btn  = `<button class="btn btn-xs btn-primary lcc-pack-add-box" data-name="${nm}" ${fully_packed ? "disabled" : ""}
+				title="${fully_packed ? __("Fully packed — nothing remaining") : __("Pack a box")}">
+				<i class="fa fa-plus"></i> ${__("Pack Box")}
+			</button>`;
+
 			return `<tr>
 				<td>
 					<a href="#" class="lcc-pack-open" data-name="${nm}">${nm}</a>
@@ -759,9 +769,7 @@ class LogisticsCommandCenter {
 				</td>
 				<td><span class="lcc-sev ${age_cls}">${age}</span></td>
 				<td>
-					<button class="btn btn-xs btn-primary lcc-pack-add-box" data-name="${nm}">
-						<i class="fa fa-plus"></i> ${__("Pack Box")}
-					</button>
+					${add_box_btn}
 					${submit_btn}
 				</td>
 			</tr>`;
@@ -1395,11 +1403,20 @@ class LogisticsCommandCenter {
 			$b.html(`<div class="lcc-empty">${__("No drivers found.")}</div>`);
 			return;
 		}
+		const trip_status_colors = {
+			Draft: "grey", Assigned: "blue", Started: "orange",
+			Completed: "green", Closed: "darkgrey", Cancelled: "red",
+		};
 		const rows = this.drivers.map((d) => `<tr>
 			<td><strong>${frappe.utils.escape_html(d.full_name || d.name)}</strong></td>
 			<td>${frappe.utils.escape_html(d.cell_number || "—")}</td>
 			<td><span class="lcc-avail lcc-avail-${(d.availability_status || "Available").replace(/ /g,"-").toLowerCase()}">${d.availability_status || "—"}</span></td>
-			<td>${d.current_trip ? `<a href="#" class="lcc-trip-link" data-name="${d.current_trip}">${d.current_trip}</a>` : "—"}</td>
+			<td>${d.current_trip
+				? `<a href="#" class="lcc-trip-link" data-name="${d.current_trip}">${d.current_trip}</a>`
+					+ (d.current_trip_status
+						? ` <span class="indicator-pill ${trip_status_colors[d.current_trip_status] || "grey"}" style="margin-left:4px">${frappe.utils.escape_html(d.current_trip_status)}</span>`
+						: "")
+				: "—"}</td>
 			<td>${frappe.utils.escape_html(d.status || "")}</td>
 		</tr>`).join("");
 
@@ -1848,7 +1865,16 @@ class LogisticsCommandCenter {
 		const d = new frappe.ui.Dialog({
 			title: __("Assign Driver"),
 			fields: [
-				{ fieldtype: "Link", fieldname: "driver", label: __("Driver"), options: "Driver", reqd: 1 },
+				{
+					fieldtype: "Link", fieldname: "driver", label: __("Driver"), options: "Driver", reqd: 1,
+					onchange: () => {
+						const driver = d.get_value("driver");
+						if (!driver || d.get_value("vehicle")) return;
+						frappe.db.get_value("Driver", driver, "custom_default_vehicle", (r) => {
+							if (r && r.custom_default_vehicle) d.set_value("vehicle", r.custom_default_vehicle);
+						});
+					},
+				},
 				{ fieldtype: "Link", fieldname: "vehicle", label: __("Vehicle"), options: "Vehicle" },
 			],
 			primary_action_label: __("Assign"),
@@ -1982,7 +2008,16 @@ class LogisticsCommandCenter {
 				{ fieldtype: "Link",     fieldname: "route",         label: __("Route"),       options: "CH Route" },
 				{ fieldtype: "Select",   fieldname: "direction",     label: __("Direction"),   options: "Forward\nReverse\nMixed", default: "Forward" },
 				{ fieldtype: "Column Break" },
-				{ fieldtype: "Link",     fieldname: "driver",        label: __("Driver"),      options: "Driver" },
+				{
+					fieldtype: "Link", fieldname: "driver", label: __("Driver"), options: "Driver",
+					onchange: () => {
+						const driver = d.get_value("driver");
+						if (!driver || d.get_value("vehicle")) return;
+						frappe.db.get_value("Driver", driver, "custom_default_vehicle", (r) => {
+							if (r && r.custom_default_vehicle) d.set_value("vehicle", r.custom_default_vehicle);
+						});
+					},
+				},
 				{ fieldtype: "Link",     fieldname: "vehicle",       label: __("Vehicle"),     options: "Vehicle" },
 				{ fieldtype: "Datetime", fieldname: "planned_start", label: __("Planned Start") },
 				{ fieldtype: "Datetime", fieldname: "planned_end",   label: __("Planned End") },
