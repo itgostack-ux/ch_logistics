@@ -7,6 +7,7 @@ Lifecycle:
 import hashlib
 import hmac
 import math
+import re
 import secrets
 
 import frappe
@@ -184,14 +185,22 @@ class CHTransferManifest(Document):
     def _has_packing_photo(self) -> bool:
         """Return True when at least one packing photo is attached.
 
-        Accepts either:
+        Accepts any of:
+          * A ``packing_photo`` on one of the manifest's cartons
+            (``CH Transfer Package``), which is where the packing hub
+            actually stores them and where the field is mandatory, OR
           * A ``packing_photos`` child table field on the manifest, OR
-          * A generic image ``File`` attachment on the manifest doc
-            with a name / description containing ``pack``.
-        This dual-mode check means the same setting works whether a
-        site has adopted the (upcoming) packing_photos child table or
-        continues using generic File attachments.
+          * A generic image ``File`` attachment on the manifest doc.
+
+        The carton branch is the one that matters and was missing: the check
+        looked only at a ``packing_photos`` table the docstring itself called
+        "upcoming" (it does not exist) and at File attachments. Turning
+        require_packing_photo on would therefore have rejected manifests whose
+        every carton carried a photo — the flag was unusable, not merely off.
         """
+        for pkg in (self.packages or []):
+            if (pkg.get("packing_photo") or "").strip():
+                return True
         photos = getattr(self, "packing_photos", None)
         if photos:
             return True
@@ -1191,9 +1200,66 @@ class CHTransferManifest(Document):
         finally:
             frappe.db.sql("SELECT RELEASE_LOCK(%s)", (lock_key,))
 
+    def _packed_seals(self) -> set[str]:
+        """Seal / tamper-tag numbers recorded on this manifest's cartons."""
+        return {
+            str(p.seal_number).strip().upper()
+            for p in (self.packages or [])
+            if (p.seal_number or "").strip()
+        }
+
+    def _validate_seals(self, observed):
+        """Chain-of-custody check: the seals that arrive must be the ones that left.
+
+        A seal number was captured at packing and then never read again, so a
+        swapped or cut tamper tag was invisible to the system — the one thing a
+        seal exists to prove. GS1/CTPAT chain-of-custody and every carrier
+        high-value flow verify the tag at each custody change, not just at
+        origin.
+
+        Self-activating by design: manifests whose cartons carry no seal are
+        unaffected, so this needs no rollout flag and cannot block sites that
+        do not seal. Where seals ARE recorded, delivery must account for every
+        one of them.
+
+        A mismatch is deliberately a hard stop rather than a warning. The
+        driver's route out is the damage/tamper channel (``damage_reported``),
+        which preserves the evidence instead of quietly accepting the box.
+        """
+        packed = self._packed_seals()
+        if not packed:
+            return
+        if isinstance(observed, str):
+            observed = re.split(r"[,\n;]+", observed)
+        seen = {
+            str(x).strip().upper()
+            for x in (observed or [])
+            if str(x or "").strip()
+        }
+        if not seen:
+            frappe.throw(
+                _("Seal verification is required: confirm tamper tag(s) {0} before "
+                  "completing delivery.").format(", ".join(sorted(packed))),
+                title=_("Seal Check Required"),
+            )
+        missing = packed - seen
+        unexpected = seen - packed
+        if missing or unexpected:
+            details = []
+            if missing:
+                details.append(_("not presented: {0}").format(", ".join(sorted(missing))))
+            if unexpected:
+                details.append(_("not on the packing list: {0}").format(", ".join(sorted(unexpected))))
+            frappe.throw(
+                _("Seal mismatch at handover ({0}). Do not accept the consignment — "
+                  "report it as damaged/tampered so the evidence is preserved.").format(
+                      "; ".join(details)),
+                title=_("Seal Mismatch"),
+            )
+
     def complete_delivery(self, delivery_photo, receiver_name, otp=None,
                           lat=None, lng=None, scanned_qr=None,
-                          otp_preverified=False):
+                          otp_preverified=False, seal_numbers=None):
         lock_key = f"manifest_status_{frappe.scrub(self.name)}"
         lock_result = frappe.db.sql("SELECT GET_LOCK(%s, 10)", (lock_key,))[0][0]
         if not lock_result:
@@ -1220,6 +1286,9 @@ class CHTransferManifest(Document):
                 frappe.throw(_("Receiver name is mandatory."), title=_("Ch Transfer Manifest Error"))
             # Mandatory delivery-side QR scan (parallel to pickup scan).
             self._validate_delivery_qr(scanned_qr)
+            # Chain of custody: the tamper tags that left must be the ones
+            # presented here. No-op for manifests packed without seals.
+            self._validate_seals(seal_numbers)
             # Mandatory driver GPS at the receiver's doorstep (proof of presence).
             lat_f, lng_f = self._validate_geo(lat, lng, kind="delivery")
             # OTP verification is auditable. The active digest remains hashed

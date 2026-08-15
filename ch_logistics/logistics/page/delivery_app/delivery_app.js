@@ -684,6 +684,7 @@ class DeliveryApp {
     }
 
     _open_delivery_dialog(recipients_html) {
+        const seals = ((this._detail || {}).packed_seals || []).filter(Boolean);
         let d = new frappe.ui.Dialog({
             title: __("Complete Delivery"),
             fields: [
@@ -715,6 +716,17 @@ class DeliveryApp {
                     reqd: 1,
                     description: __("Ask the store staff for the 6-digit OTP just sent to their email."),
                 },
+                // Chain of custody. Only shown when the cartons were actually
+                // sealed at packing — the server treats an unsealed manifest as
+                // nothing to verify, so an empty field here is never a blocker.
+                ...(seals.length ? [{
+                    fieldname: "seal_numbers",
+                    fieldtype: "Small Text",
+                    label: __("Seal / Tamper Tag Numbers"),
+                    reqd: 1,
+                    default: "",
+                    description: __("Confirm the tag(s) on the carton(s): {0}. A mismatch blocks delivery — report it as tampered instead.", [seals.join(", ")]),
+                }] : []),
             ],
             primary_action_label: __("Confirm Delivery"),
             primary_action: (values) => {
@@ -728,6 +740,7 @@ class DeliveryApp {
                             receiver_name: values.receiver_name,
                             scanned_qr: values.scanned_qr,
                             otp: values.otp,
+                            seal_numbers: values.seal_numbers,
                             lat, lng,
                         },
                         callback: () => {

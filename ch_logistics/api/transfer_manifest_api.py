@@ -267,14 +267,27 @@ def start_pickup(manifest, pickup_photo, lat=None, lng=None, notes=None,
     from ch_logistics.api.driver_resolver import assert_manifest_driver_access
 
     assert_manifest_driver_access(doc, scope_side="source")
-    # Self-heal a missing/legacy QR token instead of dead-ending pickup with
-    # "This manifest is missing a secure QR token." The consolidated stop
-    # endpoint already does this; the per-manifest path must too. When we mint,
-    # the freshly-minted token authorises this scan — there was no valid token
-    # for the driver to have scanned in the first place.
+    # Mint a token if this manifest somehow has none, but do NOT accept the
+    # freshly-minted value as the driver's scan. That is what this did before,
+    # and it turned the pickup gate into a no-op: any manifest without a token
+    # authorised whatever was scanned, because the server compared the scan
+    # against a secret it had just generated itself.
+    #
+    # Every manifest now gets a token on first save (CH Transfer Manifest
+    # ._ensure_qr_payload) and existing rows were backfilled, so reaching here
+    # with no token means the box label predates the token or was never
+    # printed. Fail closed and say so — the label has to be reprinted, since
+    # whatever is stuck on the carton cannot encode a token that did not exist.
     _token, _minted = doc.ensure_secure_qr_token()
     if _minted:
-        scanned_qr = _token
+        frappe.throw(
+            frappe._(
+                "Manifest {0} had no scan token, so the label on the carton cannot "
+                "be valid. A token has now been issued — reprint the box label and "
+                "scan the new QR to start pickup."
+            ).format(manifest),
+            title=frappe._("Label Out Of Date"),
+        )
     doc.start_pickup(pickup_photo=pickup_photo, lat=lat, lng=lng, notes=notes,
                      scanned_qr=scanned_qr)
     return {"status": doc.status}
@@ -412,18 +425,29 @@ def mark_reached_destination(manifest, lat, lng) -> dict:
     methods=["POST"],
 )
 def complete_delivery(manifest, delivery_photo, receiver_name, otp=None,
-                      lat=None, lng=None, scanned_qr=None) -> dict:
+                      lat=None, lng=None, scanned_qr=None,
+                      seal_numbers=None) -> dict:
     _require_stage_role("complete_delivery")
     doc = frappe.get_doc("CH Transfer Manifest", manifest)
     doc.check_permission("write")
     from ch_logistics.api.driver_resolver import assert_manifest_driver_access
 
     assert_manifest_driver_access(doc, scope_side="destination")
-    # Self-heal a missing/legacy QR token (same rationale as start_pickup) so
-    # delivery never dead-ends on "missing a secure QR token".
+    # Mint if absent, but never accept the minted value as the scan — see
+    # start_pickup for why that made the gate authorise itself. The delivery
+    # scan is the proof the goods reached the right consignee, so a manifest
+    # whose label predates its token must be reprinted rather than waved
+    # through.
     _token, _minted = doc.ensure_secure_qr_token()
     if _minted:
-        scanned_qr = _token
+        frappe.throw(
+            frappe._(
+                "Manifest {0} had no scan token, so the label on the carton cannot "
+                "be valid. A token has now been issued — reprint the box label and "
+                "scan the new QR to complete delivery."
+            ).format(manifest),
+            title=frappe._("Label Out Of Date"),
+        )
     from ch_logistics.logistics.doctype.ch_logistics_otp_log.ch_logistics_otp_log import (
         DeliveryOTPError,
     )
@@ -434,6 +458,7 @@ def complete_delivery(manifest, delivery_photo, receiver_name, otp=None,
             receiver_name=receiver_name,
             otp=otp, lat=lat, lng=lng,
             scanned_qr=scanned_qr,
+            seal_numbers=seal_numbers,
         )
     except DeliveryOTPError as exc:
         # Returning a normal response is deliberate: Frappe rolls the whole
@@ -1509,6 +1534,12 @@ def get_manifest_detail(manifest) -> dict:
         result["source_address"] = frappe.db.get_value("CH Store", doc.source_store, "address") or ""
     if doc.destination_store:
         result["destination_address"] = frappe.db.get_value("CH Store", doc.destination_store, "address") or ""
+
+    # Tamper tags to verify at handover. Only the seal numbers are exposed —
+    # the driver app needs to know WHICH tags to check, not the rest of the
+    # packing record. Empty for manifests packed without seals, which is what
+    # keeps the delivery-side check self-activating.
+    result["packed_seals"] = sorted(doc._packed_seals())
 
     return result
 

@@ -98,6 +98,23 @@ def run():
         "CH Logistics Settings", "enforce_delivery_qr", prior_enforce_delivery_qr
     )
 
+    print("== seal chain of custody ==")
+    sealed = _stub()
+    sealed.append("packages", {"package_label": "TM-SMOKE-0001-B01", "seal_number": "SEAL-9001"})
+    sealed.append("packages", {"package_label": "TM-SMOKE-0001-B02", "seal_number": "seal-9002"})
+    _expect(lambda: sealed._validate_seals(None),
+            contains="Seal verification is required", label="seal: none presented throws")
+    _expect(lambda: sealed._validate_seals("SEAL-9001"),
+            contains="not presented", label="seal: short of the packed set throws")
+    _expect(lambda: sealed._validate_seals("SEAL-9001, SEAL-9002, SEAL-XXXX"),
+            contains="not on the packing list", label="seal: swapped tag throws")
+    # Case and separator tolerant: a tag is a tag however it was typed.
+    sealed._validate_seals("seal-9001\nSEAL-9002")
+    print("  PASS  seal: exact set accepted (case/separator tolerant)")
+    # A manifest packed without seals has nothing to verify.
+    _stub()._validate_seals(None)
+    print("  PASS  seal: unsealed manifest is unaffected")
+
     print("== complete_delivery signature accepts scanned_qr ==")
     import inspect
     sig = inspect.signature(CHTransferManifest.complete_delivery)

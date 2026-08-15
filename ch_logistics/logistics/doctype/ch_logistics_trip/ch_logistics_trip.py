@@ -316,6 +316,39 @@ class CHLogisticsTrip(Document):
             frappe.throw(
                 _("Cannot transition Trip status from {0} to {1}").format(previous.status, self.status)
             )
+        if self.status == "Started":
+            self._reject_stops_without_shipments()
+
+    def _reject_stops_without_shipments(self):
+        """Refuse to dispatch an itinerary containing a stop that serves nothing.
+
+        Oracle OTM and SAP TM never emit a stop with no shipment events: the
+        planned route is a template, and only locations with work become
+        executable stops. Copying a template verbatim used to hand the driver
+        stops with nothing to load or unload — no way to tell an oversight from
+        a deliberate waypoint, and no way to complete them meaningfully.
+
+        Deliberately gated on the transition INTO Started rather than on the
+        Started state, so a dispatcher can still shape a Draft itinerary before
+        shipments are attached, and trips already on the road stay saveable.
+        ``manifest_count`` is refreshed by _reconcile_stops earlier in validate.
+        """
+        if not self.stops:
+            return
+        # A trip with nothing attached at all is a different problem, reported
+        # elsewhere; don't mask it with a per-stop complaint.
+        if not any(int(s.manifest_count or 0) for s in self.stops):
+            return
+        empty = [str(s.sequence) for s in self.stops if not int(s.manifest_count or 0)]
+        if empty:
+            frappe.throw(
+                _(
+                    "Stop(s) {0} have no shipments assigned. Remove them or attach a "
+                    "manifest before starting the trip — the driver cannot load or "
+                    "unload anything there."
+                ).format(", ".join(f"#{s}" for s in empty)),
+                title=_("Empty Stop On Itinerary"),
+            )
 
     # ------------------------------------------------------------------
     # Public helpers used by logistics_api
