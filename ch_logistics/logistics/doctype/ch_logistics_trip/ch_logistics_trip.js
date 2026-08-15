@@ -193,6 +193,13 @@ frappe.ui.form.on("CH Logistics Trip", {
 					options: "Driver",
 					reqd: 1,
 					default: frm.doc.driver || "",
+					onchange: () => {
+						const driver = d.get_value("driver");
+						if (!driver || d.get_value("vehicle")) return;
+						frappe.db.get_value("Driver", driver, "custom_default_vehicle", (r) => {
+							if (r && r.custom_default_vehicle) d.set_value("vehicle", r.custom_default_vehicle);
+						});
+					},
 				},
 				{
 					fieldname: "vehicle",

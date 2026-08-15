@@ -397,6 +397,9 @@ def mark_reached_destination(manifest, lat, lng) -> dict:
     from ch_logistics.api.driver_resolver import assert_manifest_driver_access
 
     assert_manifest_driver_access(doc, scope_side="destination")
+    from ch_logistics.api import driver_status as ds
+
+    ds.assert_not_on_break(doc.driver)
     info = doc.mark_reached_destination(lat=lat, lng=lng)
     return {
         "status": doc.status,
@@ -419,6 +422,9 @@ def complete_delivery(manifest, delivery_photo, receiver_name, otp=None,
     from ch_logistics.api.driver_resolver import assert_manifest_driver_access
 
     assert_manifest_driver_access(doc, scope_side="destination")
+    from ch_logistics.api import driver_status as ds
+
+    ds.assert_not_on_break(doc.driver)
     # Self-heal a missing/legacy QR token (same rationale as start_pickup) so
     # delivery never dead-ends on "missing a secure QR token".
     _token, _minted = doc.ensure_secure_qr_token()

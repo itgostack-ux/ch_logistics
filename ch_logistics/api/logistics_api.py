@@ -100,6 +100,10 @@ def trip_create(trip_date, company, route=None, driver=None, vehicle=None,
         doc.status = "Assigned"
     if vehicle:
         doc.vehicle = vehicle
+    elif driver:
+        # Each driver has their own assigned vehicle — default to it so ops
+        # doesn't have to look it up / retype it on every trip.
+        doc.vehicle = frappe.db.get_value("Driver", driver, "custom_default_vehicle")
     if planned_start:
         doc.planned_start = planned_start
     if planned_end:
@@ -111,6 +115,13 @@ def trip_create(trip_date, company, route=None, driver=None, vehicle=None,
     elif not manifests:
         scope_guard.assert_scope(company=company)
     doc.insert()
+
+    if driver:
+        # Mirror trip_assign_driver: a driver assigned at creation time must
+        # show up as "on trip" (Driver.current_trip) immediately, not only
+        # once they Accept/Start it — otherwise ops sees a blank Current Trip
+        # for anyone assigned this way.
+        _set_driver_availability(driver, "On Trip", doc.name)
 
     if manifests:
         if not (doc.get("stops") or []):
@@ -184,6 +195,10 @@ def trip_assign_driver(trip, driver, vehicle=None):
     doc.driver = driver
     if vehicle:
         doc.vehicle = vehicle
+    elif not doc.vehicle:
+        # Each driver has their own assigned vehicle — default to it so ops
+        # doesn't have to look it up / retype it on every trip.
+        doc.vehicle = frappe.db.get_value("Driver", driver, "custom_default_vehicle")
     if doc.status == "Draft":
         doc.status = "Assigned"
     doc.save()
@@ -360,6 +375,7 @@ def driver_accept_trip(trip):
     from ch_logistics.api.driver_resolver import assert_trip_driver_access
 
     assert_trip_driver_access(doc)
+    ds.assert_not_on_break(doc.driver)
     assigned_driver = doc.driver
 
     doc.add_comment(
@@ -414,6 +430,7 @@ def trip_start(trip, gps_lat=None, gps_lng=None):
     from ch_logistics.api.driver_resolver import assert_trip_driver_access
 
     assert_trip_driver_access(doc)
+    ds.assert_not_on_break(doc.driver)
     doc.mark_started()
     doc.save()
     if doc.driver:
@@ -429,6 +446,7 @@ def trip_complete(trip, override_exceptions=0):
     from ch_logistics.api.driver_resolver import assert_trip_driver_access
 
     assert_trip_driver_access(doc)
+    ds.assert_not_on_break(doc.driver)
     _assert_exception_gate(doc, action="complete trip", override_exceptions=override_exceptions)
     doc.mark_completed()
     doc.save()
@@ -2250,15 +2268,16 @@ def ops_drivers_available():
         for row in frappe.get_all(
             "CH Logistics Trip",
             filters={"name": ["in", list(trip_names) or ["__none__"]]},
-            fields=["name", "hub_warehouse", "company"],
+            fields=["name", "hub_warehouse", "company", "status"],
         )
     }
     visible = []
     for row in rows:
+        trip = trip_scope.get(row.get("current_trip"))
+        row["current_trip_status"] = trip.status if trip else None
         if role_registry.is_privileged():
             visible.append(row)
             continue
-        trip = trip_scope.get(row.get("current_trip"))
         if trip and scope_guard.is_in_scope(
             warehouse=trip.hub_warehouse, company=trip.company
         ):

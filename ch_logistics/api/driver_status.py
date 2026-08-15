@@ -64,6 +64,20 @@ def get_status(driver: str) -> str | None:
     return frappe.db.get_value("Driver", driver, "availability_status")
 
 
+def assert_not_on_break(driver: str) -> None:
+    """A driver on Break is off the clock for trip/manifest actions — they
+    must end the break first. Shared gate for every physical driver action
+    (trip accept/start/complete, manifest pickup/arrive/deliver) so the rule
+    lives in one place instead of being re-implemented per call site."""
+    if not driver:
+        return
+    if get_status(driver) == BREAK:
+        frappe.throw(
+            _("You are on Break. End your break before continuing."),
+            title=_("Driver On Break"),
+        )
+
+
 def can_transition(current: str | None, target: str) -> bool:
     if current == target:
         return True

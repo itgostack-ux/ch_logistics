@@ -64,15 +64,19 @@ class DeliveryApp {
         this.load_data();
     }
 
-    load_status() {
+    load_status(after) {
         frappe.call({
             method: DRIVER_API + "get_status",
-            callback: (r) => this.render_status(r.message || {}),
+            callback: (r) => {
+                this.render_status(r.message || {});
+                if (after) after();
+            },
         });
     }
 
     render_status(p) {
         let status = p.availability_status || "Offline";
+        this.driver_status = status;
         let cls = "da-st-" + status.replace(/ /g, "-").toLowerCase();
         let on_break = status === "Break";
         let toggle = on_break
@@ -360,8 +364,15 @@ class DeliveryApp {
             // before the Complete Delivery dialog unlocks. Until arrival is
             // recorded we surface a prominent "Reached Location" CTA that
             // captures GPS + timestamp on the manifest.
+            // A driver on Break is off the clock — Reached Location / Complete
+            // Delivery are blocked until they end the break (server enforces
+            // the same gate; this just avoids a round-trip error).
+            let on_break = this.driver_status === "Break";
+            let break_hint = on_break
+                ? `<div class="text-muted" style="font-size:11px;margin-top:4px;">${__("You're on Break — end it to continue.")}</div>`
+                : "";
             if (!d.arrival_datetime) {
-                action_html = `<button id="da-arrived-btn" class="btn btn-primary btn-lg btn-block da-action-btn">
+                action_html = `<button id="da-arrived-btn" class="btn btn-primary btn-lg btn-block da-action-btn" ${on_break ? `disabled title="${__("End your break to continue")}"` : ""}>
                     <i class="fa fa-map-marker"></i> ${__("Reached Location")}
                 </button>
                 <button id="da-deliver-btn" class="btn btn-success btn-lg btn-block da-action-btn da-btn-disabled" disabled
@@ -371,18 +382,20 @@ class DeliveryApp {
                 </button>
                 <button id="da-reject-btn" class="btn btn-danger btn-sm btn-block da-action-btn">
                     <i class="fa fa-exclamation-triangle"></i> ${__("Failed Delivery (mid-trip)")}
-                </button>`;
+                </button>
+                ${break_hint}`;
             } else {
                 let arrived_at = frappe.datetime.str_to_user(d.arrival_datetime);
                 action_html = `<div class="alert alert-info da-arrival-banner" style="padding:8px 12px;border-radius:6px;margin-bottom:8px;font-size:13px;">
                     <i class="fa fa-map-marker"></i> ${__("Arrived at destination")}: ${frappe.utils.escape_html(arrived_at)}
                 </div>
-                <button id="da-deliver-btn" class="btn btn-success btn-lg btn-block da-action-btn">
+                <button id="da-deliver-btn" class="btn btn-success btn-lg btn-block da-action-btn" ${on_break ? `disabled title="${__("End your break to continue")}"` : ""}>
                     <i class="fa fa-check-circle"></i> ${__("Complete Delivery")}
                 </button>
                 <button id="da-reject-btn" class="btn btn-danger btn-sm btn-block da-action-btn">
                     <i class="fa fa-exclamation-triangle"></i> ${__("Failed Delivery (mid-trip)")}
-                </button>`;
+                </button>
+                ${break_hint}`;
             }
         } else if (d.status === "Received") {
             action_html = `<button id="da-manifest-close-btn" class="btn btn-success btn-lg btn-block da-action-btn">
@@ -536,6 +549,10 @@ class DeliveryApp {
             });
             return;
         }
+        if (this.driver_status === "Break") {
+            frappe.show_alert({ message: __("You're on Break — end it to continue."), indicator: "orange" });
+            return;
+        }
         frappe.dom.freeze(__("Capturing GPS…"));
         this._capture_gps((lat, lng) => {
             frappe.dom.unfreeze();
@@ -634,6 +651,10 @@ class DeliveryApp {
                 message: __("Tap Reached Location first to record arrival at the destination."),
                 indicator: "orange",
             });
+            return;
+        }
+        if (this.driver_status === "Break") {
+            frappe.show_alert({ message: __("You're on Break — end it to continue."), indicator: "orange" });
             return;
         }
         // Step 1: request a fresh OTP — server generates a new 6-digit code
@@ -942,7 +963,12 @@ class DeliveryApp {
                     message: st === "Break" ? __("On break") : __("Back to work"),
                     indicator: st === "Break" ? "orange" : "green",
                 });
-                this.load_status();
+                // The trip detail view's Accept/Complete buttons are
+                // disabled based on this.driver_status (set inside
+                // render_status) — re-render whatever's on screen, after the
+                // status refresh lands, so they un-disable the moment the
+                // break ends without needing a manual back-and-forth.
+                this.load_status(() => this.render_content());
             },
         });
     }
@@ -1258,13 +1284,26 @@ class DeliveryApp {
         }).join("");
 
         // Trip-level action buttons
+        // A driver on Break is off the clock — accept/start/complete are
+        // blocked until they end the break (Reject stays available so they
+        // aren't stuck holding an assignment they can't act on).
+        let on_break = this.driver_status === "Break";
+        let break_attrs = on_break
+            ? `disabled title="${__("End your break to continue")}"`
+            : "";
         let action_html = "";
         if (t.status === "Assigned") {
-            action_html += `<button id="da-trip-accept-btn" class="btn btn-primary btn-lg btn-block da-action-btn"><i class="fa fa-check-circle"></i> ${__("Accept &amp; Start Trip")}</button>`;
+            action_html += `<button id="da-trip-accept-btn" class="btn btn-primary btn-lg btn-block da-action-btn" ${break_attrs}><i class="fa fa-check-circle"></i> ${__("Accept &amp; Start Trip")}</button>`;
             action_html += `<button id="da-trip-reject-btn" class="btn btn-danger btn-sm btn-block da-action-btn"><i class="fa fa-ban"></i> ${__("Reject Trip")}</button>`;
+            if (on_break) {
+                action_html += `<div class="text-muted" style="font-size:11px;margin-top:4px;">${__("You're on Break — end it to accept this trip.")}</div>`;
+            }
         } else if (t.status === "Started") {
             let all_done = (t.stops || []).every((s) => s.status === "Completed" || s.status === "Skipped");
-            action_html += `<button id="da-trip-complete-btn" class="btn btn-success btn-lg btn-block da-action-btn" ${all_done ? "" : "disabled"}><i class="fa fa-flag-checkered"></i> ${__("Complete Trip")}</button>`;
+            action_html += `<button id="da-trip-complete-btn" class="btn btn-success btn-lg btn-block da-action-btn" ${(all_done && !on_break) ? "" : "disabled"} ${on_break ? `title="${__("End your break to continue")}"` : ""}><i class="fa fa-flag-checkered"></i> ${__("Complete Trip")}</button>`;
+            if (on_break) {
+                action_html += `<div class="text-muted" style="font-size:11px;margin-top:4px;">${__("You're on Break — end it to complete this trip.")}</div>`;
+            }
         }
         if (t.status === "Assigned" || t.status === "Started") {
             action_html += `<button id="da-trip-exception-btn" class="btn btn-warning btn-sm btn-block da-action-btn"><i class="fa fa-exclamation-triangle"></i> ${__("Report Exception")}</button>`;

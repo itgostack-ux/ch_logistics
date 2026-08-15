@@ -88,12 +88,16 @@ function show_pack_box_dialog(frm) {
                     <b>${__("Remaining")}:</b> ${remaining}
                 </div>`,
             },
-            { fieldname: "packed_qty", fieldtype: "Int", label: __("Packed Qty"), reqd: 1,
-              default: remaining || null,
-              description: __("How many item units are physically in this box? Max: {0} (remaining on manifest).", [remaining]) },
+            {
+                fieldname: "packed_qty", fieldtype: "Int", label: __("Packed Qty"), reqd: 1,
+                default: remaining || null,
+                description: __("How many item units are physically in this box? Max: {0} (remaining on manifest).", [remaining])
+            },
             { fieldname: "weight_kg", fieldtype: "Float", label: __("Weight (kg)") },
-            { fieldname: "dimensions_cm", fieldtype: "Data", label: __("Dimensions (LxWxH cm)"),
-              description: __("Optional — used for courier dimensional weight, e.g. 30x20x15") },
+            {
+                fieldname: "dimensions_cm", fieldtype: "Data", label: __("Dimensions (LxWxH cm)"),
+                description: __("Optional — used for courier dimensional weight, e.g. 30x20x15")
+            },
             { fieldname: "col_break", fieldtype: "Column Break" },
             { fieldname: "seal_number", fieldtype: "Data", label: __("Seal / Tamper Tag") },
             { fieldname: "packing_photo", fieldtype: "Attach Image", label: __("Packing Photo") },
@@ -170,6 +174,7 @@ function render_status_badge(frm) {
         "Recall Initiated": "red", "Returned": "gray",
         "Cancelled": "red",
     };
+    const display_label = frm.doc.status === "Draft" ? __("New") : __(frm.doc.status);
     frm.page.set_indicator(frm.doc.status, colors[frm.doc.status] || "gray");
 
     if (frm.doc.driver_name) {
@@ -187,7 +192,7 @@ function render_status_badge(frm) {
 // end see at-a-glance whether they own the next action. Pure UX overlay; no
 // state mutation — actual role gating lives in transfer_manifest_api.py.
 const OUTWARD_STATES = new Set(["Draft", "Packed", "Assigned", "Pickup Started", "In Transit"]);
-const INWARD_STATES  = new Set(["Delivered", "Partially Received", "Received"]);
+const INWARD_STATES = new Set(["Delivered", "Partially Received", "Received"]);
 
 function render_lane_banner(frm) {
     if (!frm.doc.status) return;
@@ -319,7 +324,7 @@ function add_action_buttons(frm) {
     //    can confirm the NIC closure before posting GRN.  Drops at Received.
     //  • Re-sync → generation/Part-B fixes are only meaningful while goods
     //    are still in motion; restricted to transport phase.
-    const ewbPrintStates  = ["Assigned", "Pickup Started", "In Transit"];
+    const ewbPrintStates = ["Assigned", "Pickup Started", "In Transit"];
     const ewbStatusStates = ["Assigned", "Pickup Started", "In Transit", "Delivered"];
     const ewbResyncStates = ["Assigned", "Pickup Started", "In Transit"];
     if (ewbStatusStates.includes(frm.doc.status)) {
@@ -405,8 +410,8 @@ function show_ewaybill_print_dialog(frm, ewb_api) {
                                 <td>${r.vehicle_no ? `<code>${frappe.utils.escape_html(r.vehicle_no)}</code>` : ""}</td>
                                 <td>
                                     ${r.ewaybill
-                                        ? `<a class="btn btn-xs btn-default" href="/app/stock-entry/${encodeURIComponent(r.stock_entry)}?print=1" target="_blank">${__("Print")}</a>`
-                                        : ""}
+                    ? `<a class="btn btn-xs btn-default" href="/app/stock-entry/${encodeURIComponent(r.stock_entry)}?print=1" target="_blank">${__("Print")}</a>`
+                    : ""}
                                 </td>
                             </tr>
                         `).join("")}
@@ -442,8 +447,10 @@ function show_pickup_dialog(frm, api) {
     let d = new frappe.ui.Dialog({
         title: __("Start Pickup"),
         fields: [
-            { fieldname: "scanned_qr", fieldtype: "Data", label: __("Scan / Enter Manifest QR"), reqd: 1,
-              description: __("Scan the manifest/order QR. Pickup is blocked until it matches.") },
+            {
+                fieldname: "scanned_qr", fieldtype: "Data", label: __("Scan / Enter Manifest QR"), reqd: 1,
+                description: __("Scan the manifest/order QR. Pickup is blocked until it matches.")
+            },
             { fieldname: "pickup_photo", fieldtype: "Attach Image", label: __("Pickup Photo"), reqd: 1 },
             { fieldname: "notes", fieldtype: "Small Text", label: __("Notes") },
         ],
@@ -473,8 +480,10 @@ function show_delivery_dialog(frm, api) {
     let d = new frappe.ui.Dialog({
         title: __("Complete Delivery"),
         fields: [
-            { fieldname: "scanned_qr", fieldtype: "Data", label: __("Scan / Enter Manifest QR"), reqd: 1,
-              description: __("Scan the manifest/order QR at the receiver. Delivery is blocked until it matches.") },
+            {
+                fieldname: "scanned_qr", fieldtype: "Data", label: __("Scan / Enter Manifest QR"), reqd: 1,
+                description: __("Scan the manifest/order QR at the receiver. Delivery is blocked until it matches.")
+            },
             { fieldname: "delivery_photo", fieldtype: "Attach Image", label: __("Delivery Photo"), reqd: 1 },
             { fieldname: "receiver_name", fieldtype: "Data", label: __("Receiver Name"), reqd: 1 },
             { fieldname: "otp", fieldtype: "Data", label: __("Delivery OTP"), reqd: 1 },
@@ -589,7 +598,7 @@ function capture_gps(callback) {
                 title: __("Location Required"),
                 indicator: "red",
                 message: __("Could not capture driver location ({0}). Enable Location on the device and retry.",
-                            [(err && err.message) || __("permission denied")]),
+                    [(err && err.message) || __("permission denied")]),
             });
         },
         { enableHighAccuracy: true, timeout: 8000, maximumAge: 0 }
