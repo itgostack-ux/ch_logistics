@@ -115,6 +115,40 @@ def run():
     _stub()._validate_seals(None)
     print("  PASS  seal: unsealed manifest is unaffected")
 
+    print("== dispatch packing gates ==")
+    # These fire in before_submit, which the e2e fixtures skip (they insert
+    # with ignore_validate and advance status directly), so without these
+    # assertions the enforced policy has no test coverage at all.
+    prior_slip = frappe.db.get_single_value("CH Logistics Settings", "require_packing_slip")
+    prior_photo = frappe.db.get_single_value("CH Logistics Settings", "require_packing_photo")
+    frappe.db.set_single_value("CH Logistics Settings", "require_packing_slip", 1)
+    frappe.db.set_single_value("CH Logistics Settings", "require_packing_photo", 1)
+
+    def _pack_stub(packages=None):
+        m = frappe.new_doc("CH Transfer Manifest")
+        m.name = "TM-SMOKE-GATE"
+        m.append("transfers", {"stock_entry": "SMOKE-SE"})
+        for pkg in (packages or []):
+            m.append("packages", pkg)
+        return m
+
+    _expect(lambda: frappe.new_doc("CH Transfer Manifest").before_submit(),
+            contains="at least one Stock Entry", label="dispatch: no stock entry throws")
+    _expect(lambda: _pack_stub().before_submit(),
+            contains="packed box", label="dispatch: no carton throws")
+    _expect(lambda: _pack_stub([{"package_label": "B01", "packed_qty": 1}]).before_submit(),
+            contains="packing photo", label="dispatch: carton without photo throws")
+    # A carton photo satisfies the requirement. This is the branch that was
+    # broken: _has_packing_photo only looked at a non-existent packing_photos
+    # table and File attachments, never at the carton where the packing hub
+    # actually stores the photo.
+    _pack_stub([{"package_label": "B01", "packed_qty": 1,
+                 "packing_photo": "/files/pack.jpg"}]).before_submit()
+    print("  PASS  dispatch: carton with photo accepted")
+
+    frappe.db.set_single_value("CH Logistics Settings", "require_packing_slip", prior_slip)
+    frappe.db.set_single_value("CH Logistics Settings", "require_packing_photo", prior_photo)
+
     print("== complete_delivery signature accepts scanned_qr ==")
     import inspect
     sig = inspect.signature(CHTransferManifest.complete_delivery)
