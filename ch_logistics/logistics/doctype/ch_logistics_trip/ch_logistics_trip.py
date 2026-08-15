@@ -229,26 +229,61 @@ class CHLogisticsTrip(Document):
             self.total_shipments = 0
         else:
             has_seq = frappe.db.has_column("CH Transfer Manifest", "stop_sequence")
-            fields = ["name"] + (["stop_sequence"] if has_seq else [])
+            fields = [
+                "name", "source_store", "source_warehouse",
+                "destination_store", "destination_warehouse",
+            ] + (["stop_sequence"] if has_seq else [])
             rows = frappe.get_all(
                 "CH Transfer Manifest",
                 filters={"trip": self.name, "docstatus": ["<", 2]},
                 fields=fields,
             )
             self.total_shipments = len(rows)
-        # Per-stop manifest counts for dispatch visibility
-        if self.stops:
-            counts = {}
-            for r in rows:
-                seq = r.get("stop_sequence")
-                if seq:
-                    counts[seq] = counts.get(seq, 0) + 1
-            for s in self.stops:
-                s.manifest_count = counts.get(s.sequence, 0)
+        self._reconcile_stops(rows)
         # Actual duration if both timestamps exist
         if self.actual_start and self.actual_end:
             delta = (self.actual_end - self.actual_start).total_seconds() / 60.0
             self.total_duration_actual_min = int(max(delta, 0))
+
+    def _reconcile_stops(self, manifests):
+        """Derive each stop's type and manifest count from the shipments on it.
+
+        A CH Route is a planning template; the executable itinerary belongs to
+        the trip. Copying the template's stop types verbatim let a stop sit at a
+        manifest's ORIGIN while declaring itself a Drop, which made the pickup
+        unreachable. Oracle OTM and SAP TM both derive the stop's role from the
+        shipment events that occur there, and that is what happens here: the
+        declared type is replaced by the union of the roles the attached
+        manifests actually imply.
+
+        Counting is role-based too. The old count keyed off ``stop_sequence``
+        alone, so a manifest was only ever counted at one end of its journey and
+        pickup stops reported zero shipments.
+
+        Stops that serve no shipment keep their declared type and report a count
+        of zero rather than being deleted — a dispatcher may have placed a
+        waypoint deliberately, and silently dropping planned rows would be worse
+        than showing an honest empty stop.
+        """
+        if not self.stops:
+            return
+        from ch_logistics.api import stop_roles
+
+        wh_by_store = stop_roles.warehouse_by_store(self.stops, manifests)
+        for s in self.stops:
+            roles = set()
+            count = 0
+            for m in manifests or ():
+                m_roles = stop_roles.manifest_roles_at_stop(m, s, wh_by_store)
+                if not m_roles and m.get("stop_sequence") and m["stop_sequence"] == s.sequence:
+                    m_roles = {stop_roles.DROP}
+                if m_roles:
+                    roles |= m_roles
+                    count += 1
+            s.manifest_count = count
+            derived = stop_roles.combine_roles(roles)
+            if derived and derived != s.stop_type:
+                s.stop_type = derived
 
     def _blocking_manifests(self, blocking_statuses):
         """Names of submitted/draft manifests on this trip whose status is in

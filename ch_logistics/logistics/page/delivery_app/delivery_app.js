@@ -1154,6 +1154,16 @@ class DeliveryApp {
             (manifests_by_stop[key] = manifests_by_stop[key] || []).push(m);
         };
         for (let m of t.manifests || []) {
+            // stop_roles is the server's authoritative {sequence: stop_type}
+            // map (ch_logistics.api.stop_roles). Preferring it keeps the card
+            // list and the stop actions driven by ONE predicate — the client
+            // used to re-derive membership and could show a manifest the
+            // server would then refuse to act on.
+            const roles = m.stop_roles;
+            if (roles && Object.keys(roles).length) {
+                for (let seq of Object.keys(roles)) _push_stop_manifest(seq, m);
+                continue;
+            }
             const pickup_seq = m.pickup_stop_sequence;
             const drop_seq = m.drop_stop_sequence || m.stop_sequence;
             _push_stop_manifest(pickup_seq, m);
@@ -1209,14 +1219,21 @@ class DeliveryApp {
             // capture delivery photo + receiver + per-manifest OTP/QR. We
             // still call it "Arrive ..." so the action remains discoverable.
             const st_type = (s.stop_type || "").toLowerCase();
+            const st_roles = st_type.split("+");
             let arrive_label = __("Arrive");
             let arrive_icon = "fa-location-arrow";
-            if (st_type === "pickup" && active_manifest_rows.length) {
-                arrive_label = __("Arrive & Pick Up");
-                arrive_icon = "fa-camera";
-            } else if (st_type === "drop" && active_manifest_rows.length) {
-                arrive_label = __("Arrive & Deliver");
-                arrive_icon = "fa-check-circle";
+            if (active_manifest_rows.length) {
+                if (st_roles.includes("pickup") && st_roles.includes("drop")) {
+                    // Combined stop: deliver first, then collect.
+                    arrive_label = __("Arrive, Deliver & Pick Up");
+                    arrive_icon = "fa-exchange";
+                } else if (st_roles.includes("pickup")) {
+                    arrive_label = __("Arrive & Pick Up");
+                    arrive_icon = "fa-camera";
+                } else if (st_roles.includes("drop")) {
+                    arrive_label = __("Arrive & Deliver");
+                    arrive_icon = "fa-check-circle";
+                }
             }
             let completion_hint = "";
             if (can_arrive && active_manifest_rows.length) {
@@ -1249,7 +1266,12 @@ class DeliveryApp {
                             : (window.ch_wh_label_html ? ch_wh_label_html(s.warehouse, "—") : frappe.utils.escape_html(s.warehouse || "—"))}
                     </div>
                     ${completion_hint}
-                    ${manifests_html ? `<div class="da-stop-manifests">${manifests_html}</div>` : ""}
+                    ${manifests_html
+                        ? `<div class="da-stop-manifests">${manifests_html}</div>`
+                        : `<div class="da-stop-empty text-muted" style="font-size:11px;padding:4px 8px 6px;">
+                             <i class="fa fa-info-circle"></i>
+                             ${__("No shipments assigned to this stop — nothing to load or unload here.")}
+                           </div>`}
                     <div class="da-stop-actions">
                         ${can_arrive ? `<button class="btn btn-primary btn-sm da-stop-arrive-btn" data-seq="${s.sequence}"><i class="fa ${arrive_icon}"></i> ${arrive_label}</button>` : ""}
                         ${can_complete ? `<button class="btn btn-success btn-sm da-stop-complete-btn" data-seq="${s.sequence}"><i class="fa fa-check"></i> ${__("Complete")}</button>` : ""}
@@ -1283,12 +1305,13 @@ class DeliveryApp {
         // OTM "Trip Stops" / Blue Yonder TMS "Tour Stops" all expose pickup
         // and delivery counts side-by-side; last-mile players (Bringg,
         // Onfleet, FarEye, Locus) follow the same pattern in driver UIs.
-        const pickup_count = (t.stops || []).filter(
-            (s) => (s.stop_type || "").toLowerCase() === "pickup"
-        ).length;
-        const drop_count = (t.stops || []).filter(
-            (s) => (s.stop_type || "").toLowerCase() === "drop"
-        ).length;
+        // A Pickup+Drop stop is BOTH a pickup and a drop, so it counts in each
+        // bucket. Testing for equality excluded it from both, which reported
+        // "0 PICKUPS" on a trip whose hub stop was the only collection point.
+        const _has_role = (s, role) =>
+            (s.stop_type || "").toLowerCase().split("+").includes(role);
+        const pickup_count = (t.stops || []).filter((s) => _has_role(s, "pickup")).length;
+        const drop_count = (t.stops || []).filter((s) => _has_role(s, "drop")).length;
         const shipment_count = t.total_shipments != null
             ? t.total_shipments
             : (t.manifests || []).length;
@@ -1502,7 +1525,7 @@ class DeliveryApp {
             (s) => (s.stop_type || "").toLowerCase() === "pickup"
         );
         const source_manifests = first_pickup
-            ? this._gather_stop_manifests(first_pickup.sequence, ["Assigned"])
+            ? this._gather_stop_manifests(first_pickup.sequence, ["Assigned"], "pickup")
             : [];
 
         if (!first_pickup || !source_manifests.length) {
@@ -1736,6 +1759,19 @@ class DeliveryApp {
             this._do_stop_pickup_flow(seq);
         } else if (stop_type === "drop") {
             this._do_stop_drop_flow(seq);
+        } else if (stop_type === "pickup+drop") {
+            // A combined stop used to fall through to the plain GPS ping
+            // below, leaving the driver unable to either deliver or collect at
+            // a hub that is both. Oracle OTM sequences a combined stop as
+            // unload-then-load, so deliver what is on board first and let the
+            // stop stay open for the pickup leg (see _stop_open_counterpart,
+            // which stops one leg from closing the stop on the other).
+            const deliverable = this._gather_stop_manifests(seq, ["In Transit"], "drop");
+            if (deliverable.length) {
+                this._do_stop_drop_flow(seq);
+            } else {
+                this._do_stop_pickup_flow(seq);
+            }
         } else {
             // Unknown stop type — fall back to a plain GPS arrival ping so we
             // never block the driver if a custom stop type slips through.
@@ -1795,31 +1831,55 @@ class DeliveryApp {
         return (t.stops || []).find((s) => cint(s.sequence) === cint(seq));
     }
 
-    _gather_stop_manifests(seq, statuses) {
-        // ``stop_sequence`` on a manifest is set by ``_assign_stop_sequence``
-        // to the manifest's DESTINATION stop (for forward trips) or SOURCE
-        // stop (for reverse trips). So filtering purely by stop_sequence
-        // works for the delivery side but never matches at the pickup stop.
+    _stop_open_counterpart(seq, role) {
+        // Open work at this stop for the OTHER leg. At a Pickup+Drop stop each
+        // flow auto-completes the stop when its own manifests all succeed;
+        // without this the first leg to finish would close the stop and strand
+        // the second (deliver at the hub, then be unable to collect there).
+        const other = (role || "").toLowerCase() === "pickup" ? "drop" : "pickup";
+        const statuses = other === "drop"
+            ? ["In Transit"]                      // on board, awaiting delivery here
+            : ["Assigned", "Pickup Started"];     // waiting to be collected here
+        return this._gather_stop_manifests(seq, statuses, other).length;
+    }
+
+    _gather_stop_manifests(seq, statuses, role) {
+        // ``role`` ("pickup" | "drop" | null) is the caller's INTENT, not the
+        // stop's declared type. At a Pickup+Drop stop the two differ: the
+        // pickup flow must collect only shipments originating here, and the
+        // drop flow only those terminating here. Inferring intent from the
+        // stop type meant a combined hub stop fed every manifest into the
+        // pickup flow, including ones merely being delivered there.
         //
-        // To make the combined Arrive & Pick Up flow work on multi-pickup
-        // trips, we additionally match a pickup stop against the manifest's
-        // source warehouse/store. Drop stops keep the strict stop_sequence
-        // match so a manifest only appears under the stop it's actually
-        // being delivered to.
+        // Membership itself comes from the server's stop_roles map
+        // (ch_logistics.api.stop_roles), the same predicate the stop actions
+        // use, so the card list and the action can no longer disagree. The
+        // location checks below are the pre-stop_roles fallback.
         const t = this._trip_detail || {};
         const stop = (t.stops || []).find((s) => cint(s.sequence) === cint(seq));
         const stop_type = ((stop && stop.stop_type) || "").toLowerCase();
         const allowed = new Set((statuses || []).map((x) => x.toLowerCase()));
+        const want = (role || "").toLowerCase();
         return (t.manifests || []).filter((m) => {
             let matches = false;
-            if (stop_type === "pickup" || stop_type === "pickup+drop") {
-                // Server-resolved pickup stop (get_trip_detail) wins; the
-                // source warehouse/store checks remain as legacy fallbacks.
+            const srv = m.stop_roles && m.stop_roles[String(seq)];
+            if (srv) {
+                const have = srv.toLowerCase().split("+");
+                matches = want ? have.includes(want) : true;
+                if (!matches) return false;
+                if (!allowed.size) return true;
+                return allowed.has((m.status || "").toLowerCase());
+            }
+            const try_pickup = want ? want === "pickup"
+                : (stop_type === "pickup" || stop_type === "pickup+drop");
+            const try_drop = want ? want === "drop"
+                : (stop_type === "drop" || stop_type === "pickup+drop");
+            if (try_pickup) {
                 if (m.pickup_stop_sequence && cint(m.pickup_stop_sequence) === cint(seq)) matches = true;
                 if (!matches && stop && stop.warehouse && m.source_warehouse === stop.warehouse) matches = true;
                 if (!matches && stop && stop.store && m.source_store === stop.store) matches = true;
             }
-            if (!matches && (stop_type === "drop" || stop_type === "pickup+drop")) {
+            if (!matches && try_drop) {
                 if (m.drop_stop_sequence && cint(m.drop_stop_sequence) === cint(seq)) matches = true;
                 if (!matches && cint(m.stop_sequence) === cint(seq)) matches = true;
                 // Fallback for trips that pre-date stop_sequence assignment.
@@ -1930,7 +1990,7 @@ class DeliveryApp {
 
     // ---------- Pickup stop combined flow ------------------------
     _do_stop_pickup_flow(seq) {
-        const candidates = this._gather_stop_manifests(seq, ["Assigned"]);
+        const candidates = this._gather_stop_manifests(seq, ["Assigned"], "pickup");
         const stop = this._find_stop(seq) || {};
         if (!candidates.length) {
             // Nothing left to pick up here. If every manifest at this stop
@@ -1938,10 +1998,11 @@ class DeliveryApp {
             // and close the stop out in one tap — the old silent "arrival
             // recorded" ping made drivers think the pickup photo / manifest
             // scan had been skipped.
-            const here = this._gather_stop_manifests(seq, []);
+            const here = this._gather_stop_manifests(seq, [], "pickup");
             const picked = here.filter((m) =>
                 ["In Transit", "Delivered", "Received", "Partially Received", "Closed"].includes(m.status));
-            if (here.length && picked.length === here.length) {
+            if (here.length && picked.length === here.length
+                && !this._stop_open_counterpart(seq, "pickup")) {
                 return this._record_stop_arrival(seq)
                     .then(() => this._call_promise(TRIP_API + "stop_complete", {
                         trip: this.active_trip,
@@ -2061,8 +2122,9 @@ class DeliveryApp {
             .then((results) => {
                 const { ok, fail } = this._summarise_batch(results);
                 // If every manifest at this pickup stop succeeded, auto-mark
-                // the stop Completed so the driver doesn't need a second tap.
-                if (ok.length && !fail.length) {
+                // the stop Completed so the driver doesn't need a second tap —
+                // unless the drop leg of a combined stop still has work.
+                if (ok.length && !fail.length && !this._stop_open_counterpart(seq, "pickup")) {
                     return this._call_promise(TRIP_API + "stop_complete", {
                         trip: this.active_trip,
                         sequence: seq,
@@ -2088,8 +2150,8 @@ class DeliveryApp {
 
     // ---------- Drop stop combined flow --------------------------
     _do_stop_drop_flow(seq) {
-        const deliverable = this._gather_stop_manifests(seq, ["In Transit"]);
-        const not_yet = this._gather_stop_manifests(seq, ["Assigned", "Pickup Started"]);
+        const deliverable = this._gather_stop_manifests(seq, ["In Transit"], "drop");
+        const not_yet = this._gather_stop_manifests(seq, ["Assigned", "Pickup Started"], "drop");
         const stop = this._find_stop(seq) || {};
 
         if (!deliverable.length) {
@@ -2286,8 +2348,10 @@ class DeliveryApp {
                 // Auto-complete the stop only when every deliverable manifest
                 // succeeded AND we didn't pre-skip any (i.e. no pickup-debt
                 // left). Otherwise leave the stop open so the driver can
-                // resolve the stragglers individually.
-                if (ok.length && !fail.length && !skipped.length) {
+                // resolve the stragglers individually — including the pickup
+                // leg of a combined stop, which must not be closed out here.
+                if (ok.length && !fail.length && !skipped.length
+                    && !this._stop_open_counterpart(seq, "drop")) {
                     return this._call_promise(TRIP_API + "stop_complete", {
                         trip: this.active_trip,
                         sequence: seq,

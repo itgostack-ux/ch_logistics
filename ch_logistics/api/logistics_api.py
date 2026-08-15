@@ -14,6 +14,7 @@ from frappe.utils import cint, flt, now_datetime
 import json
 
 from ch_logistics.api import driver_status as ds
+from ch_logistics.api import stop_roles
 from ch_logistics.api.trip_lock import get_locked_trip, lock_manifests
 from ch_logistics import roles as role_registry
 from ch_logistics import scope_guard
@@ -1299,71 +1300,18 @@ def get_driver_trips(driver=None, include_closed_days=0):
 
 
 def _annotate_manifest_stop_links(stops, manifests):
-    """Stamp ``pickup_stop_sequence`` / ``drop_stop_sequence`` on each manifest
-    dict by matching its source / destination against the trip's stops.
+    """Stamp pickup/drop sequences and per-stop roles onto each manifest dict.
 
-    Matching is tolerant of store-vs-warehouse asymmetry: a stop that only
-    carries a CH Store still matches a manifest that only carries the store's
-    warehouse (and vice versa) via the CH Store → Warehouse link.
+    Delegates to ``stop_roles.annotate`` so the driver app's stop cards and the
+    server's stop actions are driven by one predicate. The previous local
+    implementation preferred stops whose declared ``stop_type`` matched the
+    side being resolved, then fell back to "any location match so legacy routes
+    with mis-typed stops still resolve" — which quietly papered over route
+    templates whose stop types contradict the shipments assigned to them.
+    Matching on location alone removes the need to trust the declared type at
+    all; ``CH Logistics Trip`` now derives it instead.
     """
-    if not stops or not manifests:
-        return
-
-    # One lookup for every CH Store referenced on either side.
-    store_names = set()
-    for s in stops:
-        if s.get("store"):
-            store_names.add(s["store"])
-    for m in manifests:
-        for key in ("source_store", "destination_store"):
-            if m.get(key):
-                store_names.add(m[key])
-    wh_by_store = {}
-    if store_names and frappe.db.exists("DocType", "CH Store"):
-        for r in frappe.get_all(
-            "CH Store",
-            filters={"name": ["in", list(store_names)]},
-            fields=["name", "warehouse"],
-        ):
-            if r.warehouse:
-                wh_by_store[r.name] = r.warehouse
-
-    def _matches(stop, store, warehouse):
-        s_store, s_wh = stop.get("store"), stop.get("warehouse")
-        if store and s_store and store == s_store:
-            return True
-        if warehouse and s_wh and warehouse == s_wh:
-            return True
-        if warehouse and s_store and wh_by_store.get(s_store) == warehouse:
-            return True
-        if store and s_wh and wh_by_store.get(store) == s_wh:
-            return True
-        return False
-
-    def _find(store, warehouse, preferred_types):
-        if not (store or warehouse):
-            return None
-        # Prefer stops typed for this side (Pickup for source, Drop for
-        # destination), then fall back to any location match so legacy
-        # routes with mis-typed stops still resolve.
-        for only_preferred in (True, False):
-            for stop in stops:
-                stype = (stop.get("stop_type") or "").strip().lower()
-                if only_preferred and stype not in preferred_types:
-                    continue
-                if _matches(stop, store, warehouse):
-                    return stop.get("sequence")
-        return None
-
-    for m in manifests:
-        m["pickup_stop_sequence"] = _find(
-            m.get("source_store"), m.get("source_warehouse"),
-            ("pickup", "pickup+drop"),
-        )
-        m["drop_stop_sequence"] = _find(
-            m.get("destination_store"), m.get("destination_warehouse"),
-            ("drop", "pickup+drop"),
-        ) or m.get("stop_sequence")
+    stop_roles.annotate(stops, manifests)
 
 
 @frappe.whitelist()
@@ -2758,61 +2706,61 @@ def _get_trip_stop(trip_doc, sequence):
 def _stop_manifest_rows(trip_doc, stop):
     """All non-cancelled manifests the driver handles at THIS stop.
 
-    A manifest's ``stop_sequence`` points at the stop serving its DELIVERY
-    location on forward trips (its pickup location on reverse trips — see
-    _assign_stop_sequence), so a plain sequence filter only finds one side
-    of the journey. Pickup-stop membership must instead match the stop's
-    LOCATION against the manifest's source (mirroring the driver-app stop
-    cards, which list the same manifest under both its pickup and its drop
-    stop). Strategy:
+    Membership is decided by ``stop_roles.serves`` — the one predicate shared
+    with the annotation used by the driver app — so the stop card and the stop
+    action can no longer disagree.
 
-    * Pickup stop → manifests of this trip collected here
-      (source_store / source_warehouse match, stop_sequence match kept for
-      reverse trips).
-    * Drop stop → stop_sequence match first (authoritative on forward
-      trips), falling back to destination store/warehouse match.
+    This previously branched on ``stop_type == "Pickup"`` with everything else
+    falling into a drop-only branch, which silently swallowed ``Pickup+Drop``:
+    a combined hub stop returned only the manifests being delivered there and
+    never the ones being collected. It also trusted the route template's
+    stop_type, so a stop mistyped as Drop at a manifest's ORIGIN returned
+    nothing at all and the driver could not pick up.
+
+    Each returned row carries ``roles`` (Pickup / Drop / Pickup+Drop) so
+    callers can act on the side they care about instead of re-deriving it.
     """
     if not _has_manifest_trip_field():
         return []
     limit = role_registry.get_int_setting("max_manifests_per_trip", 500)
     trip_name = trip_doc.name if hasattr(trip_doc, "name") else trip_doc
-    base = {"trip": trip_name, "docstatus": ["<", 2]}
-    has_seq = _has_manifest_stop_seq_field()
-    stop_type = (stop.get("stop_type") or "").strip()
-    seq = cint(stop.get("sequence"))
 
-    def _fetch(extra=None, or_filters=None):
-        return frappe.get_all(
-            "CH Transfer Manifest",
-            filters={**base, **(extra or {})},
-            or_filters=or_filters,
-            fields=["name", "status"],
-            order_by="creation asc",
-            limit_page_length=limit + 1,
-        )
-
-    if stop_type == "Pickup":
-        location = []
-        if stop.get("store"):
-            location.append(["source_store", "=", stop.get("store")])
-        if stop.get("warehouse"):
-            location.append(["source_warehouse", "=", stop.get("warehouse")])
-        if has_seq:
-            location.append(["stop_sequence", "=", seq])
-        rows = _fetch(or_filters=location) if location else []
-    else:
-        rows = _fetch({"stop_sequence": seq}) if has_seq else []
-        if not rows:
-            location = []
-            if stop.get("store"):
-                location.append(["destination_store", "=", stop.get("store")])
-            if stop.get("warehouse"):
-                location.append(["destination_warehouse", "=", stop.get("warehouse")])
-            if location:
-                rows = _fetch(or_filters=location)
-
-    if len(rows) > limit:
+    fields = [
+        "name", "status",
+        "source_store", "source_warehouse",
+        "destination_store", "destination_warehouse",
+    ]
+    if _has_manifest_stop_seq_field():
+        fields.append("stop_sequence")
+    candidates = frappe.get_all(
+        "CH Transfer Manifest",
+        filters={"trip": trip_name, "docstatus": ["<", 2]},
+        fields=fields,
+        order_by="creation asc",
+        limit_page_length=limit + 1,
+    )
+    if len(candidates) > limit:
         frappe.throw(_("This stop exceeds the configured manifest limit."))
+
+    wh_by_store = stop_roles.warehouse_by_store([stop], candidates)
+    seq = cint(stop.get("sequence"))
+    rows = []
+    for m in candidates:
+        roles = stop_roles.manifest_roles_at_stop(m, stop, wh_by_store)
+        if not roles and m.get("stop_sequence") and cint(m["stop_sequence"]) == seq:
+            # Legacy trips whose stop locations were never filled in (or point
+            # at a store with no Warehouse link) resolve only through the old
+            # single-stop pointer, which always denoted the delivery side.
+            roles = {stop_roles.DROP}
+        if not roles:
+            continue
+        # frappe._dict, not a plain dict: callers reach these rows by attribute
+        # (r.name), matching what frappe.get_all returned before.
+        rows.append(frappe._dict({
+            "name": m["name"],
+            "status": m["status"],
+            "roles": stop_roles.combine_roles(roles),
+        }))
     return rows
 
 
