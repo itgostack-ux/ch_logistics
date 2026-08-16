@@ -259,8 +259,20 @@ def _propagate_trip_driver_to_manifests(trip, driver, vehicle=None):
             payload["driver_name"] = drv_name
         if drv_phone:
             payload["driver_phone"] = drv_phone
-        if vehicle and frappe.get_meta("CH Transfer Manifest").has_field("vehicle"):
-            payload["vehicle"] = vehicle
+        if vehicle:
+            manifest_meta = frappe.get_meta("CH Transfer Manifest")
+            # "vehicle" (a Link, if the site has adopted it) and
+            # "vehicle_number" (the plain Data field this site actually
+            # uses) are separate fields — stamp whichever exist. Previously
+            # only the Link variant was handled, which this doctype doesn't
+            # have, so vehicle_number was silently never set here despite
+            # the trip itself carrying it correctly.
+            if manifest_meta.has_field("vehicle"):
+                payload["vehicle"] = vehicle
+            if manifest_meta.has_field("vehicle_number"):
+                payload["vehicle_number"] = (
+                    frappe.db.get_value("Vehicle", vehicle, "license_plate") or vehicle
+                )
         # Every attached pre-pickup manifest must enter the scannable state.
         # Leaving Draft rows as Draft made a driver's next trip visible while
         # the Delivery App hid its barcode controls (it only scans Assigned /
@@ -518,7 +530,22 @@ def _close_trip_as_logistics_head(doc):
 
 @frappe.whitelist(methods=["POST"])
 def trip_cancel(trip, reason=None):
-    """Atomically cancel a pre-departure trip, manifests, and stock.
+    """Cancel a pre-departure trip and release its manifests back to the
+    dispatch pool — NOT cancel the manifests themselves.
+
+    Nothing has physically moved yet at this point (cancellation is only
+    allowed from Draft/Assigned, before pickup), so the goods are still
+    exactly where they were packed. There is no reason to void the manifest
+    and force it to be re-packed from scratch on a new one just because
+    this particular trip fell through (driver unavailable, vehicle issue,
+    etc.) — each manifest is instead reverted to Packed with its driver
+    attribution cleared (mirroring ``detach_manifest`` / trip-unassign), so
+    it reappears in Unassigned Manifests ready for a different trip.
+
+    Any e-Way Bill already generated for this trip is still cancelled here
+    (GST Rule 138 compliance — a stale EWB must not be left active once the
+    driver/vehicle assignment backing it is undone), even though the
+    manifest itself lives on.
 
     A reason is mandatory. Who/when/why is stamped on the trip
     (cancelled_by / cancelled_on / cancellation_reason) and added to the
@@ -541,7 +568,7 @@ def trip_cancel(trip, reason=None):
     manifests = frappe.get_all(
         "CH Transfer Manifest",
         filters={"trip": doc.name, "docstatus": ["<", 2]},
-        fields=["name", "status", "pickup_datetime"],
+        fields=["name", "status", "pickup_datetime", "ewaybill_status", "ewaybill_count"],
         order_by="name asc",
     )
     lock_manifests([row.name for row in manifests])
@@ -560,15 +587,31 @@ def trip_cancel(trip, reason=None):
             title=_("Recall Required"),
         )
 
-    reversal_actions = []
+    released = []
     for row in manifests:
         if (row.status or "Draft") == "Cancelled":
             continue
-        manifest = frappe.get_doc("CH Transfer Manifest", row.name)
-        actions = manifest.cancel_before_departure(
-            reason=_("Trip {0} cancelled: {1}").format(doc.name, reason)
+        payload = {
+            "trip": None,
+            "driver": None,
+            "driver_name": None,
+            "driver_phone": None,
+        }
+        if _has_manifest_stop_seq_field():
+            payload["stop_sequence"] = 0
+        # Keep it discoverable to dispatch as pre-pickup work again.
+        if (row.status or "Draft") in ("Draft", "Packed", "Assigned"):
+            payload["status"] = "Packed"
+        if cint(row.ewaybill_count) or row.ewaybill_status in ("Generated", "Partial"):
+            payload["ewaybill_status"] = "Cancelled"
+        frappe.db.set_value("CH Transfer Manifest", row.name, payload)
+        frappe.get_doc("CH Transfer Manifest", row.name).add_comment(
+            "Comment",
+            _("Released from trip {0} (trip cancelled by {1}): {2}").format(
+                doc.name, frappe.session.user, reason
+            ),
         )
-        reversal_actions.extend(actions)
+        released.append(row.name)
 
     prev_driver = doc.driver
     doc.status = "Cancelled"
@@ -582,8 +625,7 @@ def trip_cancel(trip, reason=None):
     return {
         "trip": doc.name,
         "status": doc.status,
-        "cancelled_manifests": [row.name for row in manifests],
-        "stock_reversals": reversal_actions,
+        "released_manifests": released,
     }
 
 
@@ -928,7 +970,13 @@ def _attach_manifests(trip, manifests):
         scope_guard.assert_manifest_scope(mf)
         _validate_manifest_attachable(trip_doc, manifest_name, mf)
         frappe.db.set_value("CH Transfer Manifest", manifest_name, "trip", trip)
+        # Runs AFTER stop assignment, deliberately: _assign_stop_sequence()
+        # reads direction fresh from the DB too (via _manifest_target_for_trip),
+        # so correcting it first would also flip what stop_sequence resolves
+        # to for a reverse-flow manifest — a wider, riskier change than the
+        # cosmetic display fix intended here. See _sync_manifest_direction.
         seq = _assign_stop_sequence(trip_doc, manifest_name)
+        _sync_manifest_direction(trip_doc, manifest_name, mf)
         if seq is None and trip_doc.status == "Started":
             seq = _ensure_dynamic_stop_for_manifest(trip_doc, manifest_name)
             if seq is not None and _has_manifest_stop_seq_field():
@@ -953,6 +1001,38 @@ def _attach_manifests(trip, manifests):
     # leaves the new manifests invisible to the driver app.
     if trip_doc.driver:
         _propagate_trip_driver_to_manifests(trip, trip_doc.driver, trip_doc.get("vehicle"))
+
+
+def _sync_manifest_direction(trip_doc, manifest_name, mf):
+    """Correct a manifest's own ``direction`` field to match its real
+    source/destination relative to the trip's hub — Reverse when goods flow
+    INTO the hub (store → hub, a return), Forward when they flow OUT of it
+    (hub → store, standard distribution).
+
+    ``direction`` lives on the manifest (not just the trip) precisely so a
+    single "Mixed" trip can carry both Forward and Reverse manifests at
+    once — _manifest_target_for_trip() reads it per-manifest for exactly
+    that reason. But nothing ever set it, so it silently sat on whatever
+    was picked (or left blank) at manifest creation, showing "Forward" on
+    a manifest that's actually a return leg. Left untouched for
+    store-to-store transfers where neither side is the hub, or when the
+    trip has no hub_warehouse to compare against — not enough information
+    to derive it safely there.
+    """
+    if not frappe.get_meta("CH Transfer Manifest").has_field("direction"):
+        return
+    hub = trip_doc.get("hub_warehouse")
+    if not hub:
+        return
+    if mf.get("destination_warehouse") == hub:
+        correct = "Reverse"
+    elif mf.get("source_warehouse") == hub:
+        correct = "Forward"
+    else:
+        return
+    if mf.get("direction") != correct:
+        frappe.db.set_value("CH Transfer Manifest", manifest_name, "direction", correct)
+        mf["direction"] = correct
 
 
 def _assign_stop_sequence(trip_doc, manifest_name):
@@ -1009,6 +1089,17 @@ def detach_manifest(manifest):
     if _has_manifest_stop_seq_field():
         # Int column is NOT NULL — writing None raises IntegrityError.
         frappe.db.set_value("CH Transfer Manifest", manifest, "stop_sequence", 0)
+    # Mirror _clear_trip_driver_from_manifests (used by trip-level unassign /
+    # driver-reject): a detached manifest must fall back to Packed and lose
+    # its stale driver/vehicle attribution, or it becomes invisible to
+    # ops_unassigned_manifests (status="Packed" is its only filter) — an
+    # orphan that's off the trip but not back in the dispatch worklist.
+    detached_status = frappe.db.get_value("CH Transfer Manifest", manifest, "status")
+    if detached_status in ("Assigned", "Pickup Started"):
+        frappe.db.set_value(
+            "CH Transfer Manifest", manifest,
+            {"status": "Packed", "driver": None, "driver_name": None, "driver_phone": None},
+        )
     _trip_audit(trip_doc, _("Manifest {0} detached by {1}.").format(manifest, frappe.session.user))
     trip_doc.reload()
     trip_doc.flags.ignore_mandatory = True

@@ -1795,7 +1795,7 @@ class LogisticsCommandCenter {
 		const d = new frappe.ui.Dialog({
 			title: __("Cancel Trip {0}", [trip]),
 			fields: [
-				{ fieldtype: "HTML", options: `<div class="alert alert-warning">${__("This pre-departure cancellation will reverse every attached manifest's stock to source, cancel the manifests, cancel the trip, and release the driver. If physical pickup has started, the server will require Abort & Recall instead.")}</div>` },
+				{ fieldtype: "HTML", options: `<div class="alert alert-warning">${__("This pre-departure cancellation will cancel the trip, release the driver, and release every attached manifest back to Packed / Unassigned Manifests so it can be re-attached to a different trip — the manifests themselves are NOT cancelled and their stock is not reversed. If physical pickup has started, the server will require Abort & Recall instead.")}</div>` },
 				{ fieldtype: "Small Text", fieldname: "reason", label: __("Reason"), reqd: 1 },
 			],
 			primary_action_label: __("Cancel Trip"),

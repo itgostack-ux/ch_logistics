@@ -1214,7 +1214,19 @@ class DeliveryApp {
             if (!pickup_seq && !drop_seq) _push_stop_manifest(m.stop_sequence || 0, m);
         }
 
-        let stops_html = (t.stops || []).map((s) => {
+        // A route's stop list is a template — on any given trip, some stops
+        // may carry no manifest at all (nothing to pick up or drop there
+        // today). Showing those as an actionable "Pending — Arrive" card
+        // just gives the driver a dead-end tap: nothing is deliverable, so
+        // it silently falls back to a bare GPS ping with no photo/OTP
+        // prompt. Hide a stop once it's confirmed empty; a stop that
+        // already has status beyond Pending stays visible (it may show
+        // completed proof/history worth keeping on screen).
+        let visible_stops = (t.stops || []).filter(
+            (s) => s.status !== "Pending" || (manifests_by_stop[s.sequence] || []).length > 0
+        );
+
+        let stops_html = visible_stops.map((s) => {
             let st_cls = (s.status || "").toLowerCase().replace(/\s+/g, "-");
             let manifests = manifests_by_stop[s.sequence] || [];
             let active_manifest_rows = manifests.filter((m) => ["Assigned", "Pickup Started", "In Transit"].includes(m.status));
@@ -1577,12 +1589,27 @@ class DeliveryApp {
         // stop; later pickup stops keep using the per-stop "Arrive & Pick Up"
         // dialog.
         const t = this._trip_detail || {};
-        const first_pickup = (t.stops || []).find(
-            (s) => (s.stop_type || "").toLowerCase() === "pickup"
+        // Find the first stop (lowest sequence) manifests are actually
+        // AWAITING PICKUP at, driven by each manifest's own server-resolved
+        // pickup_stop_sequence (get_trip_detail / _annotate_manifest_stop_links,
+        // which matches on real source-location geography and is correct
+        // regardless of trip/manifest Direction). Matching on bare stop_type
+        // instead ("first stop typed Pickup or Pickup+Drop") breaks for a
+        // Reverse trip (goods flow store → hub): stop #1 is the hub, which
+        // is this manifest's DROP point, not its pickup point — using it as
+        // the pickup gate ran start_pickup + stop_complete against the wrong
+        // stop, permanently marking it "Completed" before delivery ever
+        // happened and hiding its real "Arrive & Deliver" action.
+        const awaiting_pickup = (t.manifests || []).filter(
+            (m) => m.status === "Assigned" && m.pickup_stop_sequence
         );
-        const source_manifests = first_pickup
-            ? this._gather_stop_manifests(first_pickup.sequence, ["Assigned"], "pickup")
-            : [];
+        let first_pickup = null;
+        let source_manifests = [];
+        if (awaiting_pickup.length) {
+            const first_seq = Math.min(...awaiting_pickup.map((m) => cint(m.pickup_stop_sequence)));
+            first_pickup = (t.stops || []).find((s) => cint(s.sequence) === first_seq);
+            source_manifests = awaiting_pickup.filter((m) => cint(m.pickup_stop_sequence) === first_seq);
+        }
 
         if (!first_pickup || !source_manifests.length) {
             // Nothing to scan at the source (delivery-only trip, or all
@@ -1591,7 +1618,17 @@ class DeliveryApp {
             this._do_trip_accept_quick();
             return;
         }
-        this._open_trip_start_dialog(first_pickup, source_manifests);
+        // Capture GPS up front (not after the dialog is confirmed) so the
+        // driver can see — and the load photo / QR scan is provably tied to
+        // — the location actually captured, mirroring the Reached Location
+        // dialog's lat/lng display.
+        frappe.dom.freeze(__("Capturing GPS…"));
+        this._capture_gps_promise()
+            .then(({ lat, lng }) => {
+                frappe.dom.unfreeze();
+                this._open_trip_start_dialog(first_pickup, source_manifests, { lat, lng });
+            })
+            .catch(() => frappe.dom.unfreeze());
     }
 
     _do_trip_accept_quick() {
@@ -1606,7 +1643,7 @@ class DeliveryApp {
         });
     }
 
-    _open_trip_start_dialog(pickup_stop, source_manifests) {
+    _open_trip_start_dialog(pickup_stop, source_manifests, gps) {
         const t = this._trip_detail || {};
         const manifest_rows_html = source_manifests.map((m) => `
             <div class="da-stop-batch-row" style="border:1px solid #eee;border-radius:6px;padding:6px 8px;margin-bottom:6px;">
@@ -1624,6 +1661,10 @@ class DeliveryApp {
             reqd: 1,
         }));
 
+        const lat_str = (typeof gps.lat === "number") ? gps.lat.toFixed(6) : String(gps.lat);
+        const lng_str = (typeof gps.lng === "number") ? gps.lng.toFixed(6) : String(gps.lng);
+        const maps_url = `https://maps.google.com/?q=${lat_str},${lng_str}`;
+
         const fields = [
             {
                 fieldname: "summary", fieldtype: "HTML",
@@ -1635,6 +1676,22 @@ class DeliveryApp {
                     </div>
                 </div>
                 <div class="da-stop-batch-list">${manifest_rows_html}</div>`,
+            },
+            {
+                fieldname: "pickup_lat", fieldtype: "Data",
+                label: __("Latitude"), default: lat_str, read_only: 1,
+            },
+            {
+                fieldname: "pickup_lng", fieldtype: "Data",
+                label: __("Longitude"), default: lng_str, read_only: 1,
+            },
+            {
+                fieldname: "gps_preview", fieldtype: "HTML",
+                options: `<div style="text-align:center;margin:0 0 8px 0;">
+                    <a href="${maps_url}" target="_blank" rel="noopener" class="btn btn-default btn-xs">
+                       <i class="fa fa-external-link"></i> ${__("Open in Google Maps")}
+                    </a>
+                </div>`,
             },
             {
                 fieldname: "pickup_photo",
@@ -1659,16 +1716,18 @@ class DeliveryApp {
             primary_action_label: __("Confirm & Start Trip"),
             primary_action: (values) => {
                 d.hide();
-                this._submit_trip_start(pickup_stop, source_manifests, values);
+                this._submit_trip_start(pickup_stop, source_manifests, values, gps);
             },
         });
         d.show();
     }
 
-    _submit_trip_start(pickup_stop, source_manifests, values) {
+    _submit_trip_start(pickup_stop, source_manifests, values, gps) {
         frappe.dom.freeze(__("Accepting trip & loading manifests…"));
-        let captured_gps = null;
-        return this._capture_gps_promise()
+        let captured_gps = gps || null;
+        // GPS is already captured (and shown to the driver) before this
+        // dialog opens — don't ask the device for a second fix.
+        return (gps ? Promise.resolve(gps) : this._capture_gps_promise())
             .then(({ lat, lng, accuracy }) => {
                 captured_gps = { lat, lng, accuracy };
                 // Step 1: flip Assigned → Started so subsequent stop_arrive /
