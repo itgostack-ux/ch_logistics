@@ -1013,7 +1013,7 @@ class LogisticsCommandCenter {
 		$r.on("click",  ".lcc-attach-btn",    () => this._ops_attach());
 		$r.on("click",  ".lcc-exc-resolve",   (e) => this._ops_resolve_exc($(e.currentTarget).data("trip"), $(e.currentTarget).data("row")));
 		$r.on("click",  "#lcc-side-assign",   () => this._ops_assign_driver());
-		$r.on("click",  "#lcc-side-start",    () => this._ops_trip_action("trip_start"));
+		$r.on("click",  "#lcc-side-start",    () => this._ops_start_trip());
 		$r.on("click",  "#lcc-side-complete", () => this._ops_trip_action("trip_complete"));
 		$r.on("click",  "#lcc-side-complete-override", () => this._ops_trip_action("trip_complete", _LCC, { override_exceptions: 1 }));
 		$r.on("click",  "#lcc-side-resequence", () => this._ops_trip_action("resequence_trip", _OPT));
@@ -1787,6 +1787,26 @@ class LogisticsCommandCenter {
 		if (!this.active_trip) return;
 		frappe.call({ method: prefix + method, args: { trip: this.active_trip, ...extraArgs } })
 			.then(() => { frappe.show_alert({ message: __("Done"), indicator: "green" }); this._ops_load(); });
+	}
+
+	_ops_start_trip() {
+		// Pre-flight the empty-stop warning trip_start would otherwise throw
+		// on, same as the Delivery App's Accept & Start — one confirm here
+		// instead of a failed call.
+		if (!this.active_trip) return;
+		const trip = this.active_trip;
+		frappe.call({ method: _LCC + "get_empty_stop_warning", args: { trip } }).then((r) => {
+			const empty = (r.message && r.message.empty_stops) || [];
+			if (!empty.length) {
+				this._ops_trip_action("trip_start");
+				return;
+			}
+			frappe.confirm(
+				__("Stop(s) {0} have no shipments assigned — nothing to load or unload there. Start anyway?",
+					[empty.map((s) => "#" + s).join(", ")]),
+				() => this._ops_trip_action("trip_start", _LCC, { override_empty_stops: 1 })
+			);
+		});
 	}
 
 	_ops_cancel_trip() {

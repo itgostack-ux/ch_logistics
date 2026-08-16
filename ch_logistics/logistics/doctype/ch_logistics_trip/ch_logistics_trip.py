@@ -352,8 +352,21 @@ class CHLogisticsTrip(Document):
         if self.status == "Started":
             self._reject_stops_without_shipments()
 
+    def empty_stop_sequences(self) -> list[str]:
+        """Sequence numbers of stops with zero attached shipments, or [] if
+        none — the read-only half of _reject_stops_without_shipments(), used
+        for a pre-flight warning check before the driver commits to starting.
+        Same "trip with nothing attached at all is a different problem" guard
+        as the enforcement path, so the two never disagree."""
+        if not self.stops:
+            return []
+        if not any(int(s.manifest_count or 0) for s in self.stops):
+            return []
+        return [str(s.sequence) for s in self.stops if not int(s.manifest_count or 0)]
+
     def _reject_stops_without_shipments(self):
-        """Refuse to dispatch an itinerary containing a stop that serves nothing.
+        """Warn — but allow an explicit override — when dispatching an
+        itinerary containing a stop that serves nothing.
 
         Oracle OTM and SAP TM never emit a stop with no shipment events: the
         planned route is a template, and only locations with work become
@@ -361,27 +374,39 @@ class CHLogisticsTrip(Document):
         stops with nothing to load or unload — no way to tell an oversight from
         a deliberate waypoint, and no way to complete them meaningfully.
 
+        For routes that routinely run with fewer stops loaded than the
+        template has (the common case here), a hard block turned every
+        dispatch into manual itinerary surgery. So this stays a warning the
+        caller must have already surfaced and had confirmed — set
+        ``self.flags.ignore_empty_stops`` (mirrors the existing exception
+        override pattern) to proceed; the override itself is still audited
+        on the trip's timeline so it's traceable who chose to dispatch with a
+        known-empty stop.
+
         Deliberately gated on the transition INTO Started rather than on the
         Started state, so a dispatcher can still shape a Draft itinerary before
         shipments are attached, and trips already on the road stay saveable.
         ``manifest_count`` is refreshed by _reconcile_stops earlier in validate.
         """
-        if not self.stops:
+        empty = self.empty_stop_sequences()
+        if not empty:
             return
-        # A trip with nothing attached at all is a different problem, reported
-        # elsewhere; don't mask it with a per-stop complaint.
-        if not any(int(s.manifest_count or 0) for s in self.stops):
-            return
-        empty = [str(s.sequence) for s in self.stops if not int(s.manifest_count or 0)]
-        if empty:
-            frappe.throw(
-                _(
-                    "Stop(s) {0} have no shipments assigned. Remove them or attach a "
-                    "manifest before starting the trip — the driver cannot load or "
-                    "unload anything there."
-                ).format(", ".join(f"#{s}" for s in empty)),
-                title=_("Empty Stop On Itinerary"),
+        if self.flags.get("ignore_empty_stops"):
+            self.add_comment(
+                "Comment",
+                _("Started with known-empty stop(s) {0} — confirmed by {1}.").format(
+                    ", ".join(f"#{s}" for s in empty), frappe.session.user
+                ),
             )
+            return
+        frappe.throw(
+            _(
+                "Stop(s) {0} have no shipments assigned. Remove them or attach a "
+                "manifest before starting the trip — the driver cannot load or "
+                "unload anything there."
+            ).format(", ".join(f"#{s}" for s in empty)),
+            title=_("Empty Stop On Itinerary"),
+        )
 
     # ------------------------------------------------------------------
     # Public helpers used by logistics_api

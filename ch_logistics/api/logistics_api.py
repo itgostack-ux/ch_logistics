@@ -376,8 +376,20 @@ def trip_unassign(trip):
     return doc.name
 
 
+@frappe.whitelist()
+def get_empty_stop_warning(trip):
+    """Read-only pre-flight check for the Accept/Start dialogs: which stops
+    (if any) currently have zero shipments. Lets the client show the same
+    warning driver_accept_trip / trip_start would otherwise throw, and ask
+    for confirmation, before spending a round-trip on a call that's only
+    going to be rejected."""
+    doc = frappe.get_doc("CH Logistics Trip", trip)
+    doc.check_permission("read")
+    return {"empty_stops": doc.empty_stop_sequences()}
+
+
 @frappe.whitelist(methods=["POST"])
-def driver_accept_trip(trip):
+def driver_accept_trip(trip, override_empty_stops=0):
     """Driver acceptance of an assigned trip.
 
     Keep UX explicit: driver acknowledges assignment, then trip moves to Started.
@@ -395,6 +407,7 @@ def driver_accept_trip(trip):
         "Comment",
         _("Trip accepted for driver {0} by {1}.").format(assigned_driver, frappe.session.user),
     )
+    doc.flags.ignore_empty_stops = cint(override_empty_stops)
     doc.mark_started()
     doc.save()
     if assigned_driver:
@@ -437,13 +450,14 @@ def driver_reject_trip(trip, reason, notes=None):
 
 
 @frappe.whitelist(methods=["POST"])
-def trip_start(trip, gps_lat=None, gps_lng=None):
+def trip_start(trip, gps_lat=None, gps_lng=None, override_empty_stops=0):
     doc = get_locked_trip(trip)
     doc.check_permission("write")
     from ch_logistics.api.driver_resolver import assert_trip_driver_access
 
     assert_trip_driver_access(doc)
     ds.assert_not_on_break(doc.driver)
+    doc.flags.ignore_empty_stops = cint(override_empty_stops)
     doc.mark_started()
     doc.save()
     if doc.driver:

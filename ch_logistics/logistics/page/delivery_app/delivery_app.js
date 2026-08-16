@@ -1588,6 +1588,28 @@ class DeliveryApp {
         // For multi-pickup milk-runs the gate covers just the first pickup
         // stop; later pickup stops keep using the per-stop "Arrive & Pick Up"
         // dialog.
+        //
+        // Pre-flight the server's empty-stop warning ONCE up front, whichever
+        // path (quick-accept or the QR-scan gate below) ends up firing —
+        // both call driver_accept_trip and would otherwise hit the same
+        // throw. One confirm here instead of a failed call + retry.
+        this._call_promise(TRIP_API + "get_empty_stop_warning", {
+            trip: this.active_trip,
+        }).then((info) => {
+            const empty = (info && info.empty_stops) || [];
+            if (!empty.length) {
+                this._do_trip_accept_proceed(0);
+                return;
+            }
+            frappe.confirm(
+                __("Stop(s) {0} have no shipments assigned — nothing to load or unload there. Start anyway?",
+                    [empty.map((s) => "#" + s).join(", ")]),
+                () => this._do_trip_accept_proceed(1)
+            );
+        });
+    }
+
+    _do_trip_accept_proceed(overrideEmptyStops) {
         const t = this._trip_detail || {};
         // Find the first stop (lowest sequence) manifests are actually
         // AWAITING PICKUP at, driven by each manifest's own server-resolved
@@ -1615,7 +1637,7 @@ class DeliveryApp {
             // Nothing to scan at the source (delivery-only trip, or all
             // manifests at the source already picked up). Fall back to the
             // legacy quick-accept flow so the driver isn't blocked.
-            this._do_trip_accept_quick();
+            this._do_trip_accept_quick(overrideEmptyStops);
             return;
         }
         // Capture GPS up front (not after the dialog is confirmed) so the
@@ -1626,15 +1648,16 @@ class DeliveryApp {
         this._capture_gps_promise()
             .then(({ lat, lng }) => {
                 frappe.dom.unfreeze();
-                this._open_trip_start_dialog(first_pickup, source_manifests, { lat, lng });
+                this._open_trip_start_dialog(first_pickup, source_manifests, { lat, lng }, overrideEmptyStops);
             })
             .catch(() => frappe.dom.unfreeze());
     }
 
-    _do_trip_accept_quick() {
+    _do_trip_accept_quick(overrideEmptyStops) {
         frappe.confirm(__("Accept this trip and start now?"), () => {
             this._call_promise(TRIP_API + "driver_accept_trip", {
                 trip: this.active_trip,
+                override_empty_stops: overrideEmptyStops ? 1 : 0,
             }).then(() => {
                 frappe.show_alert({ message: __("Trip accepted"), indicator: "green" });
                 this.show_trip_detail(this.active_trip);
@@ -1643,7 +1666,7 @@ class DeliveryApp {
         });
     }
 
-    _open_trip_start_dialog(pickup_stop, source_manifests, gps) {
+    _open_trip_start_dialog(pickup_stop, source_manifests, gps, overrideEmptyStops) {
         const t = this._trip_detail || {};
         const manifest_rows_html = source_manifests.map((m) => `
             <div class="da-stop-batch-row" style="border:1px solid #eee;border-radius:6px;padding:6px 8px;margin-bottom:6px;">
@@ -1716,13 +1739,13 @@ class DeliveryApp {
             primary_action_label: __("Confirm & Start Trip"),
             primary_action: (values) => {
                 d.hide();
-                this._submit_trip_start(pickup_stop, source_manifests, values, gps);
+                this._submit_trip_start(pickup_stop, source_manifests, values, gps, overrideEmptyStops);
             },
         });
         d.show();
     }
 
-    _submit_trip_start(pickup_stop, source_manifests, values, gps) {
+    _submit_trip_start(pickup_stop, source_manifests, values, gps, overrideEmptyStops) {
         frappe.dom.freeze(__("Accepting trip & loading manifests…"));
         let captured_gps = gps || null;
         // GPS is already captured (and shown to the driver) before this
@@ -1734,6 +1757,7 @@ class DeliveryApp {
                 // stop_complete calls are allowed by the server.
                 return this._call_promise(TRIP_API + "driver_accept_trip", {
                     trip: this.active_trip,
+                    override_empty_stops: overrideEmptyStops ? 1 : 0,
                 });
             })
             .then(() => {
