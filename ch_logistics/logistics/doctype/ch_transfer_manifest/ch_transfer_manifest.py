@@ -713,15 +713,15 @@ class CHTransferManifest(Document):
             if ewb_no:
                 generated += 1
                 ewb_status = "Generated"
+                # e-Waybill Log carries validity only — it has no status column,
+                # and asking for one made the whole EWB summary raise.
                 ewb_doc = frappe.db.get_value(
                     "e-Waybill Log",
                     {"name": ewb_no},
-                    ["valid_upto", "status"],
+                    ["valid_upto"],
                     as_dict=True,
                 ) or {}
                 validity = ewb_doc.get("valid_upto")
-                if ewb_doc.get("status"):
-                    ewb_status = ewb_doc["status"]
             results.append({
                 "stock_entry": se_name,
                 "ewaybill": ewb_no,
@@ -2782,10 +2782,8 @@ class CHTransferManifest(Document):
             stores.append((self.destination_store, "Destination"))
 
         for store_name, label in stores:
-            try:
-                contact_email = frappe.db.get_value("CH Store", store_name, "email")
-            except Exception:
-                contact_email = None
+            # CH Store holds no email address; the recall notice is addressed to
+            # the store's managers.
             store_user = None
             try:
                 from ch_erp15.ch_erp15.store_request_api import _get_store_managers
@@ -2793,7 +2791,7 @@ class CHTransferManifest(Document):
                 store_user = managers[0] if managers else None
             except Exception:
                 store_user = None
-            if not contact_email and not store_user:
+            if not store_user:
                 continue
 
             subject = _("Transfer Recall Notice — {0}").format(self.name)
@@ -2829,11 +2827,7 @@ class CHTransferManifest(Document):
                 manifest_url=manifest_url,
             )
 
-            recipients = []
-            if contact_email:
-                recipients.append(contact_email)
-            if store_user and store_user != contact_email:
-                recipients.append(store_user)
+            recipients = [store_user]
 
             if recipients:
                 frappe.sendmail(

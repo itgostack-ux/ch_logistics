@@ -74,6 +74,33 @@ def _get_or_create_ch_store(name: str, warehouse: str, company: str) -> None:
     doc.store_name = name
     doc.company = company
     doc.warehouse = warehouse
+    # An Active CH Store requires City + Zone
+    # (ch_store._validate_operational_location). ignore_mandatory does NOT
+    # bypass that frappe.throw, which is why this fixture used to abort the
+    # whole module before a single scope assertion ran. CH Store.validate()
+    # derives city from the zone, so supplying the zone alone is enough.
+    zone = frappe.db.get_value("CH Store Zone", {"company": company}, "name")
+    if not zone:
+        z = frappe.new_doc("CH Store Zone")
+        z.zone_name = f"{name} Zone"
+        z.company = company
+        z.city = frappe.db.get_value("CH City", {"disabled": 0}, "name")
+        # NOT the store's own warehouse: location_hierarchy rejects a store
+        # whose warehouse is any zone's source hub ("configured as a zone hub").
+        z.source_warehouse = (
+            frappe.db.get_value(
+                "Warehouse",
+                {"company": company, "is_group": 1, "name": ("!=", warehouse)},
+                "name",
+            )
+            or frappe.db.get_value(
+                "Warehouse", {"company": company, "name": ("!=", warehouse)}, "name"
+            )
+        )
+        z.flags.ignore_permissions = True
+        z.insert(ignore_permissions=True)
+        zone = z.name
+    doc.zone = zone
     doc.flags.ignore_permissions = True
     doc.flags.ignore_mandatory = True
     doc.insert(ignore_permissions=True)

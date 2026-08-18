@@ -2888,6 +2888,24 @@ def _stop_manifest_rows(trip_doc, stop):
     return rows
 
 
+def _stop_rows_for_role(rows, role):
+    """The subset of a stop's manifests whose event at THIS stop is ``role``.
+
+    A Pickup+Drop stop carries both the goods dropped here and the goods
+    collected here, and by definition those two sets are in different states:
+    the drop side is In Transit, the pickup side is still Assigned. So every
+    stop action has to narrow to its own side before applying a status gate.
+    An unfiltered gate reads the other side's perfectly normal status as an
+    error — "Every manifest at this stop must be In Transit before delivery"
+    when the only offender is a parcel the driver has not collected yet — which
+    deadlocks every combined stop on a cyclic route (1 -> 2/3 with a 3 -> 2 leg
+    and a 2 -> 3 leg: stops 2 and 3 are both Pickup+Drop, so neither the pickup
+    nor the drop could ever run). _stop_manifest_rows already tags each row with
+    its roles precisely so callers can pick their side.
+    """
+    return [r for r in rows if role in stop_roles.roles_of(r.roles)]
+
+
 def _stop_scan_matches(scanned, expected_token, manifest_names) -> bool:
     """True when the scanned payload proves the driver is handling THIS stop's
     goods. Accepted proofs, all bound to manifests attached to the stop:
@@ -2977,8 +2995,14 @@ def start_stop_pickup(trip, sequence, scanned_qr, pickup_photo,
               "to this stop.").format(stop.sequence, rows[0].name),
             title=_("Wrong Label"))
 
+    rows = _stop_rows_for_role(rows, stop_roles.PICKUP)
+    if not rows:
+        frappe.throw(
+            _("Nothing to collect at stop #{0} — every manifest here is a delivery.")
+                .format(stop.sequence),
+            title=_("Nothing to Pick Up"))
     if any(r.status != "Assigned" for r in rows):
-        frappe.throw(_("Every manifest at this stop must be Assigned before pickup."))
+        frappe.throw(_("Every manifest being collected at this stop must be Assigned before pickup."))
     manifests = []
     for r in rows:
         doc = frappe.get_doc("CH Transfer Manifest", r.name)
@@ -3077,8 +3101,14 @@ def complete_stop_delivery(trip, sequence, scanned_qr, delivery_photo,
               "to this stop.").format(stop.sequence, rows[0].name),
             title=_("Wrong Label"))
 
+    rows = _stop_rows_for_role(rows, stop_roles.DROP)
+    if not rows:
+        frappe.throw(
+            _("Nothing to deliver at stop #{0} — every manifest here is a collection.")
+                .format(stop.sequence),
+            title=_("Nothing to Deliver"))
     if any(r.status != "In Transit" for r in rows):
-        frappe.throw(_("Every manifest at this stop must be In Transit before delivery."))
+        frappe.throw(_("Every manifest being delivered at this stop must be In Transit before delivery."))
     manifests = []
     for r in rows:
         doc = frappe.get_doc("CH Transfer Manifest", r.name)
@@ -3224,6 +3254,14 @@ def request_stop_otp(trip, sequence, lat=None, lng=None):
     if not rows:
         frappe.throw(_("No manifests are due for delivery at stop #{0}.").format(stop.sequence),
                      title=_("Empty Stop"))
+
+    # Delivery OTP covers the drop side only; the pickup side of a combined
+    # stop is still Assigned and is not being handed over here.
+    rows = _stop_rows_for_role(rows, stop_roles.DROP)
+    if not rows:
+        frappe.throw(
+            _("Stop #{0} has no delivery — no OTP is needed.").format(stop.sequence),
+            title=_("Nothing to Deliver"))
 
     # Pre-flight: every manifest needs to be In Transit before OTP makes
     # sense (request_delivery_otp enforces the same rule per manifest).
@@ -3559,7 +3597,10 @@ def get_stop_label(trip, sequence, kind="pickup"):
         frappe.throw(_("This stop is missing a {0} token. Re-save the trip.").format(kind),
                      title=_("Token Missing"))
 
-    manifests = _stop_manifest_rows(trip_doc, stop)
+    manifests = _stop_rows_for_role(
+        _stop_manifest_rows(trip_doc, stop),
+        stop_roles.PICKUP if kind == "pickup" else stop_roles.DROP,
+    )
     manifest_list_html = "".join(
         f"<li>{escape_html(m.name)} — {escape_html(m.status or '')}</li>" for m in manifests
     ) or "<li><i>No manifests attached yet</i></li>"
