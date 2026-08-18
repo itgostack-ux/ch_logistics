@@ -119,6 +119,14 @@ class LogisticsCommandCenter {
 		this.$root.find(".lcc-mode-btn").removeClass("active");
 		this.$root.find(`.lcc-mode-btn[data-mode="${mode}"]`).addClass("active");
 
+		// The trip side panel (Start/Assign Driver/Cancel/etc.) is only ever
+		// meant to be live in Operations — switching modes used to leave it
+		// open and fully clickable underneath Overview's read-only analytics,
+		// since only #lcc-content got swapped, not #lcc-side.
+		if (mode !== "ops") {
+			this._ops_close_side();
+		}
+
 		if (mode === "overview") {
 			$("#lcc-live-badge").show();
 			this._ov_init();
@@ -1785,9 +1793,9 @@ class LogisticsCommandCenter {
 			</div>
 			<div class="lcc-side-actions">
 				${can_assign   ? `<button class="btn btn-sm btn-default" id="lcc-side-assign"><i class="fa fa-user-plus"></i> ${__("Assign Driver")}</button>` : ""}
-				${can_start    ? `<button class="btn btn-sm btn-warning" id="lcc-side-start"><i class="fa fa-play"></i> ${__("Start")}</button>` : ""}
+				${can_start    ? `<button class="btn btn-sm btn-warning" id="lcc-side-start" disabled title="${__("Starting a trip from here is currently disabled")}"><i class="fa fa-play"></i> ${__("Start")}</button>` : ""}
 				${can_resequence ? `<button class="btn btn-sm btn-default" id="lcc-side-resequence"><i class="fa fa-random"></i> ${__("Re-sequence")}</button>` : ""}
-				${can_complete ? `<button class="btn btn-sm btn-success" id="lcc-side-complete"><i class="fa fa-check"></i> ${__("Complete")}</button>` : ""}
+				${can_complete ? `<button class="btn btn-sm btn-success" id="lcc-side-complete" disabled title="${__("Completing a trip from here is currently disabled")}"><i class="fa fa-check"></i> ${__("Complete")}</button>` : ""}
 				${can_complete_override ? `<button class="btn btn-sm btn-danger" id="lcc-side-complete-override"><i class="fa fa-shield"></i> ${__("Complete (Override Exceptions)")}</button>` : ""}
 				${can_close    ? `<button class="btn btn-sm btn-primary" id="lcc-side-close-trip"><i class="fa fa-archive"></i> ${__("Close")}</button>` : ""}
 				${can_unassign ? `<button class="btn btn-sm btn-default" id="lcc-side-cancel"><i class="fa fa-user-times"></i> ${__("Unassign")}</button>` : ""}
