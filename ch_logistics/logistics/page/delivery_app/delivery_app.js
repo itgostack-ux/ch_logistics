@@ -162,6 +162,14 @@ class DeliveryApp {
             let seq = $(e.currentTarget).data("seq");
             this.do_stop_arrive(seq);
         });
+        this.$body.on("click", ".da-stop-pickup-btn", (e) => {
+            let seq = $(e.currentTarget).data("seq");
+            this._do_stop_pickup_flow(seq);
+        });
+        this.$body.on("click", ".da-stop-deliver-btn", (e) => {
+            let seq = $(e.currentTarget).data("seq");
+            this._do_stop_drop_flow(seq);
+        });
         this.$body.on("click", ".da-stop-complete-btn", (e) => {
             let seq = $(e.currentTarget).data("seq");
             this.do_stop_complete(seq);
@@ -169,6 +177,10 @@ class DeliveryApp {
         this.$body.on("click", ".da-stop-manifest-link", (e) => {
             let name = $(e.currentTarget).data("name");
             this.show_manifest_detail(name);
+        });
+        this.$body.on("click", ".da-stat-clickable", (e) => {
+            let role = $(e.currentTarget).data("shipment-role");
+            this._show_shipment_breakdown(role);
         });
     }
 
@@ -1269,20 +1281,24 @@ class DeliveryApp {
 
             let can_arrive = (t.status === "Started" && s.status === "Pending");
             let can_complete = (t.status === "Started" && s.status === "Arrived");
+            // Show Complete as disabled up front rather than letting the
+            // driver tap it and get an error afterwards — same open-work
+            // check do_stop_complete() enforces server-round-trip-free here.
+            const stop_open_rows = can_complete
+                ? this._gather_stop_manifests(s.sequence, ["Assigned", "Pickup Started", "In Transit"], null)
+                : [];
+            const complete_blocked = stop_open_rows.length > 0;
             // Per-stop CTA label reflects what the combined flow actually
             // does: pickup stops capture goods + per-manifest QR; drop stops
             // capture delivery photo + receiver + per-manifest OTP/QR. We
             // still call it "Arrive ..." so the action remains discoverable.
             const st_type = (s.stop_type || "").toLowerCase();
             const st_roles = st_type.split("+");
+            const is_combined = st_roles.includes("pickup") && st_roles.includes("drop");
             let arrive_label = __("Arrive");
             let arrive_icon = "fa-location-arrow";
-            if (active_manifest_rows.length) {
-                if (st_roles.includes("pickup") && st_roles.includes("drop")) {
-                    // Combined stop: deliver first, then collect.
-                    arrive_label = __("Arrive, Deliver & Pick Up");
-                    arrive_icon = "fa-exchange";
-                } else if (st_roles.includes("pickup")) {
+            if (active_manifest_rows.length && !is_combined) {
+                if (st_roles.includes("pickup")) {
                     arrive_label = __("Arrive & Pick Up");
                     arrive_icon = "fa-camera";
                 } else if (st_roles.includes("drop")) {
@@ -1290,8 +1306,23 @@ class DeliveryApp {
                     arrive_icon = "fa-check-circle";
                 }
             }
+            // Combined stops get two independent buttons instead of one
+            // auto-selecting button — both legs are frequently pending at
+            // once (goods on board awaiting drop AND other goods here
+            // awaiting pickup), and forcing a single "does whichever leg
+            // has work" button hid whichever leg wasn't picked first.
+            let combined_pickup_pending = 0;
+            let combined_deliver_pending = 0;
+            if (is_combined) {
+                combined_pickup_pending = this._gather_stop_manifests(s.sequence, ["Assigned"], "pickup").length;
+                combined_deliver_pending = this._gather_stop_manifests(s.sequence, ["In Transit"], "drop").length;
+            }
             let completion_hint = "";
-            if (can_arrive && active_manifest_rows.length) {
+            if (can_arrive && is_combined && active_manifest_rows.length) {
+                completion_hint = `<div class="text-muted" style="font-size:11px;margin-bottom:6px;">
+                    ${__("Deliver captures a photo, receiver name + per-manifest OTP/QR. Pick Up captures a photo + QR scan. Do either first — the other stays available.")}
+                </div>`;
+            } else if (can_arrive && active_manifest_rows.length) {
                 const verb = st_type === "pickup"
                     ? __("photo + QR scan for each manifest")
                     : __("delivery photo, receiver name + per-manifest OTP/QR");
@@ -1328,8 +1359,13 @@ class DeliveryApp {
                              ${__("No shipments assigned to this stop — nothing to load or unload here.")}
                            </div>`}
                     <div class="da-stop-actions">
-                        ${can_arrive ? `<button class="btn btn-primary btn-sm da-stop-arrive-btn" data-seq="${s.sequence}"><i class="fa ${arrive_icon}"></i> ${arrive_label}</button>` : ""}
-                        ${can_complete ? `<button class="btn btn-success btn-sm da-stop-complete-btn" data-seq="${s.sequence}"><i class="fa fa-check"></i> ${__("Complete")}</button>` : ""}
+                        ${is_combined && t.status === "Started" ? `
+                            ${combined_deliver_pending ? `<button class="btn btn-primary btn-sm da-stop-deliver-btn" data-seq="${s.sequence}"><i class="fa fa-check-circle"></i> ${__("Deliver")} (${combined_deliver_pending})</button>` : ""}
+                            ${combined_pickup_pending ? `<button class="btn btn-primary btn-sm da-stop-pickup-btn" data-seq="${s.sequence}"><i class="fa fa-camera"></i> ${__("Pick Up")} (${combined_pickup_pending})</button>` : ""}
+                        ` : (can_arrive ? `<button class="btn btn-primary btn-sm da-stop-arrive-btn" data-seq="${s.sequence}"><i class="fa ${arrive_icon}"></i> ${arrive_label}</button>` : "")}
+                        ${can_complete ? `<button class="btn btn-success btn-sm da-stop-complete-btn" data-seq="${s.sequence}"
+                                ${complete_blocked ? `disabled title="${__("Finish open manifest(s) first: {0}", [stop_open_rows.map((r) => r.name).join(", ")])}"` : ""}>
+                                <i class="fa fa-check"></i> ${__("Complete")}</button>` : ""}
                     </div>
                 </div>`;
         }).join("");
@@ -1402,9 +1438,9 @@ class DeliveryApp {
                 </div>
 
                 <div class="da-detail-summary">
-                    <div class="da-stat"><span class="da-stat-val">${pickup_count}</span><span class="da-stat-label">${__("Pickups")}</span></div>
-                    <div class="da-stat"><span class="da-stat-val">${drop_count}</span><span class="da-stat-label">${__("Drops")}</span></div>
-                    <div class="da-stat"><span class="da-stat-val">${shipment_count}</span><span class="da-stat-label">${__("Shipments")}</span></div>
+                    <div class="da-stat da-stat-clickable" data-shipment-role="pickup" style="cursor:pointer;"><span class="da-stat-val">${pickup_count}</span><span class="da-stat-label">${__("Pickups")}</span></div>
+                    <div class="da-stat da-stat-clickable" data-shipment-role="drop" style="cursor:pointer;"><span class="da-stat-val">${drop_count}</span><span class="da-stat-label">${__("Drops")}</span></div>
+                    <div class="da-stat da-stat-clickable" data-shipment-role="all" style="cursor:pointer;"><span class="da-stat-val">${shipment_count}</span><span class="da-stat-label">${__("Shipments")}</span></div>
                 </div>
 
                 ${map_html}
@@ -1928,9 +1964,15 @@ class DeliveryApp {
         // fallback for legacy/partial cases where the driver finished a stop
         // through the per-manifest flow. Keep the original guard: refuse to
         // mark the stop complete while any manifest on it is still mid-flight.
+        // m.stop_sequence only ever points at a manifest's DESTINATION stop
+        // (see get_trip_detail), so on a Pickup+Drop stop this used to miss
+        // manifests being picked up here whose destination is a later stop —
+        // letting the stop complete while a pickup was still open there.
+        // _gather_stop_manifests (role=null → any role) checks stop_roles
+        // instead, so it correctly covers both legs.
         if (this._trip_detail && (this._trip_detail.manifests || []).length) {
-            const open_rows = (this._trip_detail.manifests || []).filter((m) =>
-                m.stop_sequence === seq && ["Assigned", "Pickup Started", "In Transit"].includes(m.status)
+            const open_rows = this._gather_stop_manifests(
+                seq, ["Assigned", "Pickup Started", "In Transit"], null
             );
             if (open_rows.length) {
                 frappe.msgprint({
@@ -1962,6 +2004,88 @@ class DeliveryApp {
             __("Complete Stop"),
             __("Confirm")
         );
+    }
+
+    // ── Pickups / Drops summary breakdown ────────────────────────
+    // The Pickups/Drops tiles only ever showed a bare stop count, with no
+    // way to see what's actually inside without opening each manifest one
+    // at a time. Clicking either tile now lists every currently-relevant
+    // manifest's source, destination, and item lines in one place.
+
+    _show_shipment_breakdown(role) {
+        const t = this._trip_detail || {};
+        let manifests;
+        if (role === "all") {
+            // Every shipment on the trip, any status — the overall manifest
+            // (not filtered to what's currently actionable, unlike the
+            // Pickups/Drops tiles).
+            manifests = (t.manifests || []).slice();
+        } else {
+            const pending_statuses = role === "drop" ? ["In Transit"] : ["Assigned", "Pickup Started"];
+            manifests = (t.manifests || []).filter((m) => pending_statuses.includes(m.status));
+        }
+
+        if (!manifests.length) {
+            frappe.show_alert({
+                message: role === "all"
+                    ? __("No shipments on this trip")
+                    : (role === "drop"
+                        ? __("Nothing currently awaiting delivery on this trip")
+                        : __("Nothing currently awaiting pickup on this trip")),
+                indicator: "blue",
+            });
+            return;
+        }
+
+        frappe.call({
+            method: "ch_logistics.api.logistics_api.get_manifest_items_bulk",
+            args: { manifests: manifests.map((m) => m.name) },
+            freeze: true,
+            callback: (r) => {
+                const items_by_manifest = r.message || {};
+                const esc = (s) => frappe.utils.escape_html(s || "");
+                const loc = (wh, store) => esc(store || wh || "—");
+
+                const rows = manifests.map((m) => {
+                    const items = items_by_manifest[m.name] || [];
+                    const item_rows = items.length
+                        ? items.map((it) => `
+                            <tr>
+                                <td>${esc(it.item_name || it.item_code)}</td>
+                                <td class="text-center">${flt(it.qty)} ${esc(it.uom || "")}</td>
+                            </tr>`).join("")
+                        : `<tr><td colspan="2" class="text-muted">${__("No items found")}</td></tr>`;
+                    const status_badge = role === "all"
+                        ? `<span class="da-card-status da-status-${(m.status || "").toLowerCase().replace(/\s+/g, "-")}" style="margin-left:8px;">${esc(m.status)}</span>`
+                        : "";
+                    return `
+                        <div class="da-shipment-breakdown-group" style="margin-bottom:12px;">
+                            <div style="font-weight:600;margin-bottom:2px;">
+                                <i class="fa fa-file-text-o"></i> ${esc(m.name)}${status_badge}
+                            </div>
+                            <div class="text-muted" style="font-size:12px;margin-bottom:4px;">
+                                ${loc(m.source_warehouse, m.source_store)}
+                                <i class="fa fa-arrow-right" style="margin:0 4px;"></i>
+                                ${loc(m.destination_warehouse, m.destination_store)}
+                            </div>
+                            <table class="table table-bordered" style="margin-bottom:0;">
+                                <thead><tr><th>${__("Item")}</th><th class="text-center" style="width:110px;">${__("Qty")}</th></tr></thead>
+                                <tbody>${item_rows}</tbody>
+                            </table>
+                        </div>`;
+                }).join("");
+
+                const title = role === "all"
+                    ? __("All Shipments — Source, Destination & Items")
+                    : (role === "drop" ? __("Drops — Source, Destination & Items") : __("Pickups — Source, Destination & Items"));
+                const dialog = new frappe.ui.Dialog({
+                    title,
+                    size: "large",
+                    fields: [{ fieldtype: "HTML", fieldname: "breakdown_html", options: rows }],
+                });
+                dialog.show();
+            },
+        });
     }
 
     // ── Stop-level combined flows ────────────────────────────────
@@ -2002,8 +2126,20 @@ class DeliveryApp {
         const want = (role || "").toLowerCase();
         return (t.manifests || []).filter((m) => {
             let matches = false;
-            const srv = m.stop_roles && m.stop_roles[String(seq)];
-            if (srv) {
+            // A manifest with a stop_roles map is one the server has fully
+            // annotated — trust it completely, INCLUDING when it has no
+            // entry for this particular seq (that means "definitively not
+            // relevant here", not "fall through to the legacy fallback").
+            // Falling through in that case let a stale/unrelated flat
+            // stop_sequence value (which only ever tracks one side of a
+            // manifest) wrongly match a manifest to a stop stop_roles says
+            // it has nothing to do with — e.g. a manifest whose real stops
+            // are #6 and #3 got pulled into stop #5's drop list purely
+            // because its stop_sequence field happened to equal 5.
+            const has_stop_roles = m.stop_roles && Object.keys(m.stop_roles).length > 0;
+            if (has_stop_roles) {
+                const srv = m.stop_roles[String(seq)];
+                if (!srv) return false;
                 const have = srv.toLowerCase().split("+");
                 matches = want ? have.includes(want) : true;
                 if (!matches) return false;

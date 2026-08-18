@@ -2957,9 +2957,16 @@ def start_stop_pickup(trip, sequence, scanned_qr, pickup_photo,
         frappe.throw(_("QR scan is mandatory to start pickup for this stop."),
                      title=_("Scan Required"))
 
-    rows = _stop_manifest_rows(trip_doc, stop)
+    # Mirror image of the same fix in request_stop_otp/complete_stop_delivery:
+    # only Pickup-role manifests are being collected at this stop. A
+    # Pickup+Drop stop also has Drop-role manifests that are correctly
+    # already "In Transit" (they're being delivered here, not picked up),
+    # which must not be folded into the "every manifest must be Assigned"
+    # check below or have start_pickup run against them.
+    rows = [r for r in _stop_manifest_rows(trip_doc, stop)
+            if "Pickup" in (r.roles or "").split("+")]
     if not rows:
-        frappe.throw(_("No manifests are attached to stop #{0}.").format(stop.sequence),
+        frappe.throw(_("No manifests are due for pickup at stop #{0}.").format(stop.sequence),
                      title=_("Empty Stop"))
 
     expected = (stop.get("pickup_token") or "").strip()
@@ -3050,9 +3057,16 @@ def complete_stop_delivery(trip, sequence, scanned_qr, delivery_photo,
         frappe.throw(_("QR scan is mandatory to complete delivery for this stop."),
                      title=_("Scan Required"))
 
-    rows = _stop_manifest_rows(trip_doc, stop)
+    # Same fix as request_stop_otp: only Drop-role manifests are actually
+    # being delivered at this stop. A Pickup+Drop stop also has Pickup-role
+    # manifests still correctly "Assigned" here, which must not be folded
+    # into the "every manifest must be In Transit" check below or have
+    # complete_delivery run against them for a destination they haven't
+    # reached.
+    rows = [r for r in _stop_manifest_rows(trip_doc, stop)
+            if "Drop" in (r.roles or "").split("+")]
     if not rows:
-        frappe.throw(_("No manifests are attached to stop #{0}.").format(stop.sequence),
+        frappe.throw(_("No manifests are due for delivery at stop #{0}.").format(stop.sequence),
                      title=_("Empty Stop"))
 
     expected = (stop.get("delivery_token") or "").strip()
@@ -3196,9 +3210,19 @@ def request_stop_otp(trip, sequence, lat=None, lng=None):
     assert_trip_driver_access(trip_doc)
     stop = _get_trip_stop(trip_doc, sequence)
 
-    rows = _stop_manifest_rows(trip_doc, stop)
+    # _stop_manifest_rows returns every manifest handled at this stop,
+    # Pickup-role and Drop-role alike (a combined Pickup+Drop stop has
+    # both). Everything below assumes every row is being DELIVERED here —
+    # it calls mark_reached_destination()/generates a delivery OTP for
+    # each — so a Pickup-role manifest (still correctly "Assigned", not
+    # yet collected) must never reach that logic. Left unfiltered, it also
+    # made the "not In Transit" pre-flight check fail on manifests that
+    # were never meant to be delivered at this stop at all, blocking
+    # delivery of the OTHER manifests that genuinely were ready.
+    rows = [r for r in _stop_manifest_rows(trip_doc, stop)
+            if "Drop" in (r.roles or "").split("+")]
     if not rows:
-        frappe.throw(_("No manifests are attached to stop #{0}.").format(stop.sequence),
+        frappe.throw(_("No manifests are due for delivery at stop #{0}.").format(stop.sequence),
                      title=_("Empty Stop"))
 
     # Pre-flight: every manifest needs to be In Transit before OTP makes
@@ -3577,3 +3601,66 @@ def get_stop_label(trip, sequence, kind="pickup"):
             </div>
         """,
     }
+
+
+@frappe.whitelist()
+def get_manifest_items_bulk(manifests):
+    """Return item-level detail (item_name, qty, uom) for a set of manifests.
+
+    Backs the Delivery App's Pickups/Drops summary tiles — those only ever
+    showed a stop count, with no way to see what's actually inside without
+    opening each manifest individually. A manifest's own child table
+    (CH Transfer Manifest Item) tracks item_count/total_qty per linked
+    Stock Entry but not item names, so this walks each Stock Entry's real
+    item rows the same way ch_pos.api.pos_api.get_stock_transfer_items does
+    for the POS Transfers screen.
+    """
+    if isinstance(manifests, str):
+        manifests = frappe.parse_json(manifests)
+    manifests = list(dict.fromkeys(manifests or []))
+    if not manifests:
+        return {}
+
+    manifest_rows = frappe.get_all(
+        "CH Transfer Manifest",
+        filters={"name": ["in", manifests]},
+        fields=["name", "company"],
+    )
+    allowed = set()
+    for m in manifest_rows:
+        try:
+            frappe.get_doc("CH Transfer Manifest", m.name).check_permission("read")
+            allowed.add(m.name)
+        except frappe.PermissionError:
+            continue
+    if not allowed:
+        return {}
+
+    stock_entries = frappe.get_all(
+        "CH Transfer Manifest Item",
+        filters={"parent": ["in", list(allowed)]},
+        fields=["parent", "stock_entry"],
+    )
+    se_to_manifest = {}
+    for row in stock_entries:
+        if row.stock_entry:
+            se_to_manifest.setdefault(row.stock_entry, []).append(row.parent)
+
+    out = {name: [] for name in allowed}
+    if not se_to_manifest:
+        return out
+
+    item_rows = frappe.get_all(
+        "Stock Entry Detail",
+        filters={"parent": ["in", list(se_to_manifest.keys())]},
+        fields=["parent", "item_code", "item_name", "qty", "custom_quantity", "uom"],
+    )
+    for row in item_rows:
+        for manifest_name in se_to_manifest.get(row.parent, []):
+            out[manifest_name].append({
+                "item_code": row.item_code,
+                "item_name": row.item_name,
+                "qty": flt(row.custom_quantity or row.qty),
+                "uom": row.uom,
+            })
+    return out
