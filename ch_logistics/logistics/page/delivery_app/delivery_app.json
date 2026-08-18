@@ -1,14 +1,29 @@
 {
  "content": null,
  "creation": "2025-01-01 00:00:00",
+ "docstatus": 0,
  "doctype": "Page",
  "icon": "fa fa-truck",
  "idx": 0,
- "modified": "2026-07-17 12:00:00.000000",
+ "modified": "2026-08-17 14:36:25.293639",
+ "modified_by": "Administrator",
  "module": "Logistics",
  "name": "delivery-app",
  "page_name": "delivery-app",
+ "roles": [
+  {
+   "role": "Delivery Manager"
+  },
+  {
+   "role": "Delivery User"
+  },
+  {
+   "role": "System Manager"
+  }
+ ],
+ "script": null,
  "standard": "Yes",
+ "style": null,
  "system_page": 0,
  "title": "Delivery App"
 }
