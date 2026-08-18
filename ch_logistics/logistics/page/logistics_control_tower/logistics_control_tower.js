@@ -1009,7 +1009,24 @@ class LogisticsCommandCenter {
 
 		$r.on("click",  ".lcc-trip-card",     (e) => this._ops_open_trip($(e.currentTarget).data("name")));
 		$r.on("click",  ".lcc-side-close",    () => this._ops_close_side());
-		$r.on("change", ".lcc-mf-check",      (e) => { const n = $(e.currentTarget).data("name"); e.currentTarget.checked ? this.selected_manifests.add(n) : this.selected_manifests.delete(n); this._ops_update_attach(); });
+		$r.on("change", ".lcc-mf-check",      (e) => {
+			const n = $(e.currentTarget).data("name");
+			e.currentTarget.checked ? this.selected_manifests.add(n) : this.selected_manifests.delete(n);
+			// Keep the header "select all" checkbox in sync with individual rows.
+			const $rows = this.$root.find(".lcc-mf-check");
+			this.$root.find(".lcc-mf-check-all").prop(
+				"checked", $rows.length > 0 && $rows.length === $rows.filter(":checked").length
+			);
+			this._ops_update_attach();
+		});
+		$r.on("change", ".lcc-mf-check-all",  (e) => {
+			const checked = e.currentTarget.checked;
+			this.$root.find(".lcc-mf-check").prop("checked", checked).each((_, el) => {
+				const n = $(el).data("name");
+				checked ? this.selected_manifests.add(n) : this.selected_manifests.delete(n);
+			});
+			this._ops_update_attach();
+		});
 		$r.on("click",  ".lcc-attach-btn",    () => this._ops_attach());
 		$r.on("click",  ".lcc-exc-resolve",   (e) => this._ops_resolve_exc($(e.currentTarget).data("trip"), $(e.currentTarget).data("row")));
 		$r.on("click",  "#lcc-side-assign",   () => this._ops_assign_driver());
@@ -1289,7 +1306,7 @@ class LogisticsCommandCenter {
 			</div>
 			<div class="lcc-table-wrap"><table class="lcc-table">
 				<thead><tr>
-					<th style="width:32px"></th>
+					<th style="width:32px"><input type="checkbox" class="lcc-mf-check-all"></th>
 					<th>${__("Manifest")}</th>
 					<th>${__("Status")}</th>
 					<th>${__("Dir")}</th><th>${__("Priority")}</th>
