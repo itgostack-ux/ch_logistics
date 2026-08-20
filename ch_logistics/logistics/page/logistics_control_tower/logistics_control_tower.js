@@ -807,10 +807,27 @@ class LogisticsCommandCenter {
 		const row = (this.pack_queue || []).find((m) => m.name === manifest) || {};
 		const next_seq = (Number(row.pkg_box_count || row.box_count || 0)) + 1;
 		const suggested_label = `${manifest}-B${String(next_seq).padStart(2, "0")}`;
-		const total_qty = Number(row.total_qty || 0);
-		const packed_so_far = Number(row.pkg_packed_qty || 0);
-		const remaining = Math.max(0, total_qty - packed_so_far);
 
+		// Fetch remaining qty for a Max hint + client-side validation, but
+		// the packer still just enters one Packed Qty total — the server
+		// auto-splits that across remaining items (first-remaining-item
+		// -first) so the per-box print label still gets real item detail.
+		frappe.call({
+			method: "ch_logistics.api.transfer_manifest_api.get_manifest_pack_items",
+			args: { manifest },
+			freeze: true,
+		}).then((r) => {
+			const available = (r.message || []).filter((it) => it.remaining_qty > 0);
+			if (!available.length) {
+				frappe.msgprint(__("Every item on this manifest has already been fully packed into a box."));
+				return;
+			}
+			const remaining_total = available.reduce((s, it) => s + it.remaining_qty, 0);
+			this._pack_open_qty_dialog(manifest, suggested_label, remaining_total);
+		});
+	}
+
+	_pack_open_qty_dialog(manifest, suggested_label, remaining_total) {
 		const d = new frappe.ui.Dialog({
 			title: __("Pack Box — {0}", [suggested_label]),
 			fields: [
@@ -819,14 +836,13 @@ class LogisticsCommandCenter {
 					fieldtype: "HTML",
 					options: `<div class="alert alert-info" style="padding:8px 12px;border-radius:6px;background:#d1ecf1;border:1px solid #bee5eb;font-size:13px">
 						<b>${__("Manifest")}:</b> ${frappe.utils.escape_html(manifest)} &middot;
-						<b>${__("Total qty")}:</b> ${total_qty} &middot;
-						<b>${__("Packed")}:</b> ${packed_so_far} &middot;
-						<b>${__("Remaining")}:</b> ${remaining}
+						<b>${__("Remaining")}:</b> ${remaining_total}
 					</div>`,
 				},
-				{ fieldname: "packed_qty", fieldtype: "Int", label: __("Packed Qty"), reqd: 1,
-				  default: remaining || null,
-				  description: __("How many item units are physically in this box? Max: {0} (remaining on manifest).", [remaining]) },
+				{
+					fieldname: "packed_qty", fieldtype: "Int", label: __("Packed Qty"), reqd: 1,
+					description: __("How many item units are physically in this box? Max: {0} (remaining on manifest).", [remaining_total]),
+				},
 				{ fieldname: "weight_kg", fieldtype: "Float", label: __("Weight (kg)") },
 				{ fieldname: "dimensions_cm", fieldtype: "Data", label: __("Dimensions (LxWxH cm)"),
 				  description: __("Optional — used for courier dimensional weight, e.g. 30x20x15") },
@@ -837,16 +853,19 @@ class LogisticsCommandCenter {
 			],
 			primary_action_label: __("Add Box"),
 			primary_action: (values) => {
+				if (!values.packed_qty || values.packed_qty <= 0) {
+					frappe.msgprint(__("Enter a packed quantity greater than zero."));
+					return;
+				}
 				// Client-side overpack guard for a clean UX. Server-side
-				// _validate_packing() on CH Transfer Manifest is the
-				// source-of-truth guard (also enforced by the pack_box API).
-				const req = Number(values.packed_qty || 0);
-				if (req > remaining) {
+				// pack_box / _validate_package_items() is the source-of
+				// -truth guard.
+				if (values.packed_qty > remaining_total) {
 					frappe.msgprint({
 						title: __("Overpack Blocked"),
 						indicator: "red",
-						message: __("Cannot pack {0} units — only {1} remaining on {2} (total {3}, already packed {4}).",
-							[req, remaining, manifest, total_qty, packed_so_far]),
+						message: __("Cannot pack {0} units — only {1} remaining on {2}.",
+							[values.packed_qty, remaining_total, manifest]),
 					});
 					return;
 				}
@@ -865,7 +884,7 @@ class LogisticsCommandCenter {
 					d.hide();
 					const m = r.message || {};
 					frappe.show_alert({
-						message: __("Box {0} packed ({1} units).", [m.package_label || suggested_label, values.packed_qty || 0]),
+						message: __("Box {0} packed ({1} units).", [m.package_label || suggested_label, values.packed_qty]),
 						indicator: "green",
 					}, 5);
 					this._pack_load();
@@ -1941,10 +1960,17 @@ class LogisticsCommandCenter {
 	_ops_attach() {
 		if (!this.selected_manifests.size) return;
 		const manifests = Array.from(this.selected_manifests);
+		// A Select field's options double as both label and submitted
+		// value, so a bare trip ID list is all it could ever show. Same
+		// "Name — extra detail" convention used elsewhere (e.g. the POS
+		// store picker) — build a readable label per trip, then split the
+		// ID back off the front of whichever one was chosen.
 		const opts = [];
 		Object.values(this.board.buckets || {}).flat()
 			.filter((t) => ["Draft","Assigned","Started"].includes(t.status))
-			.forEach((t) => opts.push(t.name));
+			.forEach((t) => opts.push(
+				`${t.name} — ${t.route || "—"} — ${t.driver_name || __("Unassigned")}`
+			));
 
 		if (!opts.length) {
 			frappe.msgprint(__("No eligible trips (Draft/Assigned/Started) available to attach to."));
@@ -1955,7 +1981,8 @@ class LogisticsCommandCenter {
 			fields: [{ fieldtype: "Select", fieldname: "trip", label: __("Trip"), options: opts.join("\n"), reqd: 1 }],
 			primary_action_label: __("Attach"),
 			primary_action: (vals) => {
-				frappe.call({ method: _LCC + "attach_manifests", args: { trip: vals.trip, manifests: JSON.stringify(manifests) } })
+				const trip = (vals.trip || "").split(" — ")[0];
+				frappe.call({ method: _LCC + "attach_manifests", args: { trip, manifests: JSON.stringify(manifests) } })
 					.then(() => { d.hide(); frappe.show_alert({ message: __("Attached"), indicator: "green" }); this._ops_load(); });
 			},
 		});

@@ -282,7 +282,40 @@ def _propagate_trip_driver_to_manifests(trip, driver, vehicle=None):
         updates[r.name] = payload
     if updates:
         frappe.db.bulk_update("CH Transfer Manifest", updates, update_modified=False)
+        # bulk_update writes straight to the DB and runs no controller
+        # hooks, so CHTransferManifest.assign_driver's own Stock Entry
+        # sync (custom_status -> "Assigned") never fires for manifests
+        # assigned this way — trip-level "assign a driver to the whole
+        # trip" rather than assigning one manifest at a time. Without this,
+        # a Stock Entry stayed shown as "Ready For Pickup" even though its
+        # manifest had genuinely moved to Assigned.
+        newly_assigned = [name for name, payload in updates.items() if payload.get("status") == "Assigned"]
+        _sync_assigned_status_to_entries(newly_assigned)
     return list(updates)
+
+
+def _sync_assigned_status_to_entries(manifest_names):
+    """Push Stock Entry custom_status='Assigned' for the given manifests.
+
+    Mirrors CHTransferManifest._sync_custom_status_only, but usable from a
+    bulk-update context where only manifest names are on hand (no full
+    Document objects, since frappe.db.bulk_update deliberately skips
+    controller hooks for performance).
+    """
+    if not manifest_names:
+        return
+    meta = frappe.get_meta("Stock Entry")
+    if not meta.has_field("custom_status"):
+        return
+    se_names = frappe.get_all(
+        "CH Transfer Manifest Item",
+        filters={"parent": ["in", manifest_names], "parenttype": "CH Transfer Manifest"},
+        pluck="stock_entry",
+    )
+    for se in se_names:
+        if not se:
+            continue
+        frappe.db.set_value("Stock Entry", se, "custom_status", "Assigned", update_modified=False)
 
 
 def _clear_trip_driver_from_manifests(trip, driver=None):
@@ -410,9 +443,67 @@ def driver_accept_trip(trip, override_empty_stops=0):
     doc.flags.ignore_empty_stops = cint(override_empty_stops)
     doc.mark_started()
     doc.save()
+    # Whole-trip accept is a bulk shortcut over per-manifest accept — stamp
+    # every manifest it swept up the same way driver_accept_manifest does,
+    # so Start Pickup is immediately available on all of them. Manifests
+    # already individually accepted or rejected are left untouched.
+    frappe.db.sql(
+        """
+        UPDATE `tabCH Transfer Manifest`
+        SET driver_accepted_at = %(now)s
+        WHERE trip = %(trip)s AND status = 'Assigned' AND driver_accepted_at IS NULL
+        """,
+        {"now": frappe.utils.now_datetime(), "trip": doc.name},
+    )
     if assigned_driver:
         _set_driver_availability(assigned_driver, "In Transit", doc.name)
     return {"trip": doc.name, "status": doc.status, "started_at": doc.actual_start}
+
+
+@frappe.whitelist(methods=["POST"])
+def driver_accept_manifest(trip, manifest, override_empty_stops=0):
+    """Driver acceptance of a single manifest on an Assigned/Started trip.
+
+    Independent of whole-trip accept: a trip can carry several manifests
+    that get accepted or rejected one at a time (driver_reject_manifest via
+    the existing rejection_api flow handles the reject side). The trip
+    itself moves to Started the first time any manifest on it is accepted,
+    so per-manifest pickup can begin even while siblings are still pending.
+    """
+    doc = get_locked_trip(trip)
+    if doc.status not in ("Assigned", "Started"):
+        frappe.throw(_("Trip must be Assigned or Started to accept a manifest."))
+    from ch_logistics.api.driver_resolver import assert_trip_driver_access
+
+    assert_trip_driver_access(doc)
+    ds.assert_not_on_break(doc.driver)
+
+    mf = frappe.get_doc("CH Transfer Manifest", manifest)
+    if mf.trip != trip:
+        frappe.throw(_("Manifest {0} is not on this trip.").format(manifest))
+    if mf.status != "Assigned":
+        frappe.throw(_("Manifest must be Assigned to accept it (current status: {0}).").format(mf.status))
+    if mf.driver_accepted_at:
+        frappe.throw(_("Manifest already accepted."))
+
+    mf.driver_accepted_at = frappe.utils.now_datetime()
+    mf.save(ignore_permissions=True)
+    mf.add_comment("Comment", _("Manifest accepted by driver {0}.").format(frappe.session.user))
+
+    trip_started = False
+    if doc.status == "Assigned":
+        doc.add_comment(
+            "Comment",
+            _("Trip auto-started: first manifest ({0}) accepted by {1}.").format(manifest, frappe.session.user),
+        )
+        doc.flags.ignore_empty_stops = cint(override_empty_stops)
+        doc.mark_started()
+        doc.save()
+        if doc.driver:
+            _set_driver_availability(doc.driver, "In Transit", doc.name)
+        trip_started = True
+
+    return {"manifest": mf.name, "trip": doc.name, "trip_status": doc.status, "trip_started": trip_started}
 
 
 @frappe.whitelist(methods=["POST"])
@@ -460,6 +551,19 @@ def trip_start(trip, gps_lat=None, gps_lng=None, override_empty_stops=0):
     doc.flags.ignore_empty_stops = cint(override_empty_stops)
     doc.mark_started()
     doc.save()
+    # Same bulk driver_accepted_at stamp as driver_accept_trip — this is a
+    # second, older entry point onto Started, and without it every manifest
+    # on a trip started this way silently fails _gather_stop_manifests's
+    # require_accepted check on the client, dropping the pickup dialog
+    # straight to a bare GPS-arrival fallback with no QR/photo prompt.
+    frappe.db.sql(
+        """
+        UPDATE `tabCH Transfer Manifest`
+        SET driver_accepted_at = %(now)s
+        WHERE trip = %(trip)s AND status = 'Assigned' AND driver_accepted_at IS NULL
+        """,
+        {"now": frappe.utils.now_datetime(), "trip": doc.name},
+    )
     if doc.driver:
         # Driver goes In Transit for the duration of the run (FR-012 → In Transit).
         _set_driver_availability(doc.driver, "In Transit", doc.name)
@@ -1532,6 +1636,12 @@ def get_trip_detail(trip):
         # combined Arrive flows run.
         "pickup_photo", "pickup_datetime",
         "delivery_photo", "delivery_datetime", "receiver_name",
+        # Without this the client's require_accepted gather-filter (used to
+        # keep an undecided sibling manifest out of another's pickup scan)
+        # can never see a truthy value and silently excludes EVERY manifest
+        # from _do_stop_pickup_flow's candidates — dropping straight to the
+        # bare GPS-arrival fallback with no QR/photo dialog at all.
+        "driver_accepted_at",
     ]
     if _has_box_count:
         manifest_fields.append("box_count")

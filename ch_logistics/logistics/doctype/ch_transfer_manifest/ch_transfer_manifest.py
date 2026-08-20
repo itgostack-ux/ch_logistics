@@ -83,6 +83,54 @@ class CHTransferManifest(Document):
         # forgery guard on the very save that mints it.
         self._ensure_qr_payload()
 
+    def on_update(self):
+        self._sync_package_items()
+
+    def _sync_package_items(self):
+        """Persist a newly-packed box's item-level breakdown.
+
+        A Table field nested inside a child row ("grandchild" table, here
+        CH Transfer Package.items) is NOT something doc.save() walks
+        recursively — only the manifest's own direct child tables
+        (packages, transfers) get auto-persisted. doc.append("packages",
+        {"items": [...]}) (used by both the pack_box API and the manifest
+        form's Pack Box dialog) happily holds the item rows in memory
+        through validate(), but they were silently dropped on save with
+        no error — confirmed by testing pack_box end-to-end and finding
+        the box's packed_qty total saved correctly while its item rows
+        vanished. This writes them out explicitly now that each package
+        has a stable name to parent them against.
+
+        Only inserts for a package with NO existing item rows in the DB
+        yet — never rewrites/deletes an already-packed box's items, since
+        neither UI currently edits an existing box's contents after the
+        fact (both only ever add a brand new box).
+        """
+        for p in self.packages or []:
+            if not p.name:
+                continue
+            in_memory = [
+                it for it in (p.get("items") or [])
+                if (it.get("item_code") if isinstance(it, dict) else it.item_code)
+            ]
+            if not in_memory:
+                continue
+            if frappe.db.exists("CH Transfer Package Item", {"parent": p.name}):
+                continue
+            for idx, it in enumerate(in_memory, start=1):
+                item_code = it.get("item_code") if isinstance(it, dict) else it.item_code
+                qty = it.get("qty") if isinstance(it, dict) else it.qty
+                frappe.get_doc({
+                    "doctype": "CH Transfer Package Item",
+                    "parent": p.name,
+                    "parenttype": "CH Transfer Package",
+                    "parentfield": "items",
+                    "idx": idx,
+                    "item_code": item_code,
+                    "item_name": frappe.db.get_value("Item", item_code, "item_name"),
+                    "qty": flt(qty),
+                }).insert(ignore_permissions=True)
+
     def _ensure_qr_payload(self):
         """Mint the pickup-scan token at save time, not at driver assignment.
 
@@ -166,6 +214,7 @@ class CHTransferManifest(Document):
         # standalone and attached to a trip via the Logistics Control Tower.
         if self.status in ("Draft", None, ""):
             self.status = "Packed"
+            self._sync_custom_status_only("Packed")
 
     def _packing_required(self) -> bool:
         """Honour the global CH Logistics Settings → require_packing_slip flag.
@@ -349,6 +398,98 @@ class CHTransferManifest(Document):
                 ).format(packed_sum, total_qty, over),
                 title=_("Overpacked Manifest"),
             )
+        self._validate_package_items()
+
+    def _validate_package_items(self):
+        """Per-item mirror of _validate_packing's total-qty guard.
+
+        A box's own ``packed_qty`` can be within the manifest total while
+        still being wrong at the item level (e.g. packing 5 units of an
+        item the manifest only carries 3 of, offset by under-packing some
+        other item) — the aggregate check alone can't catch that. Reuses
+        _get_manifest_pack_items()'s own packed/total per item rather than
+        re-deriving it, so the two can never disagree.
+        """
+        for row in self._get_manifest_pack_items():
+            if row["packed_qty"] > row["total_qty"]:
+                over = row["packed_qty"] - row["total_qty"]
+                frappe.throw(
+                    _(
+                        "Packed quantity of {0} ({1}) across all boxes exceeds the {2}"
+                        " units of it on this manifest by {3}."
+                    ).format(row["item_code"], row["packed_qty"], row["total_qty"], over),
+                    title=_("Overpacked Item"),
+                )
+
+    def _get_manifest_pack_items(self):
+        """Aggregate item_code -> {item_name, total_qty, packed_qty,
+        remaining_qty} across every Stock Entry linked to this manifest,
+        net of what's already recorded in existing package rows.
+
+        Single source of truth for both the pack-station item picker
+        (fetched via the whitelisted API wrapper) and this doctype's own
+        _validate_package_items() guard — the two can never disagree about
+        how much of an item is actually available to pack.
+
+        CH Transfer Package.items is a "grandchild" table (a Table field
+        nested inside a child row) — frappe.get_doc does NOT auto-load
+        this onto self.packages[i].items the way it loads self.packages
+        itself, so an already-saved package's item rows have to be
+        queried explicitly by package name. Only a package still being
+        built in THIS save (no name yet, or no DB rows for it yet) is
+        read from the in-memory dict/row instead.
+        """
+        # Queried and folded into `totals` one Stock Entry at a time, in the
+        # manifest's own transfers order (not an SE-name sort) — this is
+        # the order the auto-split in pack_box() consumes items in when the
+        # packer enters a bare Packed Qty total instead of picking items.
+        se_names = [row.stock_entry for row in (self.transfers or []) if row.stock_entry]
+        totals = {}
+        for se_name in se_names:
+            for row in frappe.get_all(
+                "Stock Entry Detail",
+                filters={"parent": se_name},
+                fields=["item_code", "item_name", "qty"],
+                order_by="idx",
+            ):
+                if not row.item_code:
+                    continue
+                bucket = totals.setdefault(row.item_code, {"item_name": row.item_name, "total_qty": 0})
+                bucket["total_qty"] += flt(row.qty)
+
+        package_names = [p.name for p in (self.packages or []) if p.name]
+        db_rows_by_package = {}
+        if package_names:
+            for row in frappe.get_all(
+                "CH Transfer Package Item",
+                filters={"parent": ["in", package_names]},
+                fields=["parent", "item_code", "qty"],
+            ):
+                db_rows_by_package.setdefault(row.parent, []).append(row)
+
+        packed = {}
+        for p in self.packages or []:
+            rows = db_rows_by_package.get(p.name) if p.name else None
+            if rows is None:
+                rows = p.get("items") or []
+            for it in rows:
+                item_code = it.get("item_code") if isinstance(it, dict) else it.item_code
+                qty = it.get("qty") if isinstance(it, dict) else it.qty
+                if not item_code:
+                    continue
+                packed[item_code] = packed.get(item_code, 0) + flt(qty)
+
+        result = []
+        for item_code, info in totals.items():
+            packed_qty = flt(packed.get(item_code, 0))
+            result.append({
+                "item_code": item_code,
+                "item_name": info["item_name"],
+                "total_qty": info["total_qty"],
+                "packed_qty": packed_qty,
+                "remaining_qty": max(info["total_qty"] - packed_qty, 0),
+            })
+        return result
 
     def _auto_label_packages(self):
         """Assign sequential LPN labels and stamp packer audit fields.
@@ -497,6 +638,7 @@ class CHTransferManifest(Document):
                 pass
 
             self.status = "Assigned"
+            self._sync_custom_status_only("Assigned")
             if self._delivery_otp_required():
                 self._generate_delivery_otp(request_source="Driver Assignment")
             # Seed the pickup-scan token so QR enforcement has something to
@@ -1918,6 +2060,32 @@ class CHTransferManifest(Document):
                 continue
             frappe.db.set_value(
                 "Stock Entry", row.stock_entry, update,
+                update_modified=False,
+            )
+
+    def _sync_custom_status_only(self, target_status):
+        """Push a manifest-status-driven value onto linked Stock Entries'
+        ``custom_status`` only — unlike ``_sync_logistics_status_to_entries``,
+        this does NOT touch ``custom_logistics_status`` (a separate, narrower
+        courier-leg enum — Pending Pickup / Picked Up / In Transit /
+        Delivered / Revert Requested / Reverted — that has no "Packed" or
+        "Assigned" option and would reject either as an invalid Select value).
+
+        Used for the two manifest states before any courier leg exists yet:
+        Packed (submitted, not yet assigned to a driver) and Assigned
+        (driver assigned, pickup not yet started). Before this, a Stock
+        Entry just sat at whatever status it had when created through
+        either of those states, with nothing reflecting that the manifest
+        had actually progressed.
+        """
+        meta = frappe.get_meta("Stock Entry")
+        if not meta.has_field("custom_status"):
+            return
+        for row in self.transfers:
+            if not row.stock_entry:
+                continue
+            frappe.db.set_value(
+                "Stock Entry", row.stock_entry, "custom_status", target_status,
                 update_modified=False,
             )
 

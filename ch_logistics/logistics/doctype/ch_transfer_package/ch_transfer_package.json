@@ -11,6 +11,8 @@
   "weight_kg",
   "dimensions_cm",
   "seal_number",
+  "sec_break_items",
+  "items",
   "sec_break_meta",
   "packed_by",
   "col_break_meta",
@@ -55,6 +57,18 @@
    "fieldname": "seal_number",
    "fieldtype": "Data",
    "label": "Seal / Tamper Tag"
+  },
+  {
+   "fieldname": "sec_break_items",
+   "fieldtype": "Section Break",
+   "label": "Items In This Box"
+  },
+  {
+   "description": "Which items, and how many of each, are physically packed into this box. Drives the per-box print label.",
+   "fieldname": "items",
+   "fieldtype": "Table",
+   "label": "Items",
+   "options": "CH Transfer Package Item"
   },
   {
    "collapsible": 1,

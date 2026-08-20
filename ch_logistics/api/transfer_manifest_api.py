@@ -170,8 +170,22 @@ def get_manifest(manifest) -> dict:
     return _redact_manifest_credentials(doc.as_dict())
 
 
+@frappe.whitelist()
+def get_manifest_pack_items(manifest) -> list:
+    """Item-level pack picker data: what's on this manifest, how much of
+    each item is already packed into earlier boxes, and how much is left.
+
+    Backs the "Pack Box" item picker (manifest form + Control Tower) so a
+    packer records WHICH items go in a box, not just a bare total count —
+    needed for the per-box print label to show that box's real contents.
+    """
+    doc = frappe.get_doc("CH Transfer Manifest", manifest)
+    doc.check_permission("read")
+    return doc._get_manifest_pack_items()
+
+
 @frappe.whitelist(methods=["POST"])
-def pack_box(manifest, packed_qty, weight_kg=None, dimensions_cm=None,
+def pack_box(manifest, packed_qty=None, items=None, weight_kg=None, dimensions_cm=None,
              seal_number=None, packing_photo=None, notes=None) -> dict:
     """Add one carton (LPN) to a Draft manifest's packing slip.
 
@@ -179,44 +193,94 @@ def pack_box(manifest, packed_qty, weight_kg=None, dimensions_cm=None,
     mint cartons without opening each manifest form.  The LPN label and
     packed_by / packed_at audit fields are auto-stamped by the manifest
     controller via _auto_label_packages() on save.
+
+    ``items``: optional JSON list of {item_code, qty} — which items (and
+    how much of each) are physically in this box. When given, this is
+    authoritative: the box's packed_qty is derived as the sum of these
+    item quantities rather than trusting a separately-passed total, and
+    each item is checked against its own remaining quantity on the
+    manifest (not just the manifest-wide total) via the same aggregation
+    the item picker itself reads (_get_manifest_pack_items).
+
+    When ``items`` is omitted, the caller only gives a bare ``packed_qty``
+    (the packer-facing dialogs ask for a single total, not a per-item
+    breakdown). That total is then auto-split across the manifest's still-
+    remaining items in order — first-remaining-item-first — consuming each
+    item's remaining_qty before moving to the next, until packed_qty is
+    used up. This keeps the per-box print label showing real item/qty
+    detail without requiring the packer to pick items manually.
     """
     doc = frappe.get_doc("CH Transfer Manifest", manifest)
     doc.check_permission("write")
     scope_guard.assert_manifest_scope(doc.as_dict(), side="source")
     if doc.docstatus != 0:
         frappe.throw(frappe._("Packing can only be added while the manifest is Draft."))
-    try:
-        packed_qty_int = int(packed_qty)
-    except (TypeError, ValueError):
-        frappe.throw(frappe._("Packed quantity is required."))
-    if packed_qty_int <= 0:
-        frappe.throw(frappe._("Packed quantity must be greater than zero."))
 
-    # Pre-flight overpack guard so the user sees a clean, contextual message
-    # BEFORE save() runs. The manifest controller's _validate_packing() is the
-    # source-of-truth guard (covers direct form saves + this API path); this
-    # check only exists to give the pack-station a nicer error string.
-    total_qty = float(doc.total_qty or 0)
-    if total_qty > 0:
-        packed_so_far = sum(float(p.packed_qty or 0) for p in (doc.packages or []))
-        remaining = total_qty - packed_so_far
-        if packed_qty_int > remaining:
+    item_rows = frappe.parse_json(items) if items else []
+    if item_rows:
+        available = {row["item_code"]: row for row in doc._get_manifest_pack_items()}
+        for row in item_rows:
+            item_code = row.get("item_code")
+            qty = flt(row.get("qty"))
+            if not item_code or qty <= 0:
+                frappe.throw(frappe._("Each packed item needs a valid item and a quantity greater than zero."))
+            info = available.get(item_code)
+            remaining = flt(info["remaining_qty"]) if info else 0
+            if qty > remaining:
+                frappe.throw(
+                    frappe._(
+                        "Cannot pack {0} of {1} — only {2} remaining on manifest {3}."
+                    ).format(qty, item_code, remaining, doc.name),
+                    title=frappe._("Overpack Blocked"),
+                )
+        packed_qty_int = sum(flt(row.get("qty")) for row in item_rows)
+    else:
+        try:
+            packed_qty_int = int(packed_qty)
+        except (TypeError, ValueError):
+            frappe.throw(frappe._("Packed quantity is required."))
+        if packed_qty_int <= 0:
+            frappe.throw(frappe._("Packed quantity must be greater than zero."))
+
+        # Auto-split the bare total across remaining items, first-remaining
+        # -item-first, so the box still gets real item/qty rows for the
+        # print label even though the packer only entered one number.
+        pack_items = doc._get_manifest_pack_items()
+        remaining_total = sum(flt(row["remaining_qty"]) for row in pack_items)
+        if packed_qty_int > remaining_total:
+            total_qty = sum(flt(row["total_qty"]) for row in pack_items)
+            packed_so_far = sum(flt(row["packed_qty"]) for row in pack_items)
             frappe.throw(
                 frappe._(
                     "Cannot pack {0} units — only {1} remaining on manifest {2}"
                     " (total {3}, already packed {4})."
                 ).format(
                     packed_qty_int,
-                    max(remaining, 0),
+                    remaining_total,
                     doc.name,
-                    int(total_qty) if total_qty.is_integer() else total_qty,
-                    int(packed_so_far) if packed_so_far.is_integer() else packed_so_far,
+                    total_qty,
+                    packed_so_far,
                 ),
                 title=frappe._("Overpack Blocked"),
             )
 
+        to_allocate = packed_qty_int
+        for row in pack_items:
+            if to_allocate <= 0:
+                break
+            avail = flt(row["remaining_qty"])
+            if avail <= 0:
+                continue
+            take = min(avail, to_allocate)
+            item_rows.append({"item_code": row["item_code"], "qty": take})
+            to_allocate -= take
+
     doc.append("packages", {
         "packed_qty": packed_qty_int,
+        "items": [
+            {"item_code": row.get("item_code"), "qty": flt(row.get("qty"))}
+            for row in item_rows
+        ],
         "weight_kg": weight_kg or None,
         "dimensions_cm": dimensions_cm or None,
         "seal_number": seal_number or None,
@@ -1415,7 +1479,7 @@ def get_driver_assignments() -> list:
         "driver_name", "driver_phone",
         "total_stock_entries", "total_items", "total_qty",
         "estimated_delivery_date", "creation",
-        "trip",
+        "trip", "driver_accepted_at",
     ]
     if frappe.db.has_column("CH Transfer Manifest", "arrival_datetime"):
         fields.append("arrival_datetime")
