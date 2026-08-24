@@ -47,6 +47,7 @@ import frappe
 from frappe import _
 from frappe.utils import cint
 
+
 # Roles that bypass every logistics gate (matches ch_erp15.scope._BYPASS_ROLES).
 # Shipped defaults — exactly the pre-centralisation behaviour of each call
 # site. "Logistic Head" (legacy misspelling) is retained as an accepted
@@ -107,9 +108,16 @@ def _settings_matrix() -> dict[str, set[str]]:
 
 
 def get_roles_for(function_key: str) -> set[str]:
-    """Allowed role set for a function key (settings override → defaults)."""
+    """Allowed role set for a function key.
+
+    Resolution order:
+
+    1. ``CH Logistics Settings -> Role Matrix`` child rows when configured.
+    2. ``DEFAULT_ROLE_MATRIX`` below otherwise.
+    """
     if function_key not in DEFAULT_ROLE_MATRIX:
         return set()
+
     configured = _settings_matrix().get(function_key)
     if configured:
         return configured
