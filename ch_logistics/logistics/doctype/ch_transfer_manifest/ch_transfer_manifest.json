@@ -30,6 +30,7 @@
   "driver_name",
   "driver_phone",
   "estimated_delivery_date",
+  "driver_accepted_at",
   "sec_ewaybill",
   "ewaybill_status",
   "ewaybill_count",
@@ -257,6 +258,14 @@
    "fieldtype": "Datetime",
    "in_list_view": 1,
    "label": "Estimated Delivery"
+  },
+  {
+   "fieldname": "driver_accepted_at",
+   "fieldtype": "Datetime",
+   "label": "Driver Accepted At",
+   "read_only": 1,
+   "allow_on_submit": 1,
+   "description": "Stamped when the driver accepts this manifest individually, or when the whole trip is accepted. Gates the per-manifest Start Pickup action."
   },
   {
    "fieldname": "sec_ewaybill",

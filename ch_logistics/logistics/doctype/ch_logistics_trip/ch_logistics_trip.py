@@ -182,6 +182,25 @@ class CHLogisticsTrip(Document):
                         frappe.PermissionError,
                     )
         self.stops.sort(key=lambda r: r.sequence or 0)
+        # Sequences must be 1-based and contiguous — a lot of downstream
+        # matching code (delivery_app.js's pickup_stop_sequence/drop_stop_
+        # sequence checks, stop_roles lookups keyed by sequence) uses a
+        # plain truthy check before comparing, and a sequence of 0 is
+        # falsy in JS, so it silently fails to match instead of erroring.
+        # Unlike CH Route (a template with no live references), this trip
+        # may already have manifests pointing at specific sequence numbers
+        # by the time this runs again, so it validates and rejects rather
+        # than silently renumbering — that could otherwise shift what a
+        # sequence number means out from under an already-attached
+        # manifest without anyone noticing.
+        for idx, row in enumerate(self.stops, start=1):
+            if row.sequence != idx:
+                frappe.throw(
+                    _(
+                        "Stop sequences must start at 1 and run without gaps. "
+                        "Expected stop #{0} to be sequence {1}, found {2}."
+                    ).format(row.idx, idx, row.sequence)
+                )
 
     def _validate_stop_proof_fields(self):
         """Keep QR bearers and scan evidence server-managed on direct saves."""
