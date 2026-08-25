@@ -14,6 +14,7 @@
   "col_break_header",
   "status",
   "trip",
+  "route",
   "amended_from",
   "sec_route",
   "source_warehouse",
@@ -39,6 +40,8 @@
   "ewaybill_summary",
   "sec_transfers",
   "transfers",
+  "sec_stops",
+  "stops",
   "sec_packages",
   "packages",
   "sec_pickup",
@@ -152,6 +155,17 @@
    "options": "CH Logistics Trip",
    "read_only": 1,
    "search_index": 1
+  },
+  {
+   "fieldname": "route",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Route",
+   "options": "CH Route",
+   "no_copy": 1,
+   "allow_on_submit": 1,
+   "description": "Informational only, not auto-populated here — clubbing Stock Entries into this manifest still requires an exact destination match, unaffected by this field. Route is resolved automatically on the CH Logistics Trip instead; set this by hand if you need it on the manifest itself."
   },
   {
    "fieldname": "amended_from",
@@ -324,6 +338,19 @@
    "label": "Transfers",
    "options": "CH Transfer Manifest Item",
    "reqd": 1
+  },
+  {
+   "fieldname": "sec_stops",
+   "fieldtype": "Section Break",
+   "collapsible": 1,
+   "label": "Stops"
+  },
+  {
+   "fieldname": "stops",
+   "fieldtype": "Table",
+   "label": "Stops",
+   "options": "CH Transfer Manifest Stop",
+   "description": "Auto-derived from the pickup/drop warehouses of the Stock Entries in Transfers above — lets one manifest carry a multi-leg route (e.g. a hub-to-hub chain) instead of a single source/destination pair."
   },
   {
    "fieldname": "sec_packages",

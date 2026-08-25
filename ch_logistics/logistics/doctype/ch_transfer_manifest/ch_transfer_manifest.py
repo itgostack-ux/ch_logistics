@@ -75,6 +75,7 @@ class CHTransferManifest(Document):
         if not self.status:
             self.status = "Draft"
         self._populate_transfer_details()
+        self._seed_manifest_stops()
         self._compute_totals()
         self._validate_packing()
         self._validate_transfers()
@@ -85,6 +86,13 @@ class CHTransferManifest(Document):
 
     def on_update(self):
         self._sync_package_items()
+        # Previously only ran on_submit — but packing (and now, manifest
+        # linking) is a Draft-only activity, so a Stock Entry added to a
+        # still-Draft manifest's transfers never saw custom_transfer_manifest
+        # set until submission, well after Pack Box needed it. Runs on every
+        # save now so a manually created/edited Draft manifest links back
+        # immediately.
+        self._update_stock_entries_manifest()
 
     def _sync_package_items(self):
         """Persist a newly-packed box's item-level breakdown.
@@ -212,9 +220,13 @@ class CHTransferManifest(Document):
             )
         # Trip linking is optional at submit time — manifests can be submitted
         # standalone and attached to a trip via the Logistics Control Tower.
+        # NOTE: linked Stock Entries are NOT pushed to custom_status="Packed"
+        # here anymore — packing now lives entirely on the Stock Entry, and
+        # every entry grouped into a manifest is already past that stage (at
+        # "Ready For Pickup") by the time it gets here. Doing so used to
+        # downgrade an already-correct status.
         if self.status in ("Draft", None, ""):
             self.status = "Packed"
-            self._sync_custom_status_only("Packed")
 
     def _packing_required(self) -> bool:
         """Honour the global CH Logistics Settings → require_packing_slip flag.
@@ -281,9 +293,6 @@ class CHTransferManifest(Document):
             if any(fname.endswith(ext) or furl.endswith(ext) for ext in image_exts):
                 return True
         return False
-
-    def on_submit(self):
-        self._update_stock_entries_manifest()
 
     def on_cancel(self):
         if not self.flags.get("stock_reversal_completed"):
@@ -353,6 +362,66 @@ class CHTransferManifest(Document):
             )
             row.item_count = cint(items[0].cnt) if items else 0
             row.total_qty = flt(items[0].total_qty) if items else 0
+
+    def _seed_manifest_stops(self):
+        """Ensure a CH Transfer Manifest Stop exists for every from/to
+        warehouse used by this manifest's transfer rows, and stamp each
+        row's ``manifest_stop`` with the stop (by idx) its drop leg
+        belongs to.
+
+        Lets one manifest carry a multi-leg route instead of a single
+        source/destination pair — e.g. Annanagar->Ashok Nagar and Ashok
+        Nagar->Chennai Hub in the same manifest naturally produce 3 stops
+        (Pickup@Annanagar, Pickup+Drop@Ashok Nagar — it's the drop for the
+        first leg and the pickup for the second, so both roles merge into
+        one stop — Drop@Chennai Hub), reusing a stop already at a given
+        warehouse instead of creating a duplicate.
+
+        Mirrors the exact hub-augmentation pattern already built for
+        CH Logistics Trip (_seed_stops_from_manifests /
+        auto_plan_trips's hub-stop insertion in
+        ch_logistics.api.logistics_api) — only the doctype differs.
+
+        Runs in validate(), not on_update(): unlike CH Transfer Package's
+        grandchild items table, `stops` and `transfers` are both direct
+        child tables of this manifest, so ordinary doc.save() persists
+        them correctly — no post-save grandchild-sync workaround needed
+        here. child rows have no `.name` until saved, so stops are
+        referenced by `idx` (stable, since stops are only ever appended,
+        never reordered or removed) rather than by name.
+        """
+        if not self.transfers:
+            return
+
+        by_warehouse = {}
+        for s in self.stops or []:
+            if s.warehouse:
+                by_warehouse[s.warehouse] = s
+
+        def _ensure_stop(warehouse, role):
+            if not warehouse:
+                return None
+            existing = by_warehouse.get(warehouse)
+            if existing:
+                if existing.stop_type != role and existing.stop_type != "Pickup+Drop":
+                    existing.stop_type = "Pickup+Drop"
+                return existing
+            new_stop = self.append("stops", {
+                "sequence": len(self.stops or []) + 1,
+                "warehouse": warehouse,
+                "stop_type": role,
+                "status": "Pending",
+            })
+            by_warehouse[warehouse] = new_stop
+            return new_stop
+
+        for row in self.transfers:
+            if not row.from_warehouse and not row.to_warehouse:
+                continue
+            _ensure_stop(row.from_warehouse, "Pickup")
+            drop_stop = _ensure_stop(row.to_warehouse, "Drop")
+            if drop_stop:
+                row.manifest_stop = drop_stop.idx
 
     def _compute_totals(self):
         self.total_stock_entries = len(self.transfers)
@@ -939,34 +1008,47 @@ class CHTransferManifest(Document):
             lat_f, lng_f = self._validate_geo(lat, lng, kind="pickup",
                                               accuracy_m=gps_accuracy_m,
                                               override_reason=geofence_override_reason)
-            self.pickup_photo = pickup_photo
-            self.pickup_datetime = now_datetime()
-            self.pickup_lat = lat_f
-            self.pickup_lng = lng_f
-            self.pickup_notes = notes
-            # Reset any prior arrival capture so a re-picked manifest forces a
-            # fresh "Reached Location" tap before delivery can be completed.
-            if frappe.get_meta(self.doctype).has_field("arrival_datetime"):
-                self.arrival_datetime = None
-                self.arrival_lat = None
-                self.arrival_lng = None
-            self.status = "In Transit"
-            self.flags.ignore_validate_update_after_submit = True
-            self.save()
-            self._sync_logistics_status_to_entries("In Transit")
-            # Lifecycle: this manifest is now physically being moved, so the
-            # driver must show as IN_TRANSIT regardless of whether the parent
-            # trip's trip_start API was called explicitly. Carrier driver apps
-            # (Delhivery / BlueDart / Ekart) all drive duty status from the
-            # first manifest pickup, not from a separate "trip start" button.
-            self._sync_driver_state_after_action(target_hint="In Transit")
-            # Cascade to parent trip's pickup-type stop (Pending → Completed)
-            self._cascade_stop_status_to_trip()
-            # Proactive "out for delivery" to the destination store + track link.
-            from ch_logistics.api.customer_tracking import notify_destination
-            notify_destination(self.name, "out_for_delivery")
+            self._apply_pickup_in_transit_transition(pickup_photo, lat_f, lng_f, notes)
         finally:
             frappe.db.sql("SELECT RELEASE_LOCK(%s)", (lock_key,))
+
+    def _apply_pickup_in_transit_transition(self, pickup_photo, lat_f, lng_f, notes=None):
+        """Flip this manifest to In Transit and fire everything that follows
+        from a completed pickup — the shared tail of ``start_pickup`` (whole-
+        manifest QR/GPS/photo capture) AND of the per-leg Accept Shipment
+        rollup (``driver_accept_manifest_row`` in ``logistics_api.py``, once
+        every ``transfers`` row has individually captured its own pickup
+        evidence). Both callers are expected to already hold this manifest's
+        ``manifest_status_<name>`` lock and to have validated QR/photo/geo
+        themselves — this method only applies the transition, it does not
+        re-validate anything.
+        """
+        self.pickup_photo = pickup_photo
+        self.pickup_datetime = now_datetime()
+        self.pickup_lat = lat_f
+        self.pickup_lng = lng_f
+        self.pickup_notes = notes
+        # Reset any prior arrival capture so a re-picked manifest forces a
+        # fresh "Reached Location" tap before delivery can be completed.
+        if frappe.get_meta(self.doctype).has_field("arrival_datetime"):
+            self.arrival_datetime = None
+            self.arrival_lat = None
+            self.arrival_lng = None
+        self.status = "In Transit"
+        self.flags.ignore_validate_update_after_submit = True
+        self.save()
+        self._sync_logistics_status_to_entries("In Transit")
+        # Lifecycle: this manifest is now physically being moved, so the
+        # driver must show as IN_TRANSIT regardless of whether the parent
+        # trip's trip_start API was called explicitly. Carrier driver apps
+        # (Delhivery / BlueDart / Ekart) all drive duty status from the
+        # first manifest pickup, not from a separate "trip start" button.
+        self._sync_driver_state_after_action(target_hint="In Transit")
+        # Cascade to parent trip's pickup-type stop (Pending → Completed)
+        self._cascade_stop_status_to_trip()
+        # Proactive "out for delivery" to the destination store + track link.
+        from ch_logistics.api.customer_tracking import notify_destination
+        notify_destination(self.name, "out_for_delivery")
 
     def _validate_pickup_qr(self, scanned_qr):
         """Enforce the mandatory pickup scan (Ekart/Delhivery: every shipment is
@@ -1026,7 +1108,24 @@ class CHTransferManifest(Document):
         return token, False
 
     def _validate_geo(self, lat, lng, kind: str, accuracy_m=None, override_reason=None):
-        """Mandatory driver-location proof for pickup/delivery.
+        """Mandatory driver-location proof for pickup/delivery, checked against
+        the manifest header's own source/destination warehouse.
+
+        Thin wrapper over :meth:`_validate_geo_for` — see there for the shared
+        sanity checks and the per-location geofence delegate.
+        """
+        target_wh = self.source_warehouse if kind == "pickup" else self.destination_warehouse
+        place = (self.source_store or self.source_warehouse) if kind == "pickup" \
+            else (self.destination_store or self.destination_warehouse)
+        return self._validate_geo_for(target_wh, place, lat, lng, kind,
+                                      accuracy_m=accuracy_m, override_reason=override_reason)
+
+    def _validate_geo_for(self, target_wh, place, lat, lng, kind: str, accuracy_m=None, override_reason=None):
+        """Mandatory driver-location proof for pickup/delivery at an EXPLICIT
+        location — lets a caller check a single Stock Entry leg's own
+        from/to warehouse instead of always the manifest header's one
+        source_warehouse/destination_warehouse (which is wrong for any leg
+        whose own route differs, now that one manifest can carry several).
 
         Treats null / blank / non-numeric / sentinel (0, 0) / out-of-bounds
         coordinates as a missing capture and throws. The (0, 0) sentinel is
@@ -1057,14 +1156,28 @@ class CHTransferManifest(Document):
         # Geofence: the driver must physically be at the correct location — so a
         # parcel can't be picked up at the wrong source or delivered to the wrong
         # store even if the right QR is scanned.
-        self._validate_geofence(lat_f, lng_f, kind, accuracy_m=accuracy_m,
-                                override_reason=override_reason)
+        self._validate_geofence_for(target_wh, place, lat_f, lng_f, kind, accuracy_m=accuracy_m,
+                                    override_reason=override_reason)
         return lat_f, lng_f
 
     def _validate_geofence(self, lat_f, lng_f, kind: str, accuracy_m=None,
                            override_reason=None):
-        """Reject a pickup/arrival/delivery tap that is too far from the expected
-        warehouse.
+        """Reject a pickup/arrival/delivery tap that is too far from the
+        manifest header's own source/destination warehouse.
+
+        Thin wrapper over :meth:`_validate_geofence_for` — see there for the
+        actual distance/accuracy/override logic.
+        """
+        target_wh = self.source_warehouse if kind == "pickup" else self.destination_warehouse
+        place = (self.source_store or self.source_warehouse) if kind == "pickup" \
+            else (self.destination_store or self.destination_warehouse)
+        self._validate_geofence_for(target_wh, place, lat_f, lng_f, kind,
+                                    accuracy_m=accuracy_m, override_reason=override_reason)
+
+    def _validate_geofence_for(self, target_wh, place, lat_f, lng_f, kind: str, accuracy_m=None,
+                               override_reason=None):
+        """Reject a pickup/arrival/delivery tap that is too far from an
+        EXPLICIT expected warehouse/place (see :meth:`_validate_geo_for`).
 
         Three things this has to get right, none of which it did before:
 
@@ -1087,7 +1200,6 @@ class CHTransferManifest(Document):
         enforce = frappe.db.get_single_value("CH Logistics Settings", "enforce_geofence")
         if enforce is not None and not int(enforce):
             return
-        target_wh = self.source_warehouse if kind == "pickup" else self.destination_warehouse
         if not target_wh:
             return
         try:
@@ -1104,8 +1216,6 @@ class CHTransferManifest(Document):
             return
 
         radius_m = cint(frappe.db.get_single_value("CH Logistics Settings", "geofence_radius_m")) or 300
-        place = (self.source_store or self.source_warehouse) if kind == "pickup" \
-            else (self.destination_store or self.destination_warehouse)
 
         try:
             acc_m = float(accuracy_m) if accuracy_m not in (None, "") else None
@@ -1289,14 +1399,32 @@ class CHTransferManifest(Document):
             self.status = "Rejected"
             self.flags.ignore_validate_update_after_submit = True
             self.save()
+            # Every linked Stock Entry moved into the transit ledger back at
+            # Pending With Goods (custom stock-ledger management starts
+            # there, well before a driver physically touches anything — see
+            # TRANSIT_LEDGER_MANAGED_STATUSES in ch_erp15), so a pickup-time
+            # rejection still has real stock sitting in the transit
+            # warehouse that needs reversing, exactly like an in-transit
+            # rejection does. reverse_transfer_to_source does that reversal
+            # AND sets custom_status to "Rejected" in one call — replacing
+            # the old logistics-status-only sync, which left the Stock
+            # Entry's stock position wrong (nothing was ever moved back).
+            from ch_erp15.ch_erp15.custom.stock_entry import reverse_transfer_to_source
+
+            for row in self.transfers:
+                reverse_transfer_to_source(
+                    row.stock_entry,
+                    reason=rejection_reason,
+                    reference=self.name,
+                    target_status="Rejected",
+                )
             if during == "In Transit":
-                # Goods are physically with the driver — they need to come
-                # back to source. Source store will receive them as a return.
-                self._sync_logistics_status_to_entries("Return to Source")
+                # Goods were physically with the driver — still worth a trip
+                # exception so the control tower sees the failed delivery
+                # attempt the same way Delhivery / BlueDart / FedEx surface
+                # "Delivery Exception", even though the stock is already
+                # back on the ledger.
                 self._raise_trip_exception_for_rejection(rejection_reason, rejection_notes)
-            else:
-                # Nothing was picked up — child entries go back to the queue.
-                self._sync_logistics_status_to_entries("Pending Pickup")
             # Lifecycle: a rejection releases this manifest from the driver's
             # workload exactly like a Delivered does. Recompute residual state
             # so a driver who rejected their last Assigned manifest goes back
@@ -1543,27 +1671,40 @@ class CHTransferManifest(Document):
                 self.delivery_otp_verified = 1
                 self.delivery_otp = None
 
-            self.delivery_photo = delivery_photo
-            self.delivery_datetime = now_datetime()
-            self.delivery_lat = lat_f
-            self.delivery_lng = lng_f
-            self.receiver_name = receiver_name
-            self.status = "Delivered"
-            self.flags.ignore_validate_update_after_submit = True
-            self.save()
-            self._sync_logistics_status_to_entries("Delivered")
-            # Lifecycle: this manifest is done. If the driver has no other
-            # Assigned / Pickup Started / In Transit manifests, recomputer
-            # drops them back to AVAILABLE so dispatch can re-assign them.
-            # If they're still carrying other loads, IN_TRANSIT is preserved.
-            self._sync_driver_state_after_action()
-            # Cascade to parent trip's drop stop (Pending → Completed)
-            self._cascade_stop_status_to_trip()
-            self._maybe_auto_close_parent_trip()
-            from ch_logistics.api.customer_tracking import notify_destination
-            notify_destination(self.name, "delivered")
+            self._apply_delivery_complete_transition(delivery_photo, lat_f, lng_f, receiver_name)
         finally:
             frappe.db.sql("SELECT RELEASE_LOCK(%s)", (lock_key,))
+
+    def _apply_delivery_complete_transition(self, delivery_photo, lat_f, lng_f, receiver_name):
+        """Flip this manifest to Delivered and fire everything that follows
+        from a completed delivery — the shared tail of ``complete_delivery``
+        (whole-manifest QR/OTP/GPS/photo capture) AND of the per-leg Deliver
+        rollup (``driver_complete_delivery_row`` in ``transfer_manifest_api.py``,
+        once every ``transfers`` row has individually captured its own
+        delivery evidence). Both callers are expected to already hold this
+        manifest's ``manifest_status_<name>`` lock and to have validated
+        QR/OTP/photo/geo themselves — this method only applies the
+        transition, it does not re-validate anything.
+        """
+        self.delivery_photo = delivery_photo
+        self.delivery_datetime = now_datetime()
+        self.delivery_lat = lat_f
+        self.delivery_lng = lng_f
+        self.receiver_name = receiver_name
+        self.status = "Delivered"
+        self.flags.ignore_validate_update_after_submit = True
+        self.save()
+        self._sync_logistics_status_to_entries("Delivered")
+        # Lifecycle: this manifest is done. If the driver has no other
+        # Assigned / Pickup Started / In Transit manifests, recomputer
+        # drops them back to AVAILABLE so dispatch can re-assign them.
+        # If they're still carrying other loads, IN_TRANSIT is preserved.
+        self._sync_driver_state_after_action()
+        # Cascade to parent trip's drop stop (Pending → Completed)
+        self._cascade_stop_status_to_trip()
+        self._maybe_auto_close_parent_trip()
+        from ch_logistics.api.customer_tracking import notify_destination
+        notify_destination(self.name, "delivered")
 
     def accept_delivery(self, received_by=None, damage_reported=False,
                         damage_notes=None, damage_photo=None,

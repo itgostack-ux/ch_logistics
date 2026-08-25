@@ -106,7 +106,8 @@
    "fieldtype": "Link",
    "in_list_view": 1,
    "label": "Route",
-   "options": "CH Route"
+   "options": "CH Route",
+   "description": "Auto-resolved from this trip's own Drop stops when left blank (or when the stops table changes). Hand-correct it if the auto-match picked the wrong overlapping route."
   },
   {
    "fieldname": "hub_warehouse",

@@ -4,7 +4,6 @@ frappe.ui.form.on("CH Transfer Manifest", {
         render_lane_banner(frm);
         add_action_buttons(frm);
         add_print_label_button(frm);
-        add_pack_box_button(frm);
     },
 
     source_store(frm) {
@@ -27,8 +26,9 @@ frappe.ui.form.on("CH Transfer Manifest", {
 // One-click: print the box label (FROM→TO + scannable QR = manifest number).
 // Lifecycle gate (SAP EWM / Manhattan Active WMS / Oracle WMS Cloud parity):
 // carton labels are an operational artefact of the pack ↔ dispatch phase,
-// and packing itself is a Draft-only activity (see add_pack_box_button
-// below) — boxes can still be added/changed right up until Submit. Printing
+// and packing itself is a Draft-only activity (now done from the Stock
+// Entry form's Pack Box button, not here) — boxes can still be added/changed
+// right up until Submit. Printing
 // while still Draft risks a label on a carton whose contents get edited
 // afterward. "Packed" is the status before_submit() only ever sets once the
 // manifest is actually submitted, so it's the earliest reliable "packing is
@@ -61,99 +61,6 @@ function add_print_label_button(frm) {
         const $btn = frm.page.inner_toolbar.find(`.btn:contains('${__("Print Box Label")}')`);
         $btn.addClass("btn-primary");
     }
-}
-
-// Oracle WMS-style "Pack Box" pack-station shortcut. One click opens a
-// quick-capture dialog (qty / weight / dimensions / seal / photo / notes),
-// appends a packing-slip row with an auto-generated LPN, and lets the
-// packer mint the next box without scrolling through the grid.
-function add_pack_box_button(frm) {
-    if (frm.is_new()) return;
-    if (frm.doc.docstatus !== 0) return;     // packing is a Draft-only activity
-    frm.add_custom_button(__("Pack Box"), () => show_pack_box_dialog(frm), __("Packing"));
-}
-
-function show_pack_box_dialog(frm) {
-    const next_seq = ((frm.doc.packages || []).length || 0) + 1;
-    const suggested_label = `${frm.doc.name}-B${String(next_seq).padStart(2, "0")}`;
-
-    // Fetch remaining qty so the dialog can show a Max hint and validate
-    // client-side, but the packer still just enters one Packed Qty total —
-    // the server auto-splits that across remaining items (first-remaining
-    // -item-first) so the per-box print label still gets real item detail.
-    frappe.call({
-        method: "ch_logistics.api.transfer_manifest_api.get_manifest_pack_items",
-        args: { manifest: frm.doc.name },
-        freeze: true,
-        callback: (r) => {
-            const available = (r.message || []).filter((row) => row.remaining_qty > 0);
-            if (!available.length) {
-                frappe.msgprint(__("Every item on this manifest has already been fully packed into a box."));
-                return;
-            }
-            const remaining_total = available.reduce((s, row) => s + row.remaining_qty, 0);
-            _open_pack_box_dialog(frm, suggested_label, remaining_total);
-        },
-    });
-}
-
-function _open_pack_box_dialog(frm, suggested_label, remaining_total) {
-    const d = new frappe.ui.Dialog({
-        title: __("Pack Box — {0}", [suggested_label]),
-        fields: [
-            {
-                fieldname: "packed_qty", fieldtype: "Int", label: __("Packed Qty"), reqd: 1,
-                description: __("How many item units are physically in this box? Max: {0} (remaining on manifest).", [remaining_total]),
-            },
-            { fieldname: "weight_kg", fieldtype: "Float", label: __("Weight (kg)") },
-            {
-                fieldname: "dimensions_cm", fieldtype: "Data", label: __("Dimensions (LxWxH cm)"),
-                description: __("Optional — used for courier dimensional weight, e.g. 30x20x15")
-            },
-            { fieldname: "col_break", fieldtype: "Column Break" },
-            { fieldname: "seal_number", fieldtype: "Data", label: __("Seal / Tamper Tag") },
-            { fieldname: "packing_photo", fieldtype: "Attach Image", label: __("Packing Photo") },
-            { fieldname: "notes", fieldtype: "Small Text", label: __("Notes") },
-        ],
-        primary_action_label: __("Add Box"),
-        primary_action(values) {
-            if (!values.packed_qty || values.packed_qty <= 0) {
-                frappe.msgprint(__("Enter a packed quantity greater than zero."));
-                return;
-            }
-            if (values.packed_qty > remaining_total) {
-                frappe.msgprint({
-                    title: __("Overpack Blocked"),
-                    indicator: "red",
-                    message: __("Cannot pack {0} units — only {1} remaining on this manifest.",
-                        [values.packed_qty, remaining_total]),
-                });
-                return;
-            }
-            frappe.call({
-                method: "ch_logistics.api.transfer_manifest_api.pack_box",
-                args: {
-                    manifest: frm.doc.name,
-                    packed_qty: values.packed_qty,
-                    weight_kg: values.weight_kg,
-                    dimensions_cm: values.dimensions_cm,
-                    seal_number: values.seal_number,
-                    packing_photo: values.packing_photo,
-                    notes: values.notes,
-                },
-                freeze: true,
-            }).then((r) => {
-                d.hide();
-                const m = r.message || {};
-                frappe.show_alert({
-                    message: __("Box {0} packed ({1} units).", [m.package_label || suggested_label, values.packed_qty]),
-                    indicator: "green",
-                }, 5);
-                frm.reload_doc();
-            });
-        },
-    });
-    d.show();
 }
 
 frappe.ui.form.on("CH Transfer Manifest Item", {

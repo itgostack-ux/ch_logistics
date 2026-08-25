@@ -95,7 +95,7 @@ class LogisticsCommandCenter {
 						<i class="fa fa-tachometer"></i> ${__("Overview")}
 					</button>
 					<button class="lcc-mode-btn" data-mode="packing">
-						<i class="fa fa-cube"></i> ${__("Packing")}
+						<i class="fa fa-cube"></i> ${__("Packed Order")}
 					</button>
 					<button class="lcc-mode-btn" data-mode="ops">
 						<i class="fa fa-sitemap"></i> ${__("Operations")}
@@ -657,17 +657,15 @@ class LogisticsCommandCenter {
 			<div class="lcc-pack" id="lcc-pack">
 				<div class="lcc-pack-howto">
 					<div class="lcc-pack-howto-title">
-						<i class="fa fa-cube"></i> ${__("Pack Station")}
+						<i class="fa fa-cube"></i> ${__("Packed Orders")}
 					</div>
 					<ol class="lcc-pack-steps">
-						<li><b>${__("Create manifest")}</b> — ${__("draft a CH Transfer Manifest and attach the Stock Entries for this load.")}</li>
-						<li><b>${__("Move to pack station")}</b> — ${__("stage the SKUs at the carton table; print the manifest's Box Label sheet if needed.")}</li>
-						<li><b>${__("Click Pack Box for each carton")}</b> — ${__("enter qty, weight, dimensions, seal & photo. The system mints a unique LPN like TM-2026-00025-B01.")}</li>
-						<li><b>${__("Box count auto-updates")}</b> — ${__("the manifest, list view, and command-tower KPIs all reflect the running carton count in real time.")}</li>
+						<li><b>${__("Pack Box, from the Stock Entry")}</b> — ${__("packing happens on the Stock Entry form itself (Pack Box button), independent of any manifest: enter qty, weight, dimensions, seal & photo per carton. The system mints a unique LPN like BMTNMT26000123-B01. custom_status becomes Partially Packed while qty remains, and Packed once every item is fully boxed — the entries below are exactly the fully Packed ones.")}</li>
+						<li><b>${__("Tick and group, here")}</b> — ${__("tick one or more Packed, unlinked Stock Entries below (they must share the same source/destination) and click Create Manifest to group them for dispatch. Grouping is what advances them to Ready For Pickup — there's no separate manual status step.")}</li>
 					</ol>
 					<div class="lcc-pack-bundle-tip">
 						<i class="fa fa-qrcode"></i>
-						${__("<b>Bundling multiple manifests under one pickup QR?</b> Once they are marked Packed, switch to <b>Operations</b> → tick the manifests in <b>Unassigned Manifests</b> → click <b>Bundle &amp; Print Pickup QR</b>. The system clubs same-destination shipments into one trip stop with a single consolidated QR — driver scans once per drop.")}
+						${__("<b>Bundling multiple manifests under one pickup QR?</b> Once they are on a manifest, switch to <b>Operations</b> → tick the manifests in <b>Unassigned Manifests</b> → click <b>Bundle &amp; Print Pickup QR</b>. The system clubs same-destination shipments into one trip stop with a single consolidated QR — driver scans once per drop.")}
 					</div>
 				</div>
 				<div class="lcc-ops-bar">
@@ -675,27 +673,30 @@ class LogisticsCommandCenter {
 						<button class="btn btn-xs btn-default lcc-pack-refresh-btn">
 							<i class="fa fa-refresh"></i> ${__("Refresh")}
 						</button>
-						<button class="btn btn-xs btn-primary lcc-pack-new-manifest-btn">
-							<i class="fa fa-plus"></i> ${__("New Manifest")}
+						<button class="btn btn-xs btn-primary lcc-pack-create-manifest-btn" disabled>
+							<i class="fa fa-plus"></i> ${__("Create Manifest")}
 						</button>
 					</div>
 					<span class="lcc-muted lcc-ops-bar-hint">
 						<i class="fa fa-info-circle"></i>
-						${__("Showing all Draft manifests awaiting carton-level packing. Submit moves them to Packed and out of this queue.")}
+						${__("Showing fully Packed Stock Entries not yet on a manifest. Tick some and click Create Manifest to group them for dispatch.")}
 					</span>
 				</div>
 				<div class="lcc-pack-body" id="lcc-pack-body">
-					<div class="lcc-loading"><i class="fa fa-spinner fa-spin"></i> ${__("Loading pack queue…")}</div>
+					<div class="lcc-loading"><i class="fa fa-spinner fa-spin"></i> ${__("Loading packed orders…")}</div>
 				</div>
 			</div>
 		`);
 		if (!this._pack_events_bound) {
 			const $r = this.$root;
-			$r.on("click", ".lcc-pack-refresh-btn",      () => this._pack_load());
-			$r.on("click", ".lcc-pack-new-manifest-btn", () => frappe.new_doc("CH Transfer Manifest"));
-			$r.on("click", ".lcc-pack-add-box",          (e) => { e.preventDefault(); this._pack_open_dialog($(e.currentTarget).data("name")); });
-			$r.on("click", ".lcc-pack-submit",           (e) => { e.preventDefault(); this._pack_submit_manifest($(e.currentTarget).data("name")); });
-			$r.on("click", ".lcc-pack-open",             (e) => { e.preventDefault(); frappe.set_route("Form", "CH Transfer Manifest", $(e.currentTarget).data("name")); });
+			$r.on("click", ".lcc-pack-refresh-btn",         () => this._pack_load());
+			$r.on("click", ".lcc-pack-create-manifest-btn", () => this._pack_create_manifest());
+			$r.on("click", ".lcc-pack-open",                (e) => { e.preventDefault(); frappe.set_route("Form", "Stock Entry", $(e.currentTarget).data("name")); });
+			$r.on("change", ".lcc-pack-select-all", (e) => {
+				$r.find(".lcc-pack-row-check").prop("checked", e.currentTarget.checked);
+				this._pack_update_create_btn();
+			});
+			$r.on("change", ".lcc-pack-row-check", () => this._pack_update_create_btn());
 			this._pack_events_bound = true;
 		}
 		this._pack_load();
@@ -703,223 +704,142 @@ class LogisticsCommandCenter {
 
 	async _pack_load() {
 		const $b = $("#lcc-pack-body");
-		$b.html(`<div class="lcc-loading"><i class="fa fa-spinner fa-spin"></i> ${__("Loading pack queue…")}</div>`);
+		$b.html(`<div class="lcc-loading"><i class="fa fa-spinner fa-spin"></i> ${__("Loading packed orders…")}</div>`);
 		try {
-			const r = await frappe.call({ method: _LCC + "ops_packing_queue", args: { limit: 100 } });
+			const co = this.filters?.fields?.company?.get_value() || frappe.defaults.get_user_default("Company");
+			const r = await frappe.call({
+				method: "ch_erp15.ch_erp15.custom.stock_entry.get_manifestable_stock_entries",
+				args: { company: co },
+			});
 			this.pack_queue = r.message || [];
 			this._pack_render();
 		} catch (e) {
-			$b.html(`<div class="lcc-empty"><i class="fa fa-exclamation-triangle"></i> ${__("Failed to load pack queue.")}</div>`);
+			$b.html(`<div class="lcc-empty"><i class="fa fa-exclamation-triangle"></i> ${__("Failed to load packed orders.")}</div>`);
 		}
 	}
 
 	_pack_render() {
 		const $b = $("#lcc-pack-body");
 		if (!(this.pack_queue || []).length) {
-			$b.html(`<div class="lcc-empty"><i class="fa fa-check-circle"></i> ${__("No Draft manifests in the pack queue. Create one to get started.")}</div>`);
+			$b.html(`<div class="lcc-empty"><i class="fa fa-check-circle"></i> ${__("No fully Packed Stock Entries waiting to be grouped into a manifest.")}</div>`);
 			return;
 		}
-		const rows = this.pack_queue.map((m) => {
-			const nm = frappe.utils.escape_html(m.name);
-			const total_qty   = Number(m.total_qty || 0);
-			const packed_qty  = Number(m.pkg_packed_qty || 0);
-			const remaining   = Number(m.pkg_remaining_qty || 0);
-			const box_count   = Number(m.pkg_box_count || m.box_count || 0);
-			const weight      = Number(m.pkg_total_weight_kg || 0);
-			const pct         = total_qty > 0 ? Math.min(100, Math.round((packed_qty / total_qty) * 100)) : 0;
-
-			let prog_cls = "lcc-pack-prog-low";
-			if (pct >= 100) prog_cls = "lcc-pack-prog-done";
-			else if (pct >= 50) prog_cls = "lcc-pack-prog-mid";
+		const rows = this.pack_queue.map((se) => {
+			const nm = frappe.utils.escape_html(se.name);
+			const total_qty = Number(se.total_qty || 0);
+			const box_count = Number(se.box_count || 0);
+			const weight    = Number(se.weight_kg || 0);
 
 			let age_cls = "lcc-sev-low";
-			if (m.age_hours != null) {
-				if (m.age_hours >= 48) age_cls = "lcc-sev-critical";
-				else if (m.age_hours >= 24) age_cls = "lcc-sev-high";
-				else if (m.age_hours >= 8) age_cls = "lcc-sev-medium";
+			if (se.age_hours != null) {
+				if (se.age_hours >= 48) age_cls = "lcc-sev-critical";
+				else if (se.age_hours >= 24) age_cls = "lcc-sev-high";
+				else if (se.age_hours >= 8) age_cls = "lcc-sev-medium";
 			}
-			const age = (m.age_hours == null) ? "—" : `${m.age_hours}h`;
-
-			const can_submit  = (pct >= 100 && box_count > 0);
-			const submit_btn  = `<button class="btn btn-xs btn-success lcc-pack-submit" data-name="${nm}" ${can_submit ? "" : "disabled"}
-				title="${can_submit ? __("Mark Packed & submit") : __("Pack remaining qty to enable submit")}">
-				<i class="fa fa-check"></i> ${__("Mark Packed")}
-			</button>`;
-
-			// Nothing left to pack once remaining hits 0 — keep the button
-			// clickable up to that point, then disable it so a packer can't
-			// try to add another box past the manifest's total qty (server
-			// already rejects overpacking; this just avoids the round-trip).
-			const fully_packed = total_qty > 0 && remaining <= 0;
-			const add_box_btn  = `<button class="btn btn-xs btn-primary lcc-pack-add-box" data-name="${nm}" ${fully_packed ? "disabled" : ""}
-				title="${fully_packed ? __("Fully packed — nothing remaining") : __("Pack a box")}">
-				<i class="fa fa-plus"></i> ${__("Pack Box")}
-			</button>`;
+			const age = (se.age_hours == null) ? "—" : `${se.age_hours}h`;
 
 			return `<tr>
+				<td><input type="checkbox" class="lcc-pack-row-check" data-name="${nm}"></td>
 				<td>
 					<a href="#" class="lcc-pack-open" data-name="${nm}">${nm}</a>
-					<div class="lcc-muted">${m.manifest_date ? frappe.datetime.str_to_user(m.manifest_date) : ""}</div>
+					<div class="lcc-muted">${se.posting_date ? frappe.datetime.str_to_user(se.posting_date) : ""}</div>
 				</td>
 				<td>
-					${window.ch_wh_label_html ? ch_wh_label_html(m.source_warehouse, "—") : frappe.utils.escape_html(m.source_warehouse || "—")}
-					<div class="lcc-muted">→ ${window.ch_wh_label_html ? ch_wh_label_html(m.destination_warehouse, "—") : frappe.utils.escape_html(m.destination_warehouse || "—")}</div>
+					${window.ch_wh_label_html ? ch_wh_label_html(se.from_warehouse, "—") : frappe.utils.escape_html(se.from_warehouse || "—")}
+					<div class="lcc-muted">→ ${window.ch_wh_label_html ? ch_wh_label_html(se.to_warehouse, "—") : frappe.utils.escape_html(se.to_warehouse || "—")}</div>
 				</td>
-				<td class="tr">${m.total_stock_entries || 0}</td>
 				<td class="tr">${total_qty}</td>
-				<td class="tr"><b>${packed_qty}</b> <span class="lcc-muted">/ ${total_qty}</span></td>
-				<td class="tr"><b>${remaining}</b></td>
 				<td class="tr">${box_count}</td>
 				<td class="tr">${weight ? weight.toFixed(1) + " kg" : "—"}</td>
-				<td>
-					<div class="lcc-pack-prog-wrap"><div class="lcc-pack-prog ${prog_cls}" style="width:${pct}%"></div></div>
-					<div class="lcc-muted lcc-pack-pct">${pct}%</div>
-				</td>
 				<td><span class="lcc-sev ${age_cls}">${age}</span></td>
-				<td>
-					${add_box_btn}
-					${submit_btn}
-				</td>
 			</tr>`;
 		}).join("");
 
 		$b.html(`
 			<div class="lcc-table-wrap"><table class="lcc-table lcc-pack-table">
 				<thead><tr>
-					<th>${__("Manifest")}</th>
+					<th style="width:32px"><input type="checkbox" class="lcc-pack-select-all"></th>
+					<th>${__("Stock Entry")}</th>
 					<th>${__("Lane")}</th>
-					<th class="tr">${__("SE")}</th>
-					<th class="tr">${__("Total Qty")}</th>
-					<th class="tr">${__("Packed")}</th>
-					<th class="tr">${__("Remaining")}</th>
+					<th class="tr">${__("Qty")}</th>
 					<th class="tr">${__("Boxes")}</th>
 					<th class="tr">${__("Weight")}</th>
-					<th style="width:140px">${__("Progress")}</th>
 					<th>${__("Age")}</th>
-					<th style="width:220px">${__("Action")}</th>
 				</tr></thead>
 				<tbody>${rows}</tbody>
 			</table></div>
 		`);
+		this._pack_update_create_btn();
 	}
 
-	_pack_open_dialog(manifest) {
-		const row = (this.pack_queue || []).find((m) => m.name === manifest) || {};
-		const next_seq = (Number(row.pkg_box_count || row.box_count || 0)) + 1;
-		const suggested_label = `${manifest}-B${String(next_seq).padStart(2, "0")}`;
+	_pack_update_create_btn() {
+		const $r = this.$root;
+		const n = $r.find(".lcc-pack-row-check:checked").length;
+		const $btn = $r.find(".lcc-pack-create-manifest-btn");
+		$btn.prop("disabled", n === 0);
+		$btn.html(`<i class="fa fa-plus"></i> ${__("Create Manifest")}${n ? ` (${n})` : ""}`);
+		const total = $r.find(".lcc-pack-row-check").length;
+		$r.find(".lcc-pack-select-all").prop("checked", total > 0 && n === total);
+	}
 
-		// Fetch remaining qty for a Max hint + client-side validation, but
-		// the packer still just enters one Packed Qty total — the server
-		// auto-splits that across remaining items (first-remaining-item
-		// -first) so the per-box print label still gets real item detail.
+	/* ── Create Manifest — from ticked rows in the Packed Order table ──
+	 * Groups the checked, fully Packed, unlinked Stock Entries into a
+	 * manifest — ticking here is also what advances them from Packed to
+	 * Ready For Pickup (see group_stock_entries_into_manifest). Source/
+	 * Destination Warehouse are NOT manually chosen — they're derived
+	 * server-side from whichever Stock Entries get ticked. Goes through
+	 * ch_erp15's group_stock_entries_into_manifest (loops the same
+	 * _ensure_transfer_manifest_for_stock_entry used everywhere else this
+	 * session), not ch_logistics' create_manifest — that one requires
+	 * docstatus 1, which these Stock Entries never reach (direct Material
+	 * Transfer submission is blocked; they stay Draft through their whole
+	 * custom_status lifecycle). Route is no longer auto-tagged on the
+	 * manifest — it's resolved on the CH Logistics Trip instead, once this
+	 * manifest is attached to one.
+	 */
+	_pack_create_manifest() {
+		const $r = this.$root;
+		const names = $r.find(".lcc-pack-row-check:checked").map((_, el) => $(el).data("name")).get();
+		if (!names.length) {
+			frappe.msgprint(__("Tick at least one Stock Entry."));
+			return;
+		}
+		// No exact-route pre-check here — a manifest can now carry a
+		// multi-leg/chained route (e.g. Annanagar->Ashok Nagar plus
+		// Ashok Nagar->Chennai Hub), which group_stock_entries_into_manifest
+		// resolves server-side via zone matching on the manifest's own
+		// Stops table. It still refuses (with a clear message) if the
+		// ticked entries genuinely don't connect.
 		frappe.call({
-			method: "ch_logistics.api.transfer_manifest_api.get_manifest_pack_items",
-			args: { manifest },
+			method: "ch_erp15.ch_erp15.custom.stock_entry.group_stock_entries_into_manifest",
+			args: { stock_entries: JSON.stringify(names) },
 			freeze: true,
 		}).then((r) => {
-			const available = (r.message || []).filter((it) => it.remaining_qty > 0);
-			if (!available.length) {
-				frappe.msgprint(__("Every item on this manifest has already been fully packed into a box."));
-				return;
-			}
-			const remaining_total = available.reduce((s, it) => s + it.remaining_qty, 0);
-			this._pack_open_qty_dialog(manifest, suggested_label, remaining_total);
+			const manifest_name = r.message;
+			// Submitting the manifest here (Draft → Packed at the manifest
+			// level, a separate status from the Stock Entry's own
+			// custom_status) is what used to require a second "Move to
+			// Logistics" click on a manifest-level table. Chaining it onto
+			// manifest creation means one action gets the shipment all the
+			// way into Operations → Unassigned Manifests, ready for driver
+			// assignment.
+			frappe.db.get_doc("CH Transfer Manifest", manifest_name).then((doc) => {
+				doc.status = "Packed";
+				return frappe.call({ method: "frappe.client.submit", args: { doc } });
+			}).then(() => {
+				frappe.show_alert({
+					message: __("Manifest {0} created with {1} Stock Entry(s) and moved to Operations.", [manifest_name, names.length]),
+					indicator: "green",
+				}, 6);
+				this._pack_load();
+			}).catch((err) => {
+				frappe.show_alert({
+					message: __("Manifest {0} created, but moving it to Operations failed: {1}", [manifest_name, err && err.message ? err.message : __("see log")]),
+					indicator: "orange",
+				}, 8);
+				this._pack_load();
+			});
 		});
-	}
-
-	_pack_open_qty_dialog(manifest, suggested_label, remaining_total) {
-		const d = new frappe.ui.Dialog({
-			title: __("Pack Box — {0}", [suggested_label]),
-			fields: [
-				{
-					fieldname: "summary_html",
-					fieldtype: "HTML",
-					options: `<div class="alert alert-info" style="padding:8px 12px;border-radius:6px;background:#d1ecf1;border:1px solid #bee5eb;font-size:13px">
-						<b>${__("Manifest")}:</b> ${frappe.utils.escape_html(manifest)} &middot;
-						<b>${__("Remaining")}:</b> ${remaining_total}
-					</div>`,
-				},
-				{
-					fieldname: "packed_qty", fieldtype: "Int", label: __("Packed Qty"), reqd: 1,
-					description: __("How many item units are physically in this box? Max: {0} (remaining on manifest).", [remaining_total]),
-				},
-				{ fieldname: "weight_kg", fieldtype: "Float", label: __("Weight (kg)") },
-				{ fieldname: "dimensions_cm", fieldtype: "Data", label: __("Dimensions (LxWxH cm)"),
-				  description: __("Optional — used for courier dimensional weight, e.g. 30x20x15") },
-				{ fieldname: "col_break", fieldtype: "Column Break" },
-				{ fieldname: "seal_number", fieldtype: "Data", label: __("Seal / Tamper Tag") },
-				{ fieldname: "packing_photo", fieldtype: "Attach Image", label: __("Packing Photo") },
-				{ fieldname: "notes", fieldtype: "Small Text", label: __("Notes") },
-			],
-			primary_action_label: __("Add Box"),
-			primary_action: (values) => {
-				if (!values.packed_qty || values.packed_qty <= 0) {
-					frappe.msgprint(__("Enter a packed quantity greater than zero."));
-					return;
-				}
-				// Client-side overpack guard for a clean UX. Server-side
-				// pack_box / _validate_package_items() is the source-of
-				// -truth guard.
-				if (values.packed_qty > remaining_total) {
-					frappe.msgprint({
-						title: __("Overpack Blocked"),
-						indicator: "red",
-						message: __("Cannot pack {0} units — only {1} remaining on {2}.",
-							[values.packed_qty, remaining_total, manifest]),
-					});
-					return;
-				}
-				frappe.call({
-					method: "ch_logistics.api.transfer_manifest_api.pack_box",
-					args: {
-						manifest,
-						packed_qty: values.packed_qty,
-						weight_kg: values.weight_kg,
-						dimensions_cm: values.dimensions_cm,
-						seal_number: values.seal_number,
-						packing_photo: values.packing_photo,
-						notes: values.notes,
-					},
-				}).then((r) => {
-					d.hide();
-					const m = r.message || {};
-					frappe.show_alert({
-						message: __("Box {0} packed ({1} units).", [m.package_label || suggested_label, values.packed_qty]),
-						indicator: "green",
-					}, 5);
-					this._pack_load();
-				});
-			},
-		});
-		d.show();
-	}
-
-	_pack_submit_manifest(manifest) {
-		frappe.confirm(
-			__("Submit manifest <b>{0}</b>? This marks it Packed and removes it from the pack queue.", [manifest]),
-			() => {
-				let target_trip = null;
-				frappe.db.get_doc("CH Transfer Manifest", manifest).then((doc) => {
-					// Set status to Packed so it moves into Operations unassigned manifests queue
-					doc.status = "Packed";
-					target_trip = doc.trip || null;
-					return frappe.call({
-						method: "frappe.client.submit",
-						args: { doc },
-					});
-				}).then(() => {
-					// Tell the user where the manifest landed so they can find
-					// it in Operations (unassigned queue vs. existing trip).
-					const msg = target_trip
-						? __("Manifest {0} marked Packed. Visible under trip {1} in Operations.", [manifest, target_trip])
-						: __("Manifest {0} marked Packed. Available in Operations → Unassigned Manifests.", [manifest]);
-					frappe.show_alert({ message: msg, indicator: "green" }, 7);
-					this._pack_load();
-				}).catch((err) => {
-					frappe.show_alert({ message: __("Submit failed: {0}", [err && err.message ? err.message : __("see log")]), indicator: "red" }, 7);
-				});
-			}
-		);
 	}
 
 	// ══════════════════════════════════════════════════════════════
@@ -1931,6 +1851,7 @@ class LogisticsCommandCenter {
 			fields: [
 				{
 					fieldtype: "Link", fieldname: "driver", label: __("Driver"), options: "Driver", reqd: 1,
+					get_query: () => ({ query: "ch_logistics.api.logistics_api.unassigned_drivers_query" }),
 					onchange: () => {
 						const driver = d.get_value("driver");
 						if (!driver || d.get_value("vehicle")) return;
@@ -2077,11 +1998,13 @@ class LogisticsCommandCenter {
 			fields: [
 				{ fieldtype: "Date",     fieldname: "trip_date",     label: __("Trip Date"),   reqd: 1, default: this.trip_date },
 				{ fieldtype: "Link",     fieldname: "company",       label: __("Company"),     options: "Company", reqd: 1, default: frappe.defaults.get_default("company") },
-				{ fieldtype: "Link",     fieldname: "route",         label: __("Route"),       options: "CH Route" },
 				{ fieldtype: "Select",   fieldname: "direction",     label: __("Direction"),   options: "Forward\nReverse\nMixed", default: "Forward" },
+				{ fieldtype: "Link",     fieldname: "route",         label: __("Route"),       options: "CH Route",
+					description: __("Optional — pre-populates stops from this route. Leave blank to auto-resolve from stops once they're added, or when manifests are attached.") },
 				{ fieldtype: "Column Break" },
 				{
 					fieldtype: "Link", fieldname: "driver", label: __("Driver"), options: "Driver",
+					get_query: () => ({ query: "ch_logistics.api.logistics_api.unassigned_drivers_query" }),
 					onchange: () => {
 						const driver = d.get_value("driver");
 						if (!driver || d.get_value("vehicle")) return;
@@ -2294,7 +2217,10 @@ class LogisticsCommandCenter {
 				{ fieldname: "company",       fieldtype: "Link",   label: __("Company"),   options: "Company", reqd: 1, default: frappe.defaults.get_user_default("Company") },
 				{ fieldname: "hub_warehouse", fieldtype: "Link",   label: __("Hub Warehouse"), options: "Warehouse" },
 				{ fieldname: "max_stops",     fieldtype: "Int",    label: __("Max Stops / Trip"), default: 20 },
-				{ fieldname: "driver",        fieldtype: "Link",   label: __("Driver (optional)"), options: "Driver" },
+				{
+					fieldname: "driver", fieldtype: "Link", label: __("Driver (optional)"), options: "Driver",
+					get_query: () => ({ query: "ch_logistics.api.logistics_api.unassigned_drivers_query" }),
+				},
 			],
 			primary_action_label: __("Preview"),
 			primary_action: (vals) => {

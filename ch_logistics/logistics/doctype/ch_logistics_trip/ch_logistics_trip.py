@@ -1,3 +1,5 @@
+from collections import Counter
+
 import frappe
 from frappe import _
 from frappe.model.document import Document
@@ -53,6 +55,7 @@ class CHLogisticsTrip(Document):
     def validate(self):
         self._validate_stops()
         self._validate_planned_times()
+        self._resolve_route()
         self._populate_hub_from_route()
         self._validate_actor_scope()
         self._validate_stop_proof_fields()
@@ -249,6 +252,57 @@ class CHLogisticsTrip(Document):
                 "Correct the trip window."
             ).format(self.planned_end, self.planned_start),
                 title=_("Invalid Trip Window"))
+
+    def _resolve_route(self):
+        """Auto-tag with the CH Route whose stops cover this trip's drop points.
+
+        Route used to be resolved on CH Transfer Manifest (destination-based)
+        and carried up to the trip by majority vote across its attached
+        manifests. Manifests no longer auto-tag a route at all, so this
+        resolves it directly from the trip's own stops instead, using the
+        same warehouse/zone matching the manifest used to do — matching each
+        Drop (or Pickup+Drop) stop against a curated CH Route, falling back
+        to an auto-managed zone route, then majority-voting across stops the
+        same way the old manifest-derivation did.
+
+        Self-healing: re-resolves whenever the doc is new, whenever the
+        stops table changed since the last save, or whenever route is
+        currently blank. Leaves an already-set route alone otherwise, so
+        dispatch's manual correction of an ambiguous auto-match survives
+        unrelated re-saves — including a driver's own save, since
+        _validate_actor_scope only lets dispatch change `stops` in the
+        first place, so an untouched stops table always means this is a
+        no-op for them.
+        """
+        if not self.meta.has_field("route"):
+            return
+        stops_changed = self.is_new()
+        if not stops_changed:
+            before = self.get_doc_before_save()
+            before_stops = [(s.get("warehouse"), s.get("store")) for s in (before.get("stops") or [])] if before else []
+            stops_changed = [(s.warehouse, s.store) for s in (self.stops or [])] != before_stops
+        if self.route and not stops_changed:
+            return
+        from ch_erp15.ch_erp15.doctype.ch_route.ch_route import (
+            get_or_create_zone_route,
+            get_route_for_destination,
+        )
+        votes = []
+        for stop in self.stops or []:
+            if stop.stop_type not in ("Drop", "Pickup+Drop") or not stop.warehouse:
+                continue
+            matched = get_route_for_destination(
+                self.company, stop.warehouse, stop.store
+            ) or get_or_create_zone_route(
+                self.company, stop.warehouse, stop.store, self.hub_warehouse
+            )
+            if matched:
+                votes.append(matched)
+        if not votes:
+            return
+        counts = Counter(votes)
+        top_count = max(counts.values())
+        self.route = next(r for r in votes if counts[r] == top_count)
 
     def _populate_hub_from_route(self):
         if self.route and not self.hub_warehouse:

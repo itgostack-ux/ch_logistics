@@ -381,6 +381,23 @@ def reject_manifest(manifest, rejection_reason, rejection_photo, rejection_photo
 
 
 @frappe.whitelist(methods=["POST"])
+def reject_manifest_leg(manifest, stock_entry, rejection_reason, rejection_photo,
+                        rejection_photo_2, rejection_notes=None) -> dict:
+    """Compatibility wrapper (naming mirrors ``reject_manifest`` above) for
+    rejecting ONE Stock Entry leg inside a multi-entry manifest."""
+    from ch_logistics.api.rejection_api import driver_reject_manifest_row
+
+    return driver_reject_manifest_row(
+        manifest=manifest,
+        stock_entry=stock_entry,
+        rejection_reason=rejection_reason,
+        proof_image_1=rejection_photo,
+        proof_image_2=rejection_photo_2,
+        remarks=rejection_notes,
+    )
+
+
+@frappe.whitelist(methods=["POST"])
 def bulk_reject_other_assignments(accepted_manifest, rejection_reason,
                                   rejection_photo, rejection_photo_2,
                                   rejection_notes=None) -> dict:
@@ -560,6 +577,135 @@ def complete_delivery(manifest, delivery_photo, receiver_name, otp=None,
         "status": doc.status,
         "delivery_datetime": str(doc.delivery_datetime),
         "otp_log": doc.get("delivery_otp_log"),
+    }
+
+
+@frappe.whitelist(methods=["POST"])
+@rate_limit(
+    limit=lambda: role_registry.get_int_setting("delivery_otp_attempts_per_minute", 10),
+    seconds=60,
+    methods=["POST"],
+)
+def driver_complete_delivery_row(manifest, stock_entry, delivery_photo, receiver_name,
+                                 scanned_qr, otp=None, lat=None, lng=None,
+                                 gps_accuracy_m=None, geofence_override_reason=None) -> dict:
+    """Driver completes delivery of ONE Stock Entry leg inside a multi-entry
+    manifest — the delivery-side mirror of ``driver_accept_manifest_row``.
+
+    A manifest can carry several unrelated Stock Entries at DIFFERENT
+    destination warehouses, so each leg's own QR/GPS/photo/receiver is
+    captured and validated against ITS OWN to_warehouse
+    (``mf._validate_geo_for``), not the manifest header's single
+    destination_warehouse. OTP is requested fresh per leg by the client
+    (``request_delivery_otp``, unchanged) since verifying an OTP consumes
+    it — one code cannot validate two legs. Once every leg has captured its
+    own delivery evidence, this fires the manifest's real delivery-complete
+    transition (``_apply_delivery_complete_transition`` — the same tail
+    ``complete_delivery`` uses), flipping it to Delivered exactly as if a
+    single whole-manifest Complete Delivery had just happened.
+    """
+    _require_stage_role("complete_delivery")
+    mf = frappe.get_doc("CH Transfer Manifest", manifest)
+    mf.check_permission("write")
+    from ch_logistics.api.driver_resolver import assert_manifest_driver_access
+
+    assert_manifest_driver_access(mf, scope_side="destination")
+    from ch_logistics.api import driver_status as ds
+
+    ds.assert_not_on_break(mf.driver)
+    _token, _minted = mf.ensure_secure_qr_token()
+    if _minted:
+        frappe.throw(
+            _("Manifest {0} had no scan token, so the label on the carton cannot "
+              "be valid. A token has now been issued — reprint the box label and "
+              "scan the new QR to complete delivery.").format(manifest),
+            title=_("Label Out Of Date"),
+        )
+
+    from ch_logistics.logistics.doctype.ch_logistics_otp_log.ch_logistics_otp_log import (
+        DeliveryOTPError,
+        verify_manifest_otp,
+    )
+
+    lock_key = f"manifest_status_{frappe.scrub(manifest)}"
+    if not frappe.db.sql("SELECT GET_LOCK(%s, 10)", (lock_key,))[0][0]:
+        frappe.throw(_("Manifest {0} is being updated by another user. Please refresh and try again.").format(manifest))
+    try:
+        if mf.status != "In Transit":
+            frappe.throw(_("Manifest must be In Transit to deliver a shipment (current status: {0}).").format(mf.status))
+
+        row = next((r for r in mf.transfers if r.stock_entry == stock_entry), None)
+        if not row:
+            frappe.throw(_("Stock Entry {0} is not on manifest {1}.").format(stock_entry, manifest))
+        if row.delivery_captured_at:
+            frappe.throw(_("This shipment is already delivered."))
+
+        mf._validate_delivery_qr(scanned_qr)
+        if not delivery_photo:
+            frappe.throw(_("Delivery photo is mandatory."), title=_("Ch Transfer Manifest Error"))
+        if not receiver_name:
+            frappe.throw(_("Receiver name is mandatory."), title=_("Ch Transfer Manifest Error"))
+        lat_f, lng_f = mf._validate_geo_for(
+            row.to_warehouse, row.to_warehouse, lat, lng, kind="delivery",
+            accuracy_m=gps_accuracy_m, override_reason=geofence_override_reason,
+        )
+
+        if mf.delivery_otp or mf._delivery_otp_required():
+            verification = verify_manifest_otp(mf, otp)
+            if not verification.get("valid"):
+                raise DeliveryOTPError(verification.get("message") or _("Invalid delivery OTP."))
+            mf.delivery_otp_verified = 1
+            mf.delivery_otp = None
+
+        now = frappe.utils.now_datetime()
+        frappe.db.set_value(
+            "CH Transfer Manifest Item", row.name,
+            {
+                "delivery_photo": delivery_photo,
+                "delivery_scanned_qr": scanned_qr,
+                "delivery_receiver_name": receiver_name,
+                "delivery_lat": lat_f,
+                "delivery_lng": lng_f,
+                "delivery_gps_accuracy_m": gps_accuracy_m,
+                "delivery_captured_at": now,
+            },
+            update_modified=False,
+        )
+        row.delivery_captured_at = now
+        mf.add_comment("Comment", _("Stock Entry {0} delivered (evidence captured) by driver {1}.").format(stock_entry, frappe.session.user))
+
+        all_delivered = all(r.delivery_captured_at for r in mf.transfers)
+        fully_delivered_now = False
+        if all_delivered:
+            fully_delivered_now = True
+            # This leg's own capture stands in for the manifest-wide arrival
+            # ping and delivery evidence — every leg has now individually
+            # proven delivery, so the manifest as a whole genuinely is
+            # delivered. Fires the exact same tail complete_delivery uses.
+            mf.arrival_datetime = now
+            mf.arrival_lat = lat_f
+            mf.arrival_lng = lng_f
+            mf._apply_delivery_complete_transition(delivery_photo, lat_f, lng_f, receiver_name)
+    except DeliveryOTPError as exc:
+        # Returning a normal response is deliberate: Frappe rolls the whole
+        # request back for an uncaught exception, which would make failed
+        # OTP attempts disappear from the audit trail (same as complete_delivery).
+        return {
+            "ok": False,
+            "otp_valid": False,
+            "manifest": manifest,
+            "stock_entry": stock_entry,
+            "message": str(exc),
+            "attempts": cint(mf.get("delivery_otp_attempts")),
+        }
+    finally:
+        frappe.db.sql("SELECT RELEASE_LOCK(%s)", (lock_key,))
+
+    return {
+        "ok": True,
+        "manifest": mf.name,
+        "stock_entry": stock_entry,
+        "delivery_fully_completed": fully_delivered_now,
     }
 
 
@@ -1525,12 +1671,39 @@ def get_driver_assignments() -> list:
             fields=["name", "address"],
         )
     }
+    leg_rows = frappe.get_all(
+        "CH Transfer Manifest Item",
+        filters={"parent": ["in", [m["name"] for m in manifests] or ["__none__"]]},
+        fields=["parent", "stock_entry", "from_warehouse", "to_warehouse",
+                 "item_count", "total_qty", "driver_accepted_at"],
+        order_by="parent asc, idx asc",
+    )
+    legs_by_manifest: dict[str, list] = {}
+    for row in leg_rows:
+        legs_by_manifest.setdefault(row["parent"], []).append(row)
+
+    # Forward/Reverse — the manifest's own Trip already carries this (shown
+    # elsewhere as a badge); the board tab has no trip-detail object to read
+    # it from client-side the way the trip-detail cards do, so it rides
+    # along on each manifest row instead.
+    trip_names = {m["trip"] for m in manifests if m.get("trip")}
+    trip_direction = {
+        row.name: row.direction
+        for row in frappe.get_all(
+            "CH Logistics Trip",
+            filters={"name": ["in", list(trip_names) or ["__none__"]]},
+            fields=["name", "direction"],
+        )
+    }
+
     for m in manifests:
         m["bucket"] = bucket_by_status.get(m.get("status"), "to_pickup")
         if m.get("source_store"):
             m["source_address"] = addresses.get(m["source_store"]) or ""
         if m.get("destination_store"):
             m["destination_address"] = addresses.get(m["destination_store"]) or ""
+        m["transfers"] = legs_by_manifest.get(m["name"], [])
+        m["trip_direction"] = trip_direction.get(m.get("trip")) or "Forward"
 
     return manifests
 

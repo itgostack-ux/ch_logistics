@@ -139,12 +139,25 @@ def _seed_stops_from_manifests(trip_doc, manifests) -> None:
     Reverse manifests: one Pickup stop per source, hub = common destination.
     Mirrors club_transfers_into_trip so the Control Tower "Create & Attach"
     dialog (no route picked) keeps working under the warehouse-match gate.
+
+    Also adds a stop for each manifest's HUB side, not just the target
+    side — previously only the non-hub side got a stop row, so
+    trip.hub_warehouse was set as a bare scalar field but never given its
+    own stop. stop_roles.annotate() (which the driver app uses to resolve
+    pickup_stop_sequence/drop_stop_sequence) matches purely by stop
+    location, so with no stop at the hub, a manifest's pickup (or, for
+    Reverse, its drop) could never resolve — confirmed live on
+    TRIP-2026-00032, which shipped with 3 Drop stops and zero Pickup
+    stops. One stop per distinct hub location actually present among the
+    manifests, not a single assumed hub — manifests attached together
+    aren't guaranteed to share one physical origin.
     """
     if not manifests:
         return
     seq = 0
     seen_targets = set()
     hub_candidates = []
+    hub_sides = []  # (store, warehouse, stop_type) per manifest's hub side
     for manifest_name in manifests:
         target = _manifest_target_for_trip(trip_doc, manifest_name)
         mf = frappe.db.get_value(
@@ -154,9 +167,11 @@ def _seed_stops_from_manifests(trip_doc, manifests) -> None:
         ) or {}
         # The side NOT served by a stop is the hub side.
         if target.get("stop_type") == "Pickup":
-            hub_candidates.append(mf.get("destination_warehouse"))
+            hub_store, hub_wh, hub_stop_type = mf.get("destination_store"), mf.get("destination_warehouse"), "Drop"
         else:
-            hub_candidates.append(mf.get("source_warehouse"))
+            hub_store, hub_wh, hub_stop_type = mf.get("source_store"), mf.get("source_warehouse"), "Pickup"
+        hub_candidates.append(hub_wh)
+        hub_sides.append((hub_store, hub_wh, hub_stop_type))
 
         target_store = target.get("store")
         target_wh = target.get("warehouse")
@@ -172,6 +187,22 @@ def _seed_stops_from_manifests(trip_doc, manifests) -> None:
             "warehouse": target_wh,
             "store": target_store,
             "stop_type": target.get("stop_type") or "Drop",
+            "status": "Pending",
+        })
+
+    for hub_store, hub_wh, hub_stop_type in hub_sides:
+        if not hub_wh and hub_store:
+            hub_wh = frappe.db.get_value("CH Store", hub_store, "warehouse")
+        key = hub_store or hub_wh
+        if not key or key in seen_targets:
+            continue
+        seen_targets.add(key)
+        seq += 1
+        trip_doc.append("stops", {
+            "sequence": seq,
+            "warehouse": hub_wh,
+            "store": hub_store,
+            "stop_type": hub_stop_type,
             "status": "Pending",
         })
 
@@ -390,6 +421,51 @@ def _ensure_single_active_trip_for_driver(driver: str, target_trip: str | None =
         )
 
 
+@frappe.whitelist()
+@frappe.validate_and_sanitize_search_inputs
+def unassigned_drivers_query(doctype, txt, searchfield, start, page_len, filters):
+    """Link-field query for the New Trip dialog's Driver picker: only
+    drivers who are free right now — excludes anyone with another CH
+    Logistics Trip in Assigned or Started status. Same "Active" definition
+    as _ensure_single_active_trip_for_driver, so a name that shows up here
+    will always pass that check too. Also excludes drivers not currently
+    Active (Suspended/Left).
+    """
+    role_registry.require("ops_control", _("search logistics drivers"))
+    if doctype != "Driver":
+        frappe.throw(_("This query only supports Driver links."))
+    txt = (txt or "").strip()
+    start = max(cint(start), 0)
+    page_len = min(max(cint(page_len) or 20, 1), 100)
+
+    busy_drivers = frappe.get_all(
+        "CH Logistics Trip",
+        filters={"status": ["in", ("Assigned", "Started")]},
+        pluck="driver",
+    )
+
+    driver_filters = {"status": "Active"}
+    if busy_drivers:
+        driver_filters["name"] = ["not in", busy_drivers]
+    or_filters = None
+    if txt:
+        or_filters = {
+            "name": ("like", f"%{txt}%"),
+            "full_name": ("like", f"%{txt}%"),
+        }
+
+    rows = frappe.get_list(
+        "Driver",
+        filters=driver_filters,
+        or_filters=or_filters,
+        fields=["name", "full_name"],
+        start=start,
+        page_length=page_len,
+        order_by="full_name",
+    )
+    return [(r.name, r.full_name) for r in rows]
+
+
 @frappe.whitelist(methods=["POST"])
 def trip_unassign(trip):
     _require_ops()
@@ -504,6 +580,118 @@ def driver_accept_manifest(trip, manifest, override_empty_stops=0):
         trip_started = True
 
     return {"manifest": mf.name, "trip": doc.name, "trip_status": doc.status, "trip_started": trip_started}
+
+
+@frappe.whitelist(methods=["POST"])
+def driver_accept_manifest_row(trip, manifest, stock_entry, pickup_photo, scanned_qr,
+                               lat, lng, gps_accuracy_m=None, geofence_override_reason=None,
+                               override_empty_stops=0):
+    """Driver acceptance of ONE Stock Entry leg inside a multi-entry manifest —
+    now WITH the same pickup evidence capture (QR scan, GPS, photo) that used
+    to only happen later at the separate whole-manifest "Start Pickup" step,
+    per explicit request: accepting a shipment IS the pickup for that leg.
+
+    A manifest can carry several unrelated Stock Entries (chained legs
+    grouped by zone) at DIFFERENT physical warehouses, so each leg's own
+    QR/GPS/photo is captured and validated against ITS OWN from_warehouse
+    (``mf._validate_geo_for``), not the manifest header's single
+    source_warehouse. The manifest header's own ``driver_accepted_at`` stays
+    a derived rollup — set once every row has individually captured its
+    pickup evidence — so every existing consumer (trip auto-start, the
+    pickup-candidate gather filter, driver assignment listings) keeps
+    working unchanged; they still see one header timestamp. Once every leg
+    is captured, this also fires the manifest's real pickup-complete
+    transition (``_apply_pickup_in_transit_transition`` — the same tail
+    ``start_pickup`` uses), flipping it to In Transit exactly as if a single
+    whole-manifest Start Pickup had just happened.
+    """
+    doc = get_locked_trip(trip)
+    if doc.status not in ("Assigned", "Started"):
+        frappe.throw(_("Trip must be Assigned or Started to accept a shipment."))
+    from ch_logistics.api.driver_resolver import assert_trip_driver_access
+
+    assert_trip_driver_access(doc)
+    ds.assert_not_on_break(doc.driver)
+
+    lock_key = f"manifest_status_{frappe.scrub(manifest)}"
+    if not frappe.db.sql("SELECT GET_LOCK(%s, 10)", (lock_key,))[0][0]:
+        frappe.throw(_("Manifest {0} is being updated by another user. Please refresh and try again.").format(manifest))
+    try:
+        mf = frappe.get_doc("CH Transfer Manifest", manifest)
+        if mf.trip != trip:
+            frappe.throw(_("Manifest {0} is not on this trip.").format(manifest))
+        if mf.status != "Assigned":
+            frappe.throw(_("Manifest must be Assigned to accept a shipment (current status: {0}).").format(mf.status))
+
+        row = next((r for r in mf.transfers if r.stock_entry == stock_entry), None)
+        if not row:
+            frappe.throw(_("Stock Entry {0} is not on manifest {1}.").format(stock_entry, manifest))
+        if row.driver_accepted_at:
+            frappe.throw(_("This shipment is already accepted."))
+
+        # Same evidence requirements as the whole-manifest Start Pickup, just
+        # scoped to this one leg's own pickup location.
+        mf._validate_pickup_qr(scanned_qr)
+        if not pickup_photo:
+            frappe.throw(_("Pickup photo is mandatory."), title=_("Ch Transfer Manifest Error"))
+        lat_f, lng_f = mf._validate_geo_for(
+            row.from_warehouse, row.from_warehouse, lat, lng, kind="pickup",
+            accuracy_m=gps_accuracy_m, override_reason=geofence_override_reason,
+        )
+
+        now = frappe.utils.now_datetime()
+        frappe.db.set_value(
+            "CH Transfer Manifest Item", row.name,
+            {
+                "driver_accepted_at": now,
+                "pickup_photo": pickup_photo,
+                "pickup_scanned_qr": scanned_qr,
+                "pickup_lat": lat_f,
+                "pickup_lng": lng_f,
+                "pickup_gps_accuracy_m": gps_accuracy_m,
+                "pickup_captured_at": now,
+            },
+            update_modified=False,
+        )
+        row.driver_accepted_at = now
+        mf.add_comment("Comment", _("Stock Entry {0} accepted (pickup captured) by driver {1}.").format(stock_entry, frappe.session.user))
+
+        all_accepted = all(r.driver_accepted_at for r in mf.transfers)
+        header_accepted_now = False
+        trip_started = False
+        if all_accepted and not mf.driver_accepted_at:
+            header_accepted_now = True
+            if doc.status == "Assigned":
+                doc.add_comment(
+                    "Comment",
+                    _("Trip auto-started: first manifest ({0}) fully accepted by {1}.").format(manifest, frappe.session.user),
+                )
+                doc.flags.ignore_empty_stops = cint(override_empty_stops)
+                doc.mark_started()
+                doc.save()
+                if doc.driver:
+                    _set_driver_availability(doc.driver, "In Transit", doc.name)
+                trip_started = True
+            # This leg's own capture stands in for the manifest-wide one —
+            # every leg has now individually proven pickup, so the manifest
+            # as a whole is genuinely picked up. Fires the exact same tail
+            # start_pickup uses (status -> In Transit, entries sync, trip
+            # stop cascade, destination notify) -- which calls self.save(),
+            # so setting driver_accepted_at here (rather than a separate
+            # db.set_value) persists it in that same save.
+            mf.driver_accepted_at = now
+            mf._apply_pickup_in_transit_transition(pickup_photo, lat_f, lng_f)
+
+        return {
+            "manifest": mf.name,
+            "stock_entry": stock_entry,
+            "trip": doc.name,
+            "trip_status": doc.status,
+            "trip_started": trip_started,
+            "manifest_fully_accepted": header_accepted_now or bool(mf.driver_accepted_at),
+        }
+    finally:
+        frappe.db.sql("SELECT RELEASE_LOCK(%s)", (lock_key,))
 
 
 @frappe.whitelist(methods=["POST"])
@@ -1068,6 +1256,17 @@ def _attach_manifests(trip, manifests):
         frappe.throw(_("Cannot attach manifests to a {0} trip").format(trip_doc.status))
     if trip_doc.status == "Started":
         _require_ops()
+
+    # A trip created without a route and without manifests pre-selected
+    # (the New Trip dialog no longer asks for a manual Route — see
+    # trip_create) has no hub_warehouse and no stops yet. Previously that
+    # meant _validate_manifest_attachable's warehouse-match gate always
+    # refused the very first attachment with "Trip Has No Route", since
+    # nothing else ever seeded stops for this path. Mirror what trip_create
+    # already does when manifests are supplied at creation time: seed the
+    # trip's hub + stops from whichever manifests are being attached now.
+    if not (trip_doc.get("stops") or []) and not trip_doc.get("hub_warehouse"):
+        _seed_stops_from_manifests(trip_doc, manifests)
 
     dynamically_inserted = []
     for manifest_name in manifests:
@@ -1671,6 +1870,22 @@ def get_trip_detail(trip):
         manifests = []
     elif len(manifests) > role_registry.get_int_setting("max_manifests_per_trip", 500):
         frappe.throw(_("Trip detail exceeds the configured manifest limit."))
+
+    # Per-Stock-Entry legs, so the driver app can render/accept/reject each
+    # one individually instead of the whole manifest as a single unit.
+    if manifests:
+        leg_rows = frappe.get_all(
+            "CH Transfer Manifest Item",
+            filters={"parent": ["in", [m["name"] for m in manifests]]},
+            fields=["parent", "stock_entry", "from_warehouse", "to_warehouse",
+                     "item_count", "total_qty", "driver_accepted_at"],
+            order_by="parent asc, idx asc",
+        )
+        legs_by_manifest: dict[str, list] = {}
+        for row in leg_rows:
+            legs_by_manifest.setdefault(row["parent"], []).append(row)
+        for m in manifests:
+            m["transfers"] = legs_by_manifest.get(m["name"], [])
 
     # Resolve, per manifest, WHICH stop serves its pickup (source) and which
     # its delivery (destination). ``stop_sequence`` alone points at only one
@@ -2676,6 +2891,17 @@ def auto_plan_trips(trip_date=None, direction="Forward", hub_warehouse=None,
             return (m.get("source_store") or "", m.get("source_warehouse") or "", "Pickup")
         return (m.get("destination_store") or "", m.get("destination_warehouse") or "", "Drop")
 
+    def _hub_key(m):
+        """(store, warehouse, role) for the HUB side of this manifest — the
+        side opposite _stop_key. Every manifest needs a stop at BOTH ends or
+        the driver app can never resolve one of pickup_stop_sequence /
+        drop_stop_sequence for it (stop_roles.annotate() matches purely by
+        stop location, so a side with no stop row at all never resolves)."""
+        eff = (m.get("direction") if direction == "Mixed" else direction) or "Forward"
+        if eff == "Reverse":
+            return (m.get("destination_store") or "", m.get("destination_warehouse") or "", "Drop")
+        return (m.get("source_store") or "", m.get("source_warehouse") or "", "Pickup")
+
     def _stop_type(roles):
         if "Pickup" in roles and "Drop" in roles:
             return "Pickup+Drop"
@@ -2710,6 +2936,44 @@ def auto_plan_trips(trip_date=None, direction="Forward", hub_warehouse=None,
             bucket = {"stops": [], "manifests": []}
     if bucket["stops"]:
         proposals.append(bucket)
+
+    # Every manifest also needs a stop at its HUB side (source for Forward,
+    # destination for Reverse) — the bucketing above only ever added the
+    # target side. Without this, trip.hub_warehouse gets set as a bare
+    # scalar field but never gains its own stop row, so the driver app can
+    # never resolve a pickup (or, for Reverse, a drop) for any manifest on
+    # the trip (confirmed live: TRIP-2026-00032 shipped with 3 Drop stops
+    # and zero Pickup stops, blocking every driver accept on it). Added per
+    # proposal, one stop per distinct hub location actually used by that
+    # proposal's own manifests — not collapsed into a single assumed hub,
+    # since manifests on one trip aren't guaranteed to share one physical
+    # origin. Inserted first so it also fixes route.hub_warehouse below,
+    # which falls back to p["stops"][0] when no hub_warehouse was given.
+    mf_lookup = {m["name"]: m for m in mfs}
+    for p in proposals:
+        seen = {(s["store"] or "", s["warehouse"]) for s in p["stops"]}
+        hub_roles, hub_order = {}, []
+        for name in p["manifests"]:
+            m = mf_lookup.get(name)
+            if not m:
+                continue
+            h_store, h_wh, h_role = _hub_key(m)
+            if not h_wh:
+                continue
+            key = (h_store or "", h_wh)
+            if key in seen:
+                continue
+            if key not in hub_roles:
+                hub_order.append(key)
+            hub_roles.setdefault(key, set()).add(h_role)
+        for key in hub_order:
+            h_store, h_wh = key
+            p["stops"].insert(0, {
+                "store": h_store or None,
+                "warehouse": h_wh,
+                "stop_type": _stop_type(hub_roles[key]),
+                "manifest_count": 0,
+            })
 
     if not cint(commit):
         return {"proposals": proposals, "created": []}
