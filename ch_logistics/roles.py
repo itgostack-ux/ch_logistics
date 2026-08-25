@@ -4,15 +4,17 @@ Single source of truth for every role-based gate in the logistics app.
 Nothing outside this module should hardcode a role name — API modules ask
 ``user_has("<function_key>")`` / ``require("<function_key>")`` instead.
 
-Resolution order per function key:
+Resolution per function key — **the DB is the only source**:
 
-1. **CH Logistics Settings → Role Matrix** child rows (``CH Logistics Role
-   Rule``): when at least one row exists for a key, those rows ARE the
-   allowed role set for that key. Admins can therefore re-map any gate
-   without a code change.
-2. **DEFAULT_ROLE_MATRIX** below: the shipped defaults, used when the
-   settings table has no rows for that key (fresh sites, or keys the admin
-   never customised).
+**CH Logistics Settings → Role Matrix** child rows (``CH Logistics Role Rule``)
+ARE the allowed role set. Admins can re-map any gate without a code change, and
+an empty set means DENY.
+
+``DEFAULT_ROLE_MATRIX`` below is the **seed source and key registry only**.
+``setup._provision_access_control()`` copies it into the settings table once per
+function key (never overwriting existing rows), so fresh sites come up with the
+shipped policy. It is deliberately not consulted at runtime — a fallback would
+silently resurrect a role an administrator had removed.
 
 ``System Manager`` and ``Administrator`` always bypass — same convention as
 ``ch_erp15.scope`` (the central store-scope guard).
@@ -48,10 +50,13 @@ from frappe import _
 from frappe.utils import cint
 
 
-# Roles that bypass every logistics gate (matches ch_erp15.scope._BYPASS_ROLES).
-# Shipped defaults — exactly the pre-centralisation behaviour of each call
-# site. "Logistic Head" (legacy misspelling) is retained as an accepted
-# alias so any site that hand-created the misspelt role keeps working.
+# SEED SOURCE ONLY — not a runtime fallback.  setup._provision_access_control()
+# copies these into CH Logistics Settings -> Role Matrix once per function key
+# (never overwriting existing rows), and get_roles_for() then reads the DB
+# exclusively, so removing a role in the UI actually removes it.  This dict also
+# defines the set of valid function keys.  "Logistic Head" (legacy misspelling)
+# is retained as an accepted alias so any site that hand-created the misspelt
+# role keeps working; it is skipped at seed time when the Role does not exist.
 DEFAULT_ROLE_MATRIX: dict[str, set[str]] = {
     "create_manifest": {"Delivery Manager", "Stock Manager", "Operations Manager"},
     # Outward stages — source-store dispatch lane
@@ -108,20 +113,18 @@ def _settings_matrix() -> dict[str, set[str]]:
 
 
 def get_roles_for(function_key: str) -> set[str]:
-    """Allowed role set for a function key.
+    """Allowed role set for a function key, from CH Logistics Settings.
 
-    Resolution order:
-
-    1. ``CH Logistics Settings -> Role Matrix`` child rows when configured.
-    2. ``DEFAULT_ROLE_MATRIX`` below otherwise.
+    DB is law: the Role Matrix child rows are the only source. An empty set
+    means DENY. ``DEFAULT_ROLE_MATRIX`` is the seed source (applied once per
+    key by ``setup._provision_access_control``) and the registry of valid
+    function keys -- it is deliberately NOT a runtime fallback, because falling
+    back would silently resurrect a shipped role that an administrator removed.
     """
     if function_key not in DEFAULT_ROLE_MATRIX:
         return set()
 
-    configured = _settings_matrix().get(function_key)
-    if configured:
-        return configured
-    return set(DEFAULT_ROLE_MATRIX.get(function_key, set()))
+    return set(_settings_matrix().get(function_key) or ())
 
 
 def get_int_setting(fieldname: str, default: int, minimum: int = 1) -> int:

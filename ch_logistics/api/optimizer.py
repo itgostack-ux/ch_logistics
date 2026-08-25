@@ -510,7 +510,7 @@ def resequence_trip(trip: str) -> dict:
     origin = origin or _hub_coords(doc) or coords[next(iter(coords))]
 
     before = _route_len([s for s in movable if s.name in coords], coords, origin)
-    ordered, _ = _sequence(
+    ordered, _unused = _sequence(
         list(movable), coords, origin, max_passes=_optimizer_limits(len(movable))
     )
 
