@@ -1,6 +1,11 @@
 frappe.query_reports["Store Transfer Register"] = {
 	filters: [
-		{ fieldname: "store", label: __("Store"), fieldtype: "Link", options: "CH Store", reqd: 0 },
+		{ fieldname: "store", label: __("Store"), fieldtype: "Link", options: "CH Store", reqd: 0,
+			get_query: () => {
+				const company = frappe.query_report.get_filter_value("company");
+				return { filters: company ? { company } : {} };
+			},
+		},
 		{ fieldname: "lens", label: __("View"), fieldtype: "Select",
 		  options: ["Both", "Inbound", "Outbound"].join("\n"), default: "Both" },
 		{ fieldname: "from_date", label: __("From Date"), fieldtype: "Date",
