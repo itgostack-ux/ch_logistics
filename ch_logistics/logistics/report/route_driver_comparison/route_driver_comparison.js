@@ -8,7 +8,12 @@ frappe.query_reports["Route Driver Comparison"] = {
 		  default: frappe.datetime.get_today() },
 		{ fieldname: "route", label: __("Route"), fieldtype: "Link", options: "CH Route" },
 		{ fieldname: "driver", label: __("Driver"), fieldtype: "Link", options: "Driver" },
-		{ fieldname: "hub_warehouse", label: __("Hub Warehouse"), fieldtype: "Link", options: "Warehouse" },
+		{ fieldname: "hub_warehouse", label: __("Hub Warehouse"), fieldtype: "Link", options: "Warehouse",
+			get_query: () => {
+				const company = frappe.query_report.get_filter_value("company");
+				return { filters: company ? { company } : {} };
+			},
+		},
 		{ fieldname: "include_unassigned_route", label: __("Include Unassigned Route"),
 		  fieldtype: "Check", default: 0,
 		  description: __("Show trips that have no CH Route set — useful during route-master seeding.") },

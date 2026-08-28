@@ -6,7 +6,17 @@ frappe.query_reports["Freight and Delivery Cost"] = {
 		  default: frappe.datetime.add_months(frappe.datetime.get_today(), -1) },
 		{ fieldname: "to_date", label: __("To Date"), fieldtype: "Date",
 		  default: frappe.datetime.get_today() },
-		{ fieldname: "source_store", label: __("Source Store"), fieldtype: "Link", options: "CH Store" },
-		{ fieldname: "destination_store", label: __("Destination Store"), fieldtype: "Link", options: "CH Store" },
+		{ fieldname: "source_store", label: __("Source Store"), fieldtype: "Link", options: "CH Store",
+			get_query: () => {
+				const company = frappe.query_report.get_filter_value("company");
+				return { filters: company ? { company } : {} };
+			},
+		},
+		{ fieldname: "destination_store", label: __("Destination Store"), fieldtype: "Link", options: "CH Store",
+			get_query: () => {
+				const company = frappe.query_report.get_filter_value("company");
+				return { filters: company ? { company } : {} };
+			},
+		},
 	],
 };

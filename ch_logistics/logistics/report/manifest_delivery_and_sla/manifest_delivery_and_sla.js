@@ -10,8 +10,18 @@ frappe.query_reports["Manifest Delivery and SLA"] = {
 		  options: ["", "Draft", "Packed", "Assigned", "Pickup Started", "Rejected",
 			"In Transit", "Delivered", "Partially Received", "Received", "Closed",
 			"Cancelled", "Returned"].join("\n") },
-		{ fieldname: "destination_store", label: __("Destination Store"), fieldtype: "Link", options: "CH Store" },
-		{ fieldname: "source_store", label: __("Source Store"), fieldtype: "Link", options: "CH Store" },
+		{ fieldname: "destination_store", label: __("Destination Store"), fieldtype: "Link", options: "CH Store",
+			get_query: () => {
+				const company = frappe.query_report.get_filter_value("company");
+				return { filters: company ? { company } : {} };
+			},
+		},
+		{ fieldname: "source_store", label: __("Source Store"), fieldtype: "Link", options: "CH Store",
+			get_query: () => {
+				const company = frappe.query_report.get_filter_value("company");
+				return { filters: company ? { company } : {} };
+			},
+		},
 		{ fieldname: "driver", label: __("Driver"), fieldtype: "Link", options: "Driver" },
 		{ fieldname: "overdue_only", label: __("Overdue Only"), fieldtype: "Check" },
 	],
