@@ -631,14 +631,22 @@ def driver_complete_delivery_row(manifest, stock_entry, delivery_photo, receiver
     if not frappe.db.sql("SELECT GET_LOCK(%s, 10)", (lock_key,))[0][0]:
         frappe.throw(_("Manifest {0} is being updated by another user. Please refresh and try again.").format(manifest))
     try:
-        if mf.status != "In Transit":
-            frappe.throw(_("Manifest must be In Transit to deliver a shipment (current status: {0}).").format(mf.status))
-
         row = next((r for r in mf.transfers if r.stock_entry == stock_entry), None)
         if not row:
             frappe.throw(_("Stock Entry {0} is not on manifest {1}.").format(stock_entry, manifest))
         if row.delivery_captured_at:
             frappe.throw(_("This shipment is already delivered."))
+        # Pickup and delivery are both per-leg — a shipment can be delivered
+        # as soon as ITS OWN pickup is captured, independent of sibling
+        # Stock Entries on the same manifest (they may still be sitting
+        # unaccepted at the source). The old gate required the whole
+        # manifest to have rolled up to "In Transit" first (i.e. every leg
+        # picked up), which blocked delivering an already-picked-up shipment
+        # just because a sibling hadn't been accepted yet.
+        if not row.driver_accepted_at:
+            frappe.throw(_("This shipment must be picked up (accepted) before it can be delivered."))
+        if mf.status not in ("Assigned", "In Transit"):
+            frappe.throw(_("Manifest must be Assigned or In Transit to deliver a shipment (current status: {0}).").format(mf.status))
 
         mf._validate_delivery_qr(scanned_qr)
         if not delivery_photo:
@@ -1675,7 +1683,7 @@ def get_driver_assignments() -> list:
         "CH Transfer Manifest Item",
         filters={"parent": ["in", [m["name"] for m in manifests] or ["__none__"]]},
         fields=["parent", "stock_entry", "from_warehouse", "to_warehouse",
-                 "item_count", "total_qty", "driver_accepted_at"],
+                 "item_count", "total_qty", "driver_accepted_at", "delivery_captured_at"],
         order_by="parent asc, idx asc",
     )
     legs_by_manifest: dict[str, list] = {}

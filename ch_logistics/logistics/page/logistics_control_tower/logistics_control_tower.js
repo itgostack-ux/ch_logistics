@@ -80,7 +80,15 @@ class LogisticsCommandCenter {
 		// Root shell
 		this.$root = $('<div class="lcc-root"></div>').appendTo(this.page.body);
 		this._render_shell();
-		this._switch_mode("overview");
+		// A full browser refresh recreates this page object from scratch,
+		// so without remembering the tab, it always landed back on
+		// Overview even if you'd been sitting in Operations. Restore
+		// whichever tab was last open instead.
+		let last_mode = "overview";
+		try {
+			last_mode = localStorage.getItem("lcc_last_mode") || "overview";
+		} catch (e) { /* localStorage unavailable — fall back to Overview */ }
+		this._switch_mode(["overview", "draft", "pending_with_goods", "packing", "ops"].includes(last_mode) ? last_mode : "overview");
 	}
 
 	// ─────────────────────────────────────────────────────────────
@@ -93,6 +101,12 @@ class LogisticsCommandCenter {
 				<div class="lcc-modebar-tabs">
 					<button class="lcc-mode-btn" data-mode="overview">
 						<i class="fa fa-tachometer"></i> ${__("Overview")}
+					</button>
+					<button class="lcc-mode-btn" data-mode="draft">
+						<i class="fa fa-file-text-o"></i> ${__("Draft")}
+					</button>
+					<button class="lcc-mode-btn" data-mode="pending_with_goods">
+						<i class="fa fa-clock-o"></i> ${__("Pending With Goods")}
 					</button>
 					<button class="lcc-mode-btn" data-mode="packing">
 						<i class="fa fa-cube"></i> ${__("Packed Order")}
@@ -116,6 +130,7 @@ class LogisticsCommandCenter {
 
 	_switch_mode(mode) {
 		this.mode = mode;
+		try { localStorage.setItem("lcc_last_mode", mode); } catch (e) { /* ignore */ }
 		this.$root.find(".lcc-mode-btn").removeClass("active");
 		this.$root.find(`.lcc-mode-btn[data-mode="${mode}"]`).addClass("active");
 
@@ -130,19 +145,24 @@ class LogisticsCommandCenter {
 		if (mode === "overview") {
 			$("#lcc-live-badge").show();
 			this._ov_init();
+		} else if (mode === "draft" || mode === "pending_with_goods") {
+			$("#lcc-live-badge").hide();
+			this._stop_auto_refresh();
+			this._draft_pending_init(mode === "draft" ? "Draft" : "Pending With Goods");
 		} else if (mode === "packing") {
 			$("#lcc-live-badge").hide();
 			this._stop_auto_refresh();
 			this._pack_init();
 		} else {
-			$("#lcc-live-badge").hide();
-			this._stop_auto_refresh();
+			$("#lcc-live-badge").show();
 			this._ops_init();
+			this._start_auto_refresh();
 		}
 	}
 
 	refresh() {
 		if (this.mode === "overview") this._ov_load();
+		else if (this.mode === "draft" || this.mode === "pending_with_goods") this._draft_pending_load();
 		else if (this.mode === "packing") this._pack_load();
 		else this._ops_load();
 	}
@@ -154,7 +174,9 @@ class LogisticsCommandCenter {
 	_start_auto_refresh() {
 		this._stop_auto_refresh();
 		this._auto_timer = setInterval(() => {
-			if (this.mode === "overview" && !document.hidden) this._ov_load(true);
+			if (document.hidden) return;
+			if (this.mode === "overview") this._ov_load(true);
+			else if (this.mode === "ops") this._ops_load();
 		}, 60000);
 	}
 
@@ -562,6 +584,10 @@ class LogisticsCommandCenter {
 		const $p = $ov.find('[data-panel="active"]');
 		if (!items.length) { $p.html(`<div class="lcc-empty"><i class="fa fa-check-circle"></i> ${__("No active manifests")}</div>`); return; }
 		const sc = { Draft:"lcc-badge-grey", Assigned:"lcc-badge-yellow", Packed:"lcc-badge-blue", "In Transit":"lcc-badge-purple", Delivered:"lcc-badge-green" };
+		// Driver-facing wording, matching the Delivery App's Pickup Pending /
+		// Delivery Pending / Delivered tabs — same underlying manifest
+		// status, just not "Assigned"/"In Transit" verbatim to the viewer.
+		const ml = { "Assigned": __("Pickup Pending"), "In Transit": __("Delivery Pending") };
 		const rows = items.map((r) => {
 			const dmg = r.damage_reported ? `<span class="lcc-damage-flag"><i class="fa fa-exclamation-triangle"></i> Damage</span>` : "";
 			const route = [r.source_store || r.source_warehouse, r.destination_store || r.destination_warehouse].filter(Boolean).join(" → ");
@@ -570,7 +596,7 @@ class LogisticsCommandCenter {
 				? `<span class="lcc-badge lcc-badge-red" style="margin-left:4px">OVERDUE</span>` : "";
 			return `<tr data-name="${r.name}">
 				<td><a href="/app/ch-transfer-manifest/${r.name}">${r.name}</a></td>
-				<td><span class="lcc-badge ${sc[r.status]||"lcc-badge-grey"}">${r.status}</span>${dmg}${over}</td>
+				<td><span class="lcc-badge ${sc[r.status]||"lcc-badge-grey"}">${frappe.utils.escape_html(ml[r.status] || r.status)}</span>${dmg}${over}</td>
 				<td class="lcc-route-cell" title="${route}">${route || "—"}</td>
 				<td>${r.driver_name || "—"}</td>
 				<td class="tr">${parseFloat(r.total_qty) || 0}</td>
@@ -641,6 +667,198 @@ class LogisticsCommandCenter {
 			<th class="tc">${__("Overdue")}</th><th class="tr">${__("Qty")}</th>
 		</tr></thead><tbody>${rows}</tbody></table></div>`);
 		$p.find("tbody tr").on("click", function (e) { if (e.target.tagName === "A") return; frappe.set_route("Form", "CH Transfer Manifest", $(this).data("name")); });
+	}
+
+	// ══════════════════════════════════════════════════════════════
+	// DRAFT / PENDING WITH GOODS MODES
+	// Two separate, purely informational tabs for Material Transfers
+	// upstream of packing. No grouping/action here; that starts once an
+	// entry reaches Packed (see PACKING MODE below). Both tabs share this
+	// same render/pagination/sort machinery, scoped by this.dp_status.
+	// ══════════════════════════════════════════════════════════════
+
+	_draft_pending_init(status) {
+		// Sort/paging state persists across a refresh but resets whenever the
+		// tab is (re)entered fresh, same as most list views.
+		this.dp_status = status;
+		this.dp_state = { start: 0, page_length: 10, sort_field: "creation", sort_order: "desc" };
+		const hint = status === "Draft"
+			? __("Showing Material Transfers still in Draft — not yet packed. Click a column heading to sort.")
+			: __("Showing Material Transfers Pending With Goods — not yet packed. Click a column heading to sort.");
+		$("#lcc-content").html(`
+			<div class="lcc-pack" id="lcc-draft-pending">
+				<div class="lcc-ops-bar">
+					<div class="lcc-ops-bar-actions">
+						<button class="btn btn-xs btn-default lcc-dp-refresh-btn">
+							<i class="fa fa-refresh"></i> ${__("Refresh")}
+						</button>
+					</div>
+					<span class="lcc-muted lcc-ops-bar-hint">
+						<i class="fa fa-info-circle"></i>
+						${hint}
+					</span>
+				</div>
+				<div class="lcc-pack-body" id="lcc-dp-body">
+					<div class="lcc-loading"><i class="fa fa-spinner fa-spin"></i> ${__("Loading…")}</div>
+				</div>
+				<div class="lcc-pack-pagination" id="lcc-dp-pagination"></div>
+			</div>
+		`);
+		if (!this._dp_events_bound) {
+			const $r = this.$root;
+			$r.on("click", ".lcc-dp-refresh-btn", () => this._draft_pending_load());
+			$r.on("click", ".lcc-dp-open", (e) => { e.preventDefault(); frappe.set_route("Form", "Stock Entry", $(e.currentTarget).data("name")); });
+			$r.on("click", ".lcc-dp-sortable", (e) => {
+				const field = $(e.currentTarget).data("field");
+				const st = this.dp_state;
+				st.sort_order = (st.sort_field === field && st.sort_order === "asc") ? "desc" : "asc";
+				st.sort_field = field;
+				st.start = 0;
+				this._draft_pending_load();
+			});
+			$r.on("click", ".lcc-dp-page-prev:not([disabled])", () => {
+				const st = this.dp_state;
+				st.start = Math.max(0, st.start - st.page_length);
+				this._draft_pending_load();
+			});
+			$r.on("click", ".lcc-dp-page-next:not([disabled])", () => {
+				const st = this.dp_state;
+				if (st.start + st.page_length < (this.dp_total_count || 0)) {
+					st.start += st.page_length;
+					this._draft_pending_load();
+				}
+			});
+			this._dp_events_bound = true;
+		}
+		this._draft_pending_load();
+	}
+
+	async _draft_pending_load() {
+		const $b = $("#lcc-dp-body");
+		$b.html(`<div class="lcc-loading"><i class="fa fa-spinner fa-spin"></i> ${__("Loading…")}</div>`);
+		try {
+			const co = this.filters?.fields?.company?.get_value() || frappe.defaults.get_user_default("Company");
+			const st = this.dp_state || (this.dp_state = { start: 0, page_length: 10, sort_field: "creation", sort_order: "desc" });
+			const r = await frappe.call({
+				method: "ch_erp15.ch_erp15.custom.stock_entry.get_draft_pending_stock_entries",
+				args: {
+					company: co,
+					status: this.dp_status,
+					start: st.start,
+					page_length: st.page_length,
+					sort_field: st.sort_field,
+					sort_order: st.sort_order,
+				},
+			});
+			this.draft_pending_queue = (r.message && r.message.rows) || [];
+			this.dp_total_count = (r.message && r.message.total_count) || 0;
+			this._draft_pending_render();
+		} catch (e) {
+			$b.html(`<div class="lcc-empty"><i class="fa fa-exclamation-triangle"></i> ${__("Failed to load.")}</div>`);
+		}
+	}
+
+	// Age badges show minutes for anything under an hour — a Stock Entry
+	// that entered its current status 5 minutes ago used to display as
+	// "0h" (or worse, the wrong multi-hour figure from document creation
+	// time), which reads as broken to whoever is watching it move.
+	_fmt_age(age_minutes, age_hours) {
+		if (age_minutes == null) return "—";
+		if (age_minutes < 60) return `${age_minutes}m`;
+		if (age_hours < 24) return `${age_hours}h`;
+		return `${Math.floor(age_hours / 24)}d`;
+	}
+
+	_dp_sort_th(label, field, extra_cls) {
+		const st = this.dp_state || {};
+		let icon = `<i class="fa fa-sort lcc-dp-sort-icon"></i>`;
+		if (st.sort_field === field) {
+			icon = st.sort_order === "asc"
+				? `<i class="fa fa-sort-asc lcc-dp-sort-icon active"></i>`
+				: `<i class="fa fa-sort-desc lcc-dp-sort-icon active"></i>`;
+		}
+		return `<th class="lcc-dp-sortable ${extra_cls || ""}" data-field="${field}">${label} ${icon}</th>`;
+	}
+
+	_draft_pending_render() {
+		const $b = $("#lcc-dp-body");
+		const $p = $("#lcc-dp-pagination");
+		if (!(this.draft_pending_queue || []).length) {
+			$b.html(`<div class="lcc-empty"><i class="fa fa-check-circle"></i> ${__("No Draft or Pending With Goods Stock Entries.")}</div>`);
+			$p.html("");
+			return;
+		}
+		const status_colors = {
+			"Draft": "red", "Pending With Goods": "orange", "Partially Packed": "yellow",
+			"Packed": "teal", "Ready For Pickup": "teal", "Assigned": "blue",
+			"Ready For Receive": "cyan", "In Transit": "yellow", "Receive At Transit": "purple",
+			"Partially Transferred": "orange", "Transferred": "green", "Force Closed": "gray",
+			"Rejected": "red",
+		};
+		const rows = this.draft_pending_queue.map((se) => {
+			const nm = frappe.utils.escape_html(se.name);
+			const total_qty = Number(se.total_qty || 0);
+			const box_count = Number(se.box_count || 0);
+			const weight    = Number(se.weight_kg || 0);
+
+			let age_cls = "lcc-sev-low";
+			if (se.age_hours != null) {
+				if (se.age_hours >= 48) age_cls = "lcc-sev-critical";
+				else if (se.age_hours >= 24) age_cls = "lcc-sev-high";
+				else if (se.age_hours >= 8) age_cls = "lcc-sev-medium";
+			}
+			const age = this._fmt_age(se.age_minutes, se.age_hours);
+
+			const status = se.custom_status || "Draft";
+			const status_color = status_colors[status] || "gray";
+			const since = se.custom_status_since || se.creation;
+			return `<tr>
+				<td><a href="#" class="lcc-dp-open" data-name="${nm}">${nm}</a></td>
+				<td>${since ? frappe.datetime.str_to_user(since) : "—"}</td>
+				<td><span class="indicator-pill ${status_color}"><span>${frappe.utils.escape_html(__(status))}</span></span></td>
+				<td>${window.ch_wh_label_html ? ch_wh_label_html(se.from_warehouse, "—") : frappe.utils.escape_html(se.from_warehouse || "—")}</td>
+				<td>${window.ch_wh_label_html ? ch_wh_label_html(se.to_warehouse, "—") : frappe.utils.escape_html(se.to_warehouse || "—")}</td>
+				<td class="tr">${total_qty}</td>
+				<td class="tr">${box_count}</td>
+				<td class="tr">${weight ? weight.toFixed(1) + " kg" : "—"}</td>
+				<td><span class="lcc-sev ${age_cls}">${age}</span></td>
+			</tr>`;
+		}).join("");
+
+		$b.html(`
+			<div class="lcc-table-wrap"><table class="lcc-table lcc-dp-table">
+				<thead><tr>
+					${this._dp_sort_th(__("Order Id"), "name")}
+					${this._dp_sort_th(__("Date"), "creation")}
+					${this._dp_sort_th(__("Status"), "custom_status")}
+					${this._dp_sort_th(__("Source Warehouse"), "from_warehouse")}
+					${this._dp_sort_th(__("Target Warehouse"), "to_warehouse")}
+					${this._dp_sort_th(__("Qty"), "total_qty", "tr")}
+					${this._dp_sort_th(__("Boxes"), "box_count", "tr")}
+					${this._dp_sort_th(__("Weight"), "weight_kg", "tr")}
+					${this._dp_sort_th(__("Age"), "age_hours")}
+				</tr></thead>
+				<tbody>${rows}</tbody>
+			</table></div>
+		`);
+
+		const st = this.dp_state;
+		const total = this.dp_total_count || 0;
+		const from = total ? st.start + 1 : 0;
+		const to = Math.min(st.start + st.page_length, total);
+		$p.html(`
+			<div class="lcc-dp-page-info">
+				${__("Showing {0}-{1} of {2}", [from, to, total])}
+			</div>
+			<div class="lcc-dp-page-btns">
+				<button class="btn btn-xs btn-default lcc-dp-page-prev" ${st.start <= 0 ? "disabled" : ""}>
+					<i class="fa fa-chevron-left"></i> ${__("Prev")}
+				</button>
+				<button class="btn btn-xs btn-default lcc-dp-page-next" ${(st.start + st.page_length >= total) ? "disabled" : ""}>
+					${__("Next")} <i class="fa fa-chevron-right"></i>
+				</button>
+			</div>
+		`);
 	}
 
 	// ══════════════════════════════════════════════════════════════
@@ -736,18 +954,29 @@ class LogisticsCommandCenter {
 				else if (se.age_hours >= 24) age_cls = "lcc-sev-high";
 				else if (se.age_hours >= 8) age_cls = "lcc-sev-medium";
 			}
-			const age = (se.age_hours == null) ? "—" : `${se.age_hours}h`;
+			const age = this._fmt_age(se.age_minutes, se.age_hours);
 
+			// Same status colors as the Stock Entry list view (stock_entry_list.js)
+			// — this queue is filtered to custom_status == "Packed" so it'll
+			// always render teal here, but kept as a real lookup rather than a
+			// hardcoded color so it stays correct if the filter ever loosens.
+			const status_colors = {
+				"Draft": "red", "Pending With Goods": "orange", "Partially Packed": "yellow",
+				"Packed": "teal", "Ready For Pickup": "teal", "Assigned": "blue",
+				"Ready For Receive": "cyan", "In Transit": "yellow", "Receive At Transit": "purple",
+				"Partially Transferred": "orange", "Transferred": "green", "Force Closed": "gray",
+				"Rejected": "red",
+			};
+			const status = se.custom_status || "";
+			const status_color = status_colors[status] || "gray";
+			const since = se.custom_status_since || se.creation;
 			return `<tr>
 				<td><input type="checkbox" class="lcc-pack-row-check" data-name="${nm}"></td>
-				<td>
-					<a href="#" class="lcc-pack-open" data-name="${nm}">${nm}</a>
-					<div class="lcc-muted">${se.posting_date ? frappe.datetime.str_to_user(se.posting_date) : ""}</div>
-				</td>
-				<td>
-					${window.ch_wh_label_html ? ch_wh_label_html(se.from_warehouse, "—") : frappe.utils.escape_html(se.from_warehouse || "—")}
-					<div class="lcc-muted">→ ${window.ch_wh_label_html ? ch_wh_label_html(se.to_warehouse, "—") : frappe.utils.escape_html(se.to_warehouse || "—")}</div>
-				</td>
+				<td><a href="#" class="lcc-pack-open" data-name="${nm}">${nm}</a></td>
+				<td>${since ? frappe.datetime.str_to_user(since) : "—"}</td>
+				<td><span class="indicator-pill ${status_color}"><span>${frappe.utils.escape_html(__(status))}</span></span></td>
+				<td>${window.ch_wh_label_html ? ch_wh_label_html(se.from_warehouse, "—") : frappe.utils.escape_html(se.from_warehouse || "—")}</td>
+				<td>${window.ch_wh_label_html ? ch_wh_label_html(se.to_warehouse, "—") : frappe.utils.escape_html(se.to_warehouse || "—")}</td>
 				<td class="tr">${total_qty}</td>
 				<td class="tr">${box_count}</td>
 				<td class="tr">${weight ? weight.toFixed(1) + " kg" : "—"}</td>
@@ -759,8 +988,11 @@ class LogisticsCommandCenter {
 			<div class="lcc-table-wrap"><table class="lcc-table lcc-pack-table">
 				<thead><tr>
 					<th style="width:32px"><input type="checkbox" class="lcc-pack-select-all"></th>
-					<th>${__("Stock Entry")}</th>
-					<th>${__("Lane")}</th>
+					<th>${__("Order Id")}</th>
+					<th>${__("Date")}</th>
+					<th>${__("Status")}</th>
+					<th>${__("Source Warehouse")}</th>
+					<th>${__("Target Warehouse")}</th>
 					<th class="tr">${__("Qty")}</th>
 					<th class="tr">${__("Boxes")}</th>
 					<th class="tr">${__("Weight")}</th>
@@ -847,6 +1079,16 @@ class LogisticsCommandCenter {
 	// ══════════════════════════════════════════════════════════════
 
 	_ops_init() {
+		// trip_date is set once when this page object is first constructed
+		// (frappe reuses one instance per session) — if the tab is left open
+		// across midnight, or the user just navigates back into Operations
+		// on a later day, that stale date silently kept showing yesterday's
+		// (or older) board until someone noticed and changed it by hand.
+		// Snap forward to today whenever it's fallen behind; leave alone if
+		// the user picked today or a future date deliberately.
+		if (this.trip_date < frappe.datetime.get_today()) {
+			this.trip_date = frappe.datetime.get_today();
+		}
 		const co = this.filters?.fields?.company?.get_value() || "";
 		$("#lcc-content").html(`
 			<div class="lcc-ops">
@@ -989,6 +1231,7 @@ class LogisticsCommandCenter {
 		$r.on("click",  ".lcc-trip-link",     (e) => { e.preventDefault(); this._ops_open_trip($(e.currentTarget).data("name")); });
 
 		// Per-row print actions for the Operations → Manifests panel.
+		$r.on("click", ".lcc-mf-open",          (e) => { e.preventDefault(); this._ops_show_manifest_items($(e.currentTarget).data("name")); });
 		$r.on("click", ".lcc-mf-print-box",     (e) => { e.preventDefault(); this._ops_print_manifest($(e.currentTarget).data("name"), "CH Transfer Manifest Label"); });
 		$r.on("click", ".lcc-mf-print-receipt", (e) => { e.preventDefault(); this._ops_print_manifest($(e.currentTarget).data("name"), "ePOD Transfer Manifest"); });
 		$r.on("click", ".lcc-mf-print-ewb",     (e) => { e.preventDefault(); this._ops_print_ewaybills($(e.currentTarget).data("name")); });
@@ -1211,13 +1454,19 @@ class LogisticsCommandCenter {
 		}
 		// Status pill colours — mirror form indicator map.
 		const STATUS_COLOR = { "Draft": "gray", "Packed": "blue" };
+		// "Packed" is the manifest's real status (and the filter value below
+		// still uses it), but at this level it reads as "Manifest Created"
+		// instead — "Packed" already means something else on the Stock
+		// Entry side, and re-using it here for a submitted manifest was
+		// confusing the two.
+		const STATUS_LABEL = { "Packed": __("Manifest Created") };
 		const rows = list.map((m) => {
 			const color = STATUS_COLOR[m.status] || "gray";
-			const status = frappe.utils.escape_html(m.status || "—");
+			const status = frappe.utils.escape_html(STATUS_LABEL[m.status] || m.status || "—");
 			const nm = encodeURIComponent(m.name);
 			return `<tr>
 			<td><input type="checkbox" class="lcc-mf-check" data-name="${m.name}"></td>
-			<td><a href="/app/ch-transfer-manifest/${nm}" target="_blank">${frappe.utils.escape_html(m.name)}</a></td>
+			<td><a href="/app/ch-transfer-manifest/${nm}" class="lcc-mf-open" data-name="${frappe.utils.escape_html(m.name)}">${frappe.utils.escape_html(m.name)}</a></td>
 			<td><span class="indicator-pill ${color}">${status}</span></td>
 			<td>${frappe.utils.escape_html(m.direction || "—")}</td>
 			<td><span class="lcc-prio lcc-prio-${(m.shipment_priority || "Normal").toLowerCase()}">${m.shipment_priority || "Normal"}</span></td>
@@ -1225,14 +1474,6 @@ class LogisticsCommandCenter {
 			<td class="tr">${m.total_qty || 0}</td>
 			<td class="tr">${m.box_count || 0}</td>
 			<td>${frappe.datetime.str_to_user(m.creation)}</td>
-			<td class="lcc-mf-actions">
-				<button class="btn btn-xs btn-default lcc-mf-print-box" data-name="${m.name}"
-					title="${__("Print Box Label")}"><i class="fa fa-tags"></i></button>
-				<button class="btn btn-xs btn-default lcc-mf-print-receipt" data-name="${m.name}"
-					title="${__("Print Transfer Receipt")}"><i class="fa fa-file-text-o"></i></button>
-				<button class="btn btn-xs btn-default lcc-mf-print-ewb" data-name="${m.name}"
-					title="${__("Print e-Way Bills")}"><i class="fa fa-file-pdf-o"></i></button>
-			</td>
 		</tr>`;
 		}).join("");
 
@@ -1249,7 +1490,7 @@ class LogisticsCommandCenter {
 					<i class="fa fa-qrcode"></i> ${__("Bundle & Print Pickup QR")}
 				</button>
 				<span class="lcc-ops-bar-spacer"></span>
-				<span class="lcc-muted lcc-ops-bar-hint">${__("Only submitted (Packed) manifests are listed — submit Draft manifests to see them here. Use the icons on the right to print labels, transfer receipts and e-Way Bills before dispatch.")}</span>
+				<span class="lcc-muted lcc-ops-bar-hint">${__("Only submitted (Packed) manifests are listed — submit Draft manifests to see them here. Open a manifest to print its box label, transfer receipt, or e-Way Bill before dispatch.")}</span>
 			</div>
 			<div class="lcc-table-wrap"><table class="lcc-table">
 				<thead><tr>
@@ -1259,10 +1500,167 @@ class LogisticsCommandCenter {
 					<th>${__("Dir")}</th><th>${__("Priority")}</th>
 					<th>${__("Route")}</th><th class="tr">${__("Qty")}</th>
 					<th class="tr">${__("Boxes")}</th><th>${__("Created")}</th>
-					<th style="width:120px">${__("Actions")}</th>
 				</tr></thead>
 				<tbody>${rows}</tbody>
 			</table></div>`);
+	}
+
+	/* ── Manifest drill-down ──────────────────────────────────────
+	 * Clicking a Manifest ID in the Operations table used to jump straight
+	 * to the full desk form. Shows the underlying Stock Entry / Item / Qty
+	 * / Status breakdown in a lightweight dialog instead. Clicking an Order
+	 * Id inside that dialog drills one level deeper into per-IMEI detail
+	 * (_ops_show_order_serials) — status there is read fresh from the Stock
+	 * Entry each time, and prefers whatever serial list is most current
+	 * (see get_stock_entry_serial_detail), so a delivery person's scan at
+	 * receipt shows up on next open without any separate refresh step.
+	 */
+	_status_color(status) {
+		const STATUS_COLOR = {
+			"Draft": "gray", "Pending With Goods": "orange", "Partially Packed": "yellow",
+			"Packed": "teal", "Ready For Pickup": "teal", "Assigned": "blue",
+			"Ready For Receive": "cyan", "In Transit": "yellow", "Receive At Transit": "purple",
+			"Partially Transferred": "orange", "Transferred": "green", "Force Closed": "gray",
+			"Rejected": "red",
+		};
+		return STATUS_COLOR[status] || "gray";
+	}
+
+	// Same relabel as the Stock Entry list view — the underlying value still
+	// drives pickup/manifest logic under the hood, but reads with driver-
+	// facing wording everywhere it's shown to a user, matching the Delivery
+	// App's Pickup Pending / Delivery Pending / Delivered tabs.
+	_status_label(status) {
+		const RELABEL = {
+			"Ready For Pickup": __("Manifest Created"),
+			"Assigned": __("Pickup Pending"),
+			"In Transit": __("Delivery Pending"),
+			"Transferred": __("Delivered"),
+		};
+		return RELABEL[status] || __(status || "—");
+	}
+
+	async _ops_show_manifest_items(name) {
+		const d = new frappe.ui.Dialog({
+			title: __("Manifest {0}", [name]),
+			size: "large",
+			fields: [{ fieldname: "items_html", fieldtype: "HTML" }],
+		});
+		d.fields_dict.items_html.$wrapper.html(
+			`<div class="lcc-loading"><i class="fa fa-spinner fa-spin"></i> ${__("Loading…")}</div>`
+		);
+		d.show();
+		d.$wrapper.on("click", ".lcc-item-open", (e) => {
+			e.preventDefault();
+			const $t = $(e.currentTarget);
+			this._ops_show_order_serials($t.data("order"), $t.data("item"));
+		});
+		try {
+			const r = await frappe.call({
+				method: _LCC + "get_manifest_items_bulk",
+				args: { manifests: [name] },
+			});
+			const rows = (r.message && r.message[name]) || [];
+			if (!rows.length) {
+				d.fields_dict.items_html.$wrapper.html(
+					`<div class="lcc-empty">${__("No item detail found for this manifest.")}</div>`
+				);
+				return;
+			}
+			// Level 1: Stock Entry (Order Id) — grouped, not a flat repeated
+			// column, so a manifest with several Stock Entries reads as
+			// distinct shipments. Level 2 (Item Name, below) drills into
+			// Level 3 (IMEI) via _ops_show_order_serials, same as before.
+			const esc = frappe.utils.escape_html;
+			const groups = {};
+			for (const row of rows) {
+				const key = row.stock_entry || "—";
+				(groups[key] = groups[key] || []).push(row);
+			}
+			const stock_entries = Object.keys(groups).sort();
+			const sections = stock_entries.map((se) => {
+				const item_rows = groups[se].map((row) => `<tr>
+						<td>
+							<a href="#" class="lcc-item-open"
+								data-order="${esc(se)}"
+								data-item="${esc(row.item_code || "")}">
+								${esc(row.item_name || row.item_code || "—")}
+							</a>
+						</td>
+						<td class="tr">${row.qty != null ? row.qty : "—"}${row.uom ? " " + esc(row.uom) : ""}</td>
+						<td><span class="indicator-pill ${this._status_color(row.status)}"><span>${esc(this._status_label(row.status))}</span></span></td>
+					</tr>`).join("");
+				return `
+					<div class="lcc-se-group" style="margin-bottom:16px">
+						<div class="lcc-se-group-header" style="font-weight:700;font-size:13px;padding:4px 0 6px;border-bottom:2px solid #e5e7eb;display:flex;align-items:center;gap:8px">
+							<i class="fa fa-file-text-o" style="color:#888"></i>
+							<a href="/app/stock-entry/${encodeURIComponent(se)}" target="_blank">${esc(se)}</a>
+							<span class="lcc-muted" style="font-weight:400;font-size:11px">${groups[se].length} ${__("item(s)")}</span>
+						</div>
+						<table class="lcc-table">
+							<thead><tr>
+								<th>${__("Item Name")}</th>
+								<th class="tr">${__("Qty")}</th>
+								<th>${__("Status")}</th>
+							</tr></thead>
+							<tbody>${item_rows}</tbody>
+						</table>
+					</div>`;
+			}).join("");
+			d.fields_dict.items_html.$wrapper.html(
+				`<div class="lcc-table-wrap">${sections}</div>`
+			);
+		} catch (e) {
+			d.fields_dict.items_html.$wrapper.html(
+				`<div class="lcc-empty"><i class="fa fa-exclamation-triangle"></i> ${__("Failed to load manifest items.")}</div>`
+			);
+		}
+	}
+
+	async _ops_show_order_serials(order_id, item_code) {
+		const d = new frappe.ui.Dialog({
+			title: __("Order {0}", [order_id]),
+			size: "large",
+			fields: [{ fieldname: "serials_html", fieldtype: "HTML" }],
+		});
+		d.fields_dict.serials_html.$wrapper.html(
+			`<div class="lcc-loading"><i class="fa fa-spinner fa-spin"></i> ${__("Loading…")}</div>`
+		);
+		d.show();
+		try {
+			const r = await frappe.call({
+				method: _LCC + "get_stock_entry_serial_detail",
+				args: { stock_entry: order_id, item_code: item_code || undefined },
+			});
+			const rows = r.message || [];
+			if (!rows.length) {
+				d.fields_dict.serials_html.$wrapper.html(
+					`<div class="lcc-empty">${__("No IMEI detail found for this order.")}</div>`
+				);
+				return;
+			}
+			const body = rows.map((row) => `<tr>
+					<td>${frappe.utils.escape_html(row.serial_no || "—")}</td>
+					<td>${frappe.utils.escape_html(row.item_name || row.item_code || "—")}</td>
+					<td class="tr">${row.qty != null ? row.qty : "—"}</td>
+					<td><span class="indicator-pill ${this._status_color(row.status)}"><span>${frappe.utils.escape_html(this._status_label(row.status))}</span></span></td>
+				</tr>`).join("");
+			d.fields_dict.serials_html.$wrapper.html(`
+				<div class="lcc-table-wrap"><table class="lcc-table">
+					<thead><tr>
+						<th>${__("IMEI")}</th>
+						<th>${__("Item Name")}</th>
+						<th class="tr">${__("Qty")}</th>
+						<th>${__("Status")}</th>
+					</tr></thead>
+					<tbody>${body}</tbody>
+				</table></div>
+			`);
+		} catch (e) {
+			d.fields_dict.serials_html.$wrapper.html(
+				`<div class="lcc-empty"><i class="fa fa-exclamation-triangle"></i> ${__("Failed to load IMEI detail.")}</div>`
+			);
+		}
 	}
 
 	/* ── Recalls inbox ────────────────────────────────────────────
@@ -1665,7 +2063,9 @@ class LogisticsCommandCenter {
 	}
 
 	_ops_side_html(t) {
-		const can_assign   = ["Draft","Assigned"].includes(t.status);
+		// Once a driver is on the trip, use Unassign first rather than
+		// re-running Assign Driver over an existing assignment.
+		const can_assign   = t.status === "Draft";
 		const can_start    = t.status === "Assigned";
 		const can_complete = t.status === "Started";
 		const can_close    = t.status === "Completed";
@@ -1678,19 +2078,52 @@ class LogisticsCommandCenter {
 		// cosmetic only — trip_close re-checks head_override server-side.
 		const can_complete_override = can_complete && !!(this._capabilities || {}).head_override;
 
+		// Group by stop_roles (location-derived by the backend's
+		// stop_roles.annotate — matches each manifest to a stop by actual
+		// warehouse, not a number) rather than the legacy stop_sequence
+		// pointer. stop_sequence is a raw number that goes stale the moment
+		// a resequence changes which warehouse holds that number — it was
+		// only ever "safe" here because resequencing used to silently fail
+		// to persist a new order at all (now fixed, which is exactly what
+		// made this surface: a manifest could show attached to whatever
+		// unrelated stop now happened to hold its old number).
 		const mf_by_stop = {};
 		(t.manifests || []).forEach((m) => {
-			const k = m.stop_sequence || 0;
-			(mf_by_stop[k] = mf_by_stop[k] || []).push(m);
+			const roles = m.stop_roles || {};
+			const seqs = Object.keys(roles);
+			if (!seqs.length) {
+				// No location match resolved (e.g. stop coords/warehouse
+				// missing) — fall back to the legacy pointer rather than
+				// dropping the manifest from the panel entirely.
+				const k = m.stop_sequence || 0;
+				(mf_by_stop[k] = mf_by_stop[k] || []).push(m);
+				return;
+			}
+			seqs.forEach((seqStr) => {
+				const k = parseInt(seqStr, 10);
+				(mf_by_stop[k] = mf_by_stop[k] || []).push(m);
+			});
 		});
 
-		const stops_html = (t.stops || []).map((s) => {
-			const mfs = (mf_by_stop[s.sequence] || []).map((m) => `
+		// Only show stops that actually have a manifest attached — a route
+		// can carry many planned stops before manifests get assigned to
+		// them, but this panel is about what's actually moving, not the
+		// full potential route.
+		// t.stops comes back in child-table row order, which is NOT
+		// guaranteed to match the sequence field — resequencing recomputes
+		// sequence numbers but doesn't reorder the underlying rows, so
+		// without this sort the panel silently kept showing the old visiting
+		// order even after a successful re-sequence.
+		const stops_html = (t.stops || [])
+			.slice()
+			.sort((a, b) => (a.sequence || 0) - (b.sequence || 0))
+			.filter((s) => (mf_by_stop[s.sequence] || []).length).map((s) => {
+			const mfs = mf_by_stop[s.sequence].map((m) => `
 				<div class="lcc-side-mf">
 					<a href="/app/ch-transfer-manifest/${m.name}" target="_blank">${m.name}</a>
 					<span class="lcc-muted">${m.status || ""} · ${m.total_qty || 0}q</span>
 					${can_detach ? `<button class="btn btn-xs btn-default lcc-side-detach" data-name="${m.name}"><i class="fa fa-unlink"></i></button>` : ""}
-				</div>`).join("") || `<div class="lcc-muted">${__("No manifests")}</div>`;
+				</div>`).join("");
 			return `<div class="lcc-side-stop">
 				<div class="lcc-side-stop-head">
 					<b>#${s.sequence}</b> ${window.ch_wh_label_html ? ch_wh_label_html(s.warehouse, "") : frappe.utils.escape_html(s.warehouse || "")}
@@ -1699,7 +2132,7 @@ class LogisticsCommandCenter {
 				<div class="lcc-side-stop-meta">${s.stop_type || ""} · ETA ${s.eta ? frappe.datetime.str_to_user(s.eta) : "—"}</div>
 				<div class="lcc-side-mfs">${mfs}</div>
 			</div>`;
-		}).join("") || `<div class="lcc-empty">${__("No stops")}</div>`;
+		}).join("") || `<div class="lcc-empty">${__("No manifest-connected stops on this route.")}</div>`;
 
 		const excs_html = (t.exceptions || []).length
 			? `<div class="lcc-side-sec">${__("Exceptions")}</div>` +
@@ -1749,8 +2182,18 @@ class LogisticsCommandCenter {
 
 	_ops_trip_action(method, prefix = _LCC, extraArgs = {}) {
 		if (!this.active_trip) return;
-		frappe.call({ method: prefix + method, args: { trip: this.active_trip, ...extraArgs } })
-			.then(() => { frappe.show_alert({ message: __("Done"), indicator: "green" }); this._ops_load(); });
+		const trip = this.active_trip;
+		frappe.call({ method: prefix + method, args: { trip, ...extraArgs } })
+			.then(() => {
+				frappe.show_alert({ message: __("Done"), indicator: "green" });
+				this._ops_load();
+				// The board reload above refreshes the main list, but never
+				// touched the open side panel — every trip action (Start,
+				// Re-sequence, Unassign, Cancel…) looked like a no-op
+				// because the stops/status shown there stayed frozen on
+				// pre-action data. Re-fetch it too if it's still open.
+				if (this.active_trip === trip) this._ops_open_trip(trip);
+			});
 	}
 
 	_ops_start_trip() {

@@ -424,9 +424,16 @@ def optimize_trip(trip: str) -> dict:
     )
 
     # Re-write sequence + per-leg distance, recompute planned total.
+    # idx must be set explicitly alongside sequence: Frappe always loads
+    # child tables in idx order (hardcoded in core, not the sequence field),
+    # and save() does not renumber idx for existing rows just because the
+    # in-memory list got sorted — without this, the persisted stop order
+    # never actually changes even though sequence numbers do, making every
+    # resequence look like a no-op the next time the trip is loaded.
     total, prev, seq = 0.0, origin, 1
     for s in ordered:
         s.sequence = seq
+        s.idx = seq
         seq += 1
         c = coords.get(s.name)
         if c:
@@ -515,10 +522,15 @@ def resequence_trip(trip: str) -> dict:
     )
 
     seq = (max([cint(s.sequence) for s in reached], default=0) + 1)
+    # Same idx/sequence split as optimize_trip above — idx drives actual
+    # load order, sequence alone is not enough for the new order to persist.
+    idx = (max([cint(s.idx) for s in reached], default=0) + 1)
     total, prev = 0.0, origin
     for s in ordered:
         s.sequence = seq
+        s.idx = idx
         seq += 1
+        idx += 1
         c = coords.get(s.name)
         if c:
             leg = haversine_km(prev[0], prev[1], c[0], c[1])

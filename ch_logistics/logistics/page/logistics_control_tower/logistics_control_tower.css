@@ -1134,3 +1134,31 @@
 	margin-top: 2px;
 	text-align: right;
 }
+
+.lcc-dp-sortable {
+	cursor: pointer;
+	user-select: none;
+	white-space: nowrap;
+}
+.lcc-dp-sortable:hover { background: #eef2f7; }
+.lcc-dp-sort-icon {
+	font-size: 10px;
+	opacity: 0.4;
+	margin-left: 2px;
+}
+.lcc-dp-sort-icon.active { opacity: 1; }
+
+.lcc-pack-pagination {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	padding: 10px 2px;
+	font-size: 12px;
+	color: var(--lcc-muted, #64748b);
+}
+.lcc-dp-page-btns { display: flex; gap: 6px; }
+.lcc-dp-page-btns button[disabled] {
+	opacity: 0.4;
+	cursor: not-allowed;
+	pointer-events: none;
+}

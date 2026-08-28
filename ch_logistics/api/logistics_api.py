@@ -582,10 +582,25 @@ def driver_accept_manifest(trip, manifest, override_empty_stops=0):
     return {"manifest": mf.name, "trip": doc.name, "trip_status": doc.status, "trip_started": trip_started}
 
 
+@frappe.whitelist()
+def get_stock_entry_box_labels(stock_entry) -> list:
+    """Box labels (CH Stock Entry Package.package_label) for one Stock Entry
+    — lets the Delivery App know, before opening the pickup dialog, whether
+    this shipment has multiple physical boxes that each need their own QR
+    scan (see driver_accept_manifest_row's multi-box validation), or just
+    one/none, in which case the existing single-scan flow is unchanged.
+    """
+    return [
+        b for b in frappe.get_all(
+            "CH Stock Entry Package", filters={"parent": stock_entry}, pluck="package_label"
+        ) if b
+    ]
+
+
 @frappe.whitelist(methods=["POST"])
 def driver_accept_manifest_row(trip, manifest, stock_entry, pickup_photo, scanned_qr,
                                lat, lng, gps_accuracy_m=None, geofence_override_reason=None,
-                               override_empty_stops=0):
+                               override_empty_stops=0, additional_scanned_qrs=None):
     """Driver acceptance of ONE Stock Entry leg inside a multi-entry manifest —
     now WITH the same pickup evidence capture (QR scan, GPS, photo) that used
     to only happen later at the separate whole-manifest "Start Pickup" step,
@@ -630,8 +645,14 @@ def driver_accept_manifest_row(trip, manifest, stock_entry, pickup_photo, scanne
             frappe.throw(_("This shipment is already accepted."))
 
         # Same evidence requirements as the whole-manifest Start Pickup, just
-        # scoped to this one leg's own pickup location.
-        mf._validate_pickup_qr(scanned_qr)
+        # scoped to this one leg's own pickup location. A Stock Entry with
+        # more than one physical box (CH Stock Entry Package) requires EVERY
+        # box's own label scanned — not just any one of them — so a driver
+        # can't load 1 of 3 boxes and still mark the whole shipment picked
+        # up; see _validate_pickup_qr_multi.
+        extra_scans = frappe.parse_json(additional_scanned_qrs) if additional_scanned_qrs else []
+        all_scans = [scanned_qr] + list(extra_scans or [])
+        mf._validate_pickup_qr_multi(stock_entry, all_scans)
         if not pickup_photo:
             frappe.throw(_("Pickup photo is mandatory."), title=_("Ch Transfer Manifest Error"))
         lat_f, lng_f = mf._validate_geo_for(
@@ -645,7 +666,7 @@ def driver_accept_manifest_row(trip, manifest, stock_entry, pickup_photo, scanne
             {
                 "driver_accepted_at": now,
                 "pickup_photo": pickup_photo,
-                "pickup_scanned_qr": scanned_qr,
+                "pickup_scanned_qr": "; ".join(s.strip() for s in all_scans if (s or "").strip()),
                 "pickup_lat": lat_f,
                 "pickup_lng": lng_f,
                 "pickup_gps_accuracy_m": gps_accuracy_m,
@@ -659,19 +680,25 @@ def driver_accept_manifest_row(trip, manifest, stock_entry, pickup_photo, scanne
         all_accepted = all(r.driver_accepted_at for r in mf.transfers)
         header_accepted_now = False
         trip_started = False
+        # Trip start (and the driver's own status flipping to In Transit)
+        # fires on the FIRST accepted leg anywhere on the trip, not once an
+        # entire manifest's legs all clear — pickup is genuinely per-leg (a
+        # driver may be carrying a mix of picked-up and not-yet-accepted
+        # shipments at once), so the driver badge reads In Transit as soon
+        # as they've picked up anything.
+        if doc.status == "Assigned":
+            doc.add_comment(
+                "Comment",
+                _("Trip auto-started: first shipment ({0}) accepted by {1}.").format(stock_entry, frappe.session.user),
+            )
+            doc.flags.ignore_empty_stops = cint(override_empty_stops)
+            doc.mark_started()
+            doc.save()
+            if doc.driver:
+                _set_driver_availability(doc.driver, "In Transit", doc.name)
+            trip_started = True
         if all_accepted and not mf.driver_accepted_at:
             header_accepted_now = True
-            if doc.status == "Assigned":
-                doc.add_comment(
-                    "Comment",
-                    _("Trip auto-started: first manifest ({0}) fully accepted by {1}.").format(manifest, frappe.session.user),
-                )
-                doc.flags.ignore_empty_stops = cint(override_empty_stops)
-                doc.mark_started()
-                doc.save()
-                if doc.driver:
-                    _set_driver_availability(doc.driver, "In Transit", doc.name)
-                trip_started = True
             # This leg's own capture stands in for the manifest-wide one —
             # every leg has now individually proven pickup, so the manifest
             # as a whole is genuinely picked up. Fires the exact same tail
@@ -2401,7 +2428,7 @@ def ops_unassigned_manifests(direction=None, hub=None, limit=100):
         params["hub"] = hub
     select_fields = ", ".join(f"`{field}`" for field in fields)
     order_by = "shipment_priority DESC, creation ASC" if has_shipment_priority else "creation ASC"
-    return frappe.db.sql(
+    rows = frappe.db.sql(
         f"""
         SELECT {select_fields}
         FROM `tabCH Transfer Manifest`
@@ -2412,6 +2439,35 @@ def ops_unassigned_manifests(direction=None, hub=None, limit=100):
         params,
         as_dict=True,
     )
+
+    # box_count on the manifest itself only reflects manifest-level
+    # re-packing (CH Transfer Manifest.packages) — a separate, rarely-used
+    # step from the per-Stock-Entry Pack Box flow this app actually runs
+    # on. For manifests built via group_stock_entries_into_manifest, the
+    # real box count lives on each linked Stock Entry's own packages, so
+    # backfill from there whenever the manifest's own count is empty.
+    if has_box_count:
+        need_fallback = [r.name for r in rows if not r.box_count]
+        if need_fallback:
+            counts = {
+                r.manifest: r.box_count
+                for r in frappe.db.sql(
+                    """
+                    SELECT tr.parent AS manifest, COUNT(pkg.name) AS box_count
+                    FROM `tabCH Transfer Manifest Item` tr
+                    JOIN `tabCH Stock Entry Package` pkg ON pkg.parent = tr.stock_entry
+                    WHERE tr.parent IN %(names)s
+                    GROUP BY tr.parent
+                    """,
+                    {"names": need_fallback},
+                    as_dict=True,
+                )
+            }
+            for r in rows:
+                if not r.box_count:
+                    r.box_count = counts.get(r.name, 0)
+
+    return rows
 
 
 @frappe.whitelist()
@@ -4070,12 +4126,76 @@ def get_manifest_items_bulk(manifests):
         filters={"parent": ["in", list(se_to_manifest.keys())]},
         fields=["parent", "item_code", "item_name", "qty", "custom_quantity", "uom"],
     )
+    se_status = {
+        r.name: r.custom_status
+        for r in frappe.get_all(
+            "Stock Entry",
+            filters={"name": ["in", list(se_to_manifest.keys())]},
+            fields=["name", "custom_status"],
+        )
+    }
     for row in item_rows:
         for manifest_name in se_to_manifest.get(row.parent, []):
             out[manifest_name].append({
+                "stock_entry": row.parent,
                 "item_code": row.item_code,
                 "item_name": row.item_name,
                 "qty": flt(row.custom_quantity or row.qty),
                 "uom": row.uom,
+                "status": se_status.get(row.parent),
             })
     return out
+
+
+@frappe.whitelist()
+def get_stock_entry_serial_detail(stock_entry, item_code=None):
+    """Per-IMEI breakdown for one Stock Entry — backs the Control Tower's
+    manifest drill-down: clicking an Item Name there goes one level deeper
+    into which physical serials are in that transfer, for that item.
+
+    Prefers whichever serial list is most current for where the transfer
+    actually is right now, so a delivery person's scan at receipt shows up
+    here without needing a separate refresh path:
+      custom_final_scanned_serials (confirmed received at destination)
+      > custom_transferred_serials (marked transferred/dispatched)
+      > custom_scanned_serials     (scanned in transit)
+      > custom_original_serials / serial_no (as originally entered)
+
+    item_code: optional — narrows the result to just that item's rows
+    instead of every item on the order.
+    """
+    doc = frappe.get_doc("Stock Entry", stock_entry)
+    doc.check_permission("read")
+
+    status = doc.custom_status
+    rows = []
+    for item in doc.items:
+        if item_code and item.item_code != item_code:
+            continue
+        serials_raw = (
+            item.custom_final_scanned_serials
+            or item.custom_transferred_serials
+            or item.custom_scanned_serials
+            or item.custom_original_serials
+            or item.serial_no
+            or ""
+        )
+        serials = [s.strip() for s in serials_raw.split("\n") if s.strip()]
+        if not serials:
+            rows.append({
+                "serial_no": None,
+                "item_code": item.item_code,
+                "item_name": item.item_name,
+                "qty": flt(item.qty),
+                "status": status,
+            })
+            continue
+        for serial in serials:
+            rows.append({
+                "serial_no": serial,
+                "item_code": item.item_code,
+                "item_name": item.item_name,
+                "qty": 1,
+                "status": status,
+            })
+    return rows

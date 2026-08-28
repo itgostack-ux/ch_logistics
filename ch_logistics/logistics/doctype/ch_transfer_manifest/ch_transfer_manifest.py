@@ -824,9 +824,9 @@ class CHTransferManifest(Document):
             if not se:
                 skipped += 1
                 continue
-            if se.docstatus != 1:
+            if se.docstatus == 2:
                 skipped += 1
-                skipped_reasons.append(f"{se_name}: not submitted")
+                skipped_reasons.append(f"{se_name}: cancelled")
                 continue
             if not (se.bill_from_address and se.bill_to_address):
                 skipped += 1
@@ -1050,10 +1050,33 @@ class CHTransferManifest(Document):
         from ch_logistics.api.customer_tracking import notify_destination
         notify_destination(self.name, "out_for_delivery")
 
+    def _scanned_matches_own_shipment(self, scanned):
+        """True if ``scanned`` identifies a Stock Entry actually linked to
+        THIS manifest — either its bare name, or a box label of the form
+        ``{stock_entry}-B{NN}`` (see CH Stock Entry Box Label / pack_box_stock_entry).
+
+        This is the fallback proof-of-possession for drivers who have the
+        physical box in hand but not a separate printed manifest QR sheet —
+        weaker than the random qr_payload token (a Stock Entry name is
+        guessable if you already know the shipment), but still requires
+        knowing which specific Stock Entries are on THIS exact manifest, not
+        just any string, so it isn't a free pass around the scan requirement.
+        """
+        scanned = (scanned or "").strip()
+        if not scanned:
+            return False
+        stock_entries = {row.stock_entry for row in (self.transfers or []) if row.stock_entry}
+        if scanned in stock_entries:
+            return True
+        # Box label form: strip a trailing "-B<digits>" and compare what's left.
+        base = re.sub(r"-B\d+$", "", scanned)
+        return base in stock_entries
+
     def _validate_pickup_qr(self, scanned_qr):
         """Enforce the mandatory pickup scan (Ekart/Delhivery: every shipment is
         scanned at handover). The scanned payload must match this manifest's
-        ``qr_payload`` token (or, for legacy rows, the manifest name)."""
+        ``qr_payload`` token (or, for legacy rows, the manifest name), OR
+        identify one of this manifest's own Stock Entries / box labels."""
         enforce = frappe.db.get_single_value("CH Logistics Settings", "enforce_pickup_qr")
         if enforce is not None and not int(enforce):
             return
@@ -1062,12 +1085,48 @@ class CHTransferManifest(Document):
         if not scanned:
             frappe.throw(_("QR scan is mandatory. Scan the manifest/order QR to start pickup."),
                          title=_("Scan Required"))
+        if self._scanned_matches_own_shipment(scanned):
+            return
         if len(expected) < 22 or expected == self.name:
             frappe.throw(_("This manifest is missing a secure QR token. Reassign it before pickup."),
                          title=_("QR Token Missing"))
         if not hmac.compare_digest(scanned, expected):
             frappe.throw(_("Scanned QR does not match this manifest."),
                          title=_("Wrong QR"))
+
+    def _validate_pickup_qr_multi(self, stock_entry, scanned_list):
+        """Pickup-scan enforcement for one Stock Entry leg that may have
+        MULTIPLE physical boxes (CH Stock Entry Package) — every box's own
+        label must appear somewhere in ``scanned_list``, not just any one of
+        them, so a driver can't load 1 of 3 boxes and still mark the whole
+        shipment picked up. A Stock Entry with 0 or 1 box falls back to the
+        existing single-scan _validate_pickup_qr unchanged (its own
+        qr_payload/shipment-name check already covers that case).
+        """
+        scanned_list = [(s or "").strip() for s in (scanned_list or []) if (s or "").strip()]
+        box_labels = [
+            b for b in frappe.get_all(
+                "CH Stock Entry Package", filters={"parent": stock_entry}, pluck="package_label"
+            ) if b
+        ]
+        if len(box_labels) <= 1:
+            self._validate_pickup_qr(scanned_list[0] if scanned_list else "")
+            return
+        if not scanned_list:
+            frappe.throw(
+                _("Scan all {0} box QR codes for {1} before accepting.").format(
+                    len(box_labels), stock_entry
+                ),
+                title=_("Scan Required"),
+            )
+        missing = [b for b in box_labels if b not in scanned_list]
+        if missing:
+            frappe.throw(
+                _("{0} box(es) still need to be scanned for {1}: {2}").format(
+                    len(missing), stock_entry, ", ".join(missing)
+                ),
+                title=_("Scan All Boxes"),
+            )
 
     def _validate_delivery_qr(self, scanned_qr):
         """Enforce the mandatory delivery scan (same handover ritual as pickup,
@@ -1082,6 +1141,8 @@ class CHTransferManifest(Document):
         if not scanned:
             frappe.throw(_("QR scan is mandatory. Scan the manifest/order QR to complete delivery."),
                          title=_("Scan Required"))
+        if self._scanned_matches_own_shipment(scanned):
+            return
         if len(expected) < 22 or expected == self.name:
             frappe.throw(_("This manifest is missing a secure QR token. Reassign it before delivery."),
                          title=_("QR Token Missing"))

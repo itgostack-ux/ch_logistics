@@ -65,13 +65,13 @@ class DeliveryApp {
             <div class="da-statusbar" id="da-statusbar"></div>
             <div class="da-tabs">
                 <button class="da-tab active" data-tab="pickup">
-                    <i class="fa fa-camera"></i> ${__("Pickup")} <span class="da-tab-count" id="da-tab-count-pickup"></span>
+                    <i class="fa fa-camera"></i> ${__("Pickup Pending")} <span class="da-tab-count" id="da-tab-count-pickup"></span>
                 </button>
                 <button class="da-tab" data-tab="drop">
-                    <i class="fa fa-check-circle"></i> ${__("Drop")} <span class="da-tab-count" id="da-tab-count-drop"></span>
+                    <i class="fa fa-check-circle"></i> ${__("Delivery Pending")} <span class="da-tab-count" id="da-tab-count-drop"></span>
                 </button>
                 <button class="da-tab" data-tab="history">
-                    <i class="fa fa-history"></i> ${__("History")}
+                    <i class="fa fa-history"></i> ${__("Delivered")}
                 </button>
             </div>
             <div class="da-content" id="da-content">
@@ -116,12 +116,30 @@ class DeliveryApp {
                </button>`;
         this.$body.find("#da-statusbar").html(`
             <span class="da-status-pill ${cls}">${__(status)}</span>
+            <button id="da-refresh-btn" class="btn btn-default btn-xs" title="${__("Refresh")}">
+                <i class="fa fa-refresh"></i>
+            </button>
             ${toggle}
             ${signout}
         `);
     }
 
+    do_refresh() {
+        // In-app data refresh — re-fetches status/trips/manifests via the
+        // same calls load_data/load_status already use, without a full
+        // browser reload (which resets scroll position and re-downloads
+        // every asset, not just the data that actually changed).
+        const $btn = this.$body.find("#da-refresh-btn");
+        $btn.find("i").addClass("fa-spin");
+        this.load_status(() => {
+            this.load_data();
+            setTimeout(() => $btn.find("i").removeClass("fa-spin"), 400);
+        });
+    }
+
     bind_events() {
+        this.$body.on("click", "#da-refresh-btn", () => this.do_refresh());
+
         this.$body.on("click", ".da-tab", (e) => {
             this._switch_tab($(e.currentTarget).data("tab"));
         });
@@ -409,7 +427,10 @@ class DeliveryApp {
         // nowhere to render under the normal per-manifest bucket cards —
         // not Pickup (this leg is done), not Drop (the manifest itself is
         // still "Assigned") — so they'd be invisible until every sibling is
-        // also accepted. Surfaced as their own informational cards instead.
+        // also accepted. Surfaced as their own cards instead — fully
+        // actionable (Deliver), not just informational: pickup and delivery
+        // are both per-leg, so this shipment doesn't need to wait on its
+        // siblings to be delivered either.
         const manifests = this.manifests || [];
         const out = [];
         manifests.filter((m) => m.bucket === "to_pickup").forEach((m) => {
@@ -418,40 +439,6 @@ class DeliveryApp {
             });
         });
         return out;
-    }
-
-    _render_leg_awaiting_siblings_card(m, row) {
-        // Read-only counterpart to _render_leg_decision_card: this leg is
-        // already accepted and picked up, but delivery completion is still
-        // whole-manifest (OTP/seals/photo, unchanged) — it can't start
-        // until every sibling leg on this manifest is also accepted. No
-        // action buttons here on purpose; this is visibility only.
-        const se = frappe.utils.escape_html(row.stock_entry || "");
-        const from_label = window.ch_wh_label_html
-            ? ch_wh_label_html(row.from_warehouse, "—")
-            : frappe.utils.escape_html(row.from_warehouse || "—");
-        const to_label = window.ch_wh_label_html
-            ? ch_wh_label_html(row.to_warehouse, "—")
-            : frappe.utils.escape_html(row.to_warehouse || "—");
-        const pending = (m.transfers || []).filter((r) => !r.driver_accepted_at).length;
-        const wait_msg = pending > 0
-            ? __("Picked up — waiting on {0} more shipment(s) on this manifest", [pending])
-            : __("Picked up — manifest updating…");
-        return `
-            <div class="da-stop-card">
-                <div class="da-stop-where">
-                    <i class="fa fa-map-marker"></i> ${from_label}
-                    <i class="fa fa-long-arrow-right" style="margin:0 4px;"></i>
-                    ${to_label}
-                </div>
-                <div class="text-muted" style="font-size:11px;padding:0 8px 6px;">
-                    <i class="fa fa-file-text-o"></i> ${se}
-                    <span class="text-muted" style="margin-left:8px;"><i class="fa fa-truck"></i> ${frappe.utils.escape_html(m.name)}</span>
-                </div>
-                <div class="da-stop-actions">
-                    <span class="da-card-status da-status-completed"><i class="fa fa-check-circle"></i> ${wait_msg}</span>
-                </div>
-            </div>`;
     }
 
     _render_leg_deliver_card(m, row, trip) {
@@ -508,7 +495,7 @@ class DeliveryApp {
         //
         // Drop also surfaces individually-accepted legs whose manifest
         // hasn't rolled up to In Transit yet (see _orphan_accepted_legs) —
-        // informational cards, not full manifest cards.
+        // per-leg cards, same actionable Deliver card any other leg gets.
         const manifests = this.manifests || [];
         const rows = manifests.filter((m) => m.bucket === bucketFilter);
         const orphan_legs = bucketFilter === "in_transit" ? this._orphan_accepted_legs() : [];
@@ -521,7 +508,11 @@ class DeliveryApp {
             return;
         }
         const manifest_cards = rows.map((m) => this._render_board_manifest_card(m)).join("");
-        const orphan_cards = orphan_legs.map(({ m, row }) => this._render_leg_awaiting_siblings_card(m, row)).join("");
+        // Per explicit request: a leg is deliverable as soon as ITS OWN
+        // pickup is captured, independent of sibling Stock Entries on the
+        // same manifest — so these get the same actionable Deliver card an
+        // In Transit manifest's legs get, not a read-only "waiting" one.
+        const orphan_cards = orphan_legs.map(({ m, row }) => this._render_leg_deliver_card(m, row, m.trip)).join("");
         $c.html(`<div class="da-manifest-list">${manifest_cards}${orphan_cards}</div>`);
     }
 
@@ -609,36 +600,10 @@ class DeliveryApp {
         // across all their trips at once, so accepting one shipment should
         // just refresh the board, not jump them into a single trip's page.
         if (!name || !trip) return;
-        // Same empty-stop pre-flight do_manifest_accept runs before a
-        // trip's FIRST accept (which is what actually flips it to
-        // Started) — skipping it here would hit the server's hard throw
-        // instead of a dismissible warning. this.trips.active carries each
-        // trip's current status, same data trip_card() already renders
-        // from, so no extra round-trip is needed to check that part.
-        const trip_row = ((this.trips && this.trips.active) || []).find((t) => t.name === trip);
-        if (trip_row && trip_row.status === "Assigned") {
-            // Load the trip detail first — _describe_empty_stops needs
-            // this._trip_detail.stops to resolve store names. Without it,
-            // this fell back to bare "#2, #3, #5" (the board has no trip
-            // context loaded yet at this point, unlike the trip page's own
-            // Accept flow which already has it).
-            this._load_trip_detail_silently(trip, () => {
-                this._call_promise(TRIP_API + "get_empty_stop_warning", { trip }).then((info) => {
-                    const empty = (info && info.empty_stops) || [];
-                    if (!empty.length) {
-                        this._submit_board_manifest_accept(name, trip, 0);
-                        return;
-                    }
-                    frappe.confirm(
-                        __("Stop(s) {0} on {1} have no shipments assigned — nothing to load or unload there. Start anyway?",
-                            [this._describe_empty_stops(empty).join(", "), trip]),
-                        () => this._submit_board_manifest_accept(name, trip, 1)
-                    );
-                });
-            });
-            return;
-        }
-        this._submit_board_manifest_accept(name, trip, 0);
+        // Empty-stop warning popup removed per explicit request — always
+        // pass override_empty_stops=1 so the server's own guard never
+        // blocks either, regardless of trip status.
+        this._submit_board_manifest_accept(name, trip, 1);
     }
 
     _submit_board_manifest_accept(name, trip, overrideEmptyStops) {
@@ -2030,21 +1995,6 @@ class DeliveryApp {
         });
     }
 
-    _describe_empty_stops(seqs) {
-        // Empty-stop warnings default to bare sequence numbers ("#2, #3")
-        // which mean nothing to a driver mid-route. Resolve each to the
-        // same store/warehouse label already shown on its stop card.
-        const t = this._trip_detail || {};
-        return (seqs || []).map((seq) => {
-            const stop = (t.stops || []).find((s) => cint(s.sequence) === cint(seq));
-            if (!stop) return "#" + seq;
-            const label = stop.store
-                ? stop.store
-                : (window.ch_wh_label_html ? ch_wh_label_html(stop.warehouse, "") : (stop.warehouse || ""));
-            return frappe.utils.escape_html(label || ("#" + seq));
-        });
-    }
-
     do_trip_accept() {
         // Carrier-grade trip-start gate (Delhivery / BlueDart / Ekart / Bringg
         // / FarEye dock-out flow): the driver must verify that every shipment
@@ -2059,24 +2009,9 @@ class DeliveryApp {
         // stop; later pickup stops keep using the per-stop "Arrive & Pick Up"
         // dialog.
         //
-        // Pre-flight the server's empty-stop warning ONCE up front, whichever
-        // path (quick-accept or the QR-scan gate below) ends up firing —
-        // both call driver_accept_trip and would otherwise hit the same
-        // throw. One confirm here instead of a failed call + retry.
-        this._call_promise(TRIP_API + "get_empty_stop_warning", {
-            trip: this.active_trip,
-        }).then((info) => {
-            const empty = (info && info.empty_stops) || [];
-            if (!empty.length) {
-                this._do_trip_accept_proceed(0);
-                return;
-            }
-            frappe.confirm(
-                __("Stop(s) {0} have no shipments assigned — nothing to load or unload there. Start anyway?",
-                    [this._describe_empty_stops(empty).join(", ")]),
-                () => this._do_trip_accept_proceed(1)
-            );
-        });
+        // Empty-stop warning popup removed per explicit request — always
+        // pass override_empty_stops=1 so the server's own guard never blocks.
+        this._do_trip_accept_proceed(1);
     }
 
     _do_trip_accept_proceed(overrideEmptyStops) {
@@ -2142,30 +2077,10 @@ class DeliveryApp {
         // unlocks that button for THIS manifest and, on the first accept of
         // the trip, flips it to Started so pickup actions are allowed.
         if (!name) return;
-        const t = this._trip_detail || {};
-        if (t.status === "Assigned") {
-            // First accept on this trip is what triggers mark_started() —
-            // same empty-stop gate driver_accept_trip already pre-flights,
-            // otherwise this call would hit the server's hard throw instead
-            // of a dismissible warning. Started trips skip this: the gate
-            // only fires on the Assigned → Started transition.
-            this._call_promise(TRIP_API + "get_empty_stop_warning", {
-                trip: this.active_trip,
-            }).then((info) => {
-                const empty = (info && info.empty_stops) || [];
-                if (!empty.length) {
-                    this._submit_manifest_accept(name, 0);
-                    return;
-                }
-                frappe.confirm(
-                    __("Stop(s) {0} have no shipments assigned — nothing to load or unload there. Start anyway?",
-                        [this._describe_empty_stops(empty).join(", ")]),
-                    () => this._submit_manifest_accept(name, 1)
-                );
-            });
-            return;
-        }
-        this._submit_manifest_accept(name, 0);
+        // Empty-stop warning popup removed per explicit request — always
+        // pass override_empty_stops=1 so the server's own guard never
+        // blocks, regardless of trip status.
+        this._submit_manifest_accept(name, 1);
     }
 
     _submit_manifest_accept(name, overrideEmptyStops) {
@@ -2198,33 +2113,20 @@ class DeliveryApp {
         if (!manifest || !stock_entry || !trip) return;
         const in_trip_view = this.active_trip === trip && this._trip_detail && this._trip_detail.name === trip;
 
-        const proceed_with_status = (status) => {
-            if (status === "Assigned") {
-                this._call_promise(TRIP_API + "get_empty_stop_warning", { trip }).then((info) => {
-                    const empty = (info && info.empty_stops) || [];
-                    if (!empty.length) {
-                        this._open_leg_pickup_dialog(manifest, stock_entry, trip, 0, in_trip_view);
-                        return;
-                    }
-                    frappe.confirm(
-                        __("Stop(s) {0} have no shipments assigned — nothing to load or unload there. Start anyway?",
-                            [this._describe_empty_stops(empty).join(", ")]),
-                        () => this._open_leg_pickup_dialog(manifest, stock_entry, trip, 1, in_trip_view)
-                    );
-                });
-                return;
-            }
-            this._open_leg_pickup_dialog(manifest, stock_entry, trip, 0, in_trip_view);
+        // Empty-stop warning popup removed per explicit request — always
+        // pass override_empty_stops=1 so the server's own guard (which the
+        // popup used to pre-empt) never blocks either, regardless of status.
+        const proceed_with_status = () => {
+            this._open_leg_pickup_dialog(manifest, stock_entry, trip, 1, in_trip_view);
         };
 
         if (in_trip_view) {
-            proceed_with_status(this._trip_detail.status);
+            proceed_with_status();
         } else {
             // Board context (or a different trip currently open) — load
-            // THIS trip's detail silently first (needed for
-            // _describe_empty_stops' store names), without navigating the
+            // THIS trip's detail silently first, without navigating the
             // driver off the board underneath them.
-            this._load_trip_detail_silently(trip, () => proceed_with_status(this._trip_detail.status));
+            this._load_trip_detail_silently(trip, () => proceed_with_status());
         }
     }
 
@@ -2236,9 +2138,17 @@ class DeliveryApp {
         // _do_stop_pickup_flow) so it can be shown to the driver in the
         // dialog instead of only silently captured on submit.
         frappe.dom.freeze(__("Capturing location…"));
-        this._capture_gps_promise()
-            .then((gps) => {
+        Promise.all([
+            this._capture_gps_promise(),
+            this._call_promise(TRIP_API + "get_stock_entry_box_labels", { stock_entry }).catch(() => []),
+        ])
+            .then(([gps, box_labels]) => {
                 frappe.dom.unfreeze();
+                box_labels = box_labels || [];
+                if (box_labels.length > 1) {
+                    this._open_leg_pickup_dialog_multibox(manifest, stock_entry, trip, overrideEmptyStops, in_trip_view, gps, box_labels);
+                    return;
+                }
                 const d = new frappe.ui.Dialog({
                     title: __("Accept & Pick Up — {0}", [stock_entry]),
                     size: "small",
@@ -2277,6 +2187,95 @@ class DeliveryApp {
             });
     }
 
+    /**
+     * Multi-box variant of the pickup dialog — a Stock Entry with more than
+     * one physical box (CH Stock Entry Package) must have EVERY box's own
+     * label scanned before accepting, not just any one of them, otherwise a
+     * driver could load 1 of 3 boxes and still mark the whole shipment
+     * picked up. Each successful scan checks off one box in the list;
+     * "Confirm & Accept" stays disabled until the list is complete.
+     */
+    _open_leg_pickup_dialog_multibox(manifest, stock_entry, trip, overrideEmptyStops, in_trip_view, gps, box_labels) {
+        const scanned = new Set();
+        const box_row_html = (label) => `
+            <div class="da-box-scan-row" data-box="${frappe.utils.escape_html(label)}" style="display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid #eee;">
+                <i class="fa fa-circle-o da-box-scan-icon" style="color:#ccc;width:16px"></i>
+                <span style="font-family:monospace">${frappe.utils.escape_html(label)}</span>
+            </div>`;
+        const d = new frappe.ui.Dialog({
+            title: __("Accept & Pick Up — {0}", [stock_entry]),
+            size: "small",
+            fields: [
+                {
+                    fieldname: "summary", fieldtype: "HTML",
+                    options: `<div class="alert alert-info" style="padding:8px 10px;border-radius:6px;margin-bottom:8px;">
+                        ${__("This shipment has <b>{0}</b> boxes — scan each box's own QR label before accepting.", [box_labels.length])}
+                    </div>`,
+                },
+                ...this._gps_display_fields(gps),
+                {
+                    fieldname: "pickup_photo", fieldtype: "Attach Image",
+                    label: __("Photo of Goods"), reqd: 1,
+                },
+                {
+                    fieldname: "scanned_qr", fieldtype: "Data", options: "Barcode",
+                    label: __("Scan Box QR"),
+                },
+                {
+                    fieldname: "box_list_html", fieldtype: "HTML",
+                    options: `<div class="da-box-scan-list">${box_labels.map(box_row_html).join("")}</div>
+                        <div class="da-box-scan-progress" style="margin-top:6px;font-size:12px;color:#888">
+                            ${__("0 of {0} boxes scanned", [box_labels.length])}
+                        </div>`,
+                },
+            ],
+            primary_action_label: __("Confirm & Accept"),
+            primary_action: (values) => {
+                d.hide();
+                const all_scans = Array.from(scanned);
+                this._submit_leg_accept(manifest, stock_entry, trip, overrideEmptyStops, in_trip_view, {
+                    pickup_photo: values.pickup_photo,
+                    scanned_qr: all_scans[0],
+                    additional_scanned_qrs: JSON.stringify(all_scans.slice(1)),
+                    lat: gps.lat, lng: gps.lng, gps_accuracy_m: gps.accuracy,
+                });
+            },
+        });
+        d.disable_primary_action();
+
+        const register_scan = (value) => {
+            value = (value || "").trim();
+            if (!value) return;
+            const $row = d.$wrapper.find(`.da-box-scan-row[data-box="${$.escapeSelector(value)}"]`);
+            if (!$row.length) {
+                frappe.show_alert({ message: __("{0} is not one of this shipment's boxes.", [value]), indicator: "red" });
+                return;
+            }
+            if (!scanned.has(value)) {
+                scanned.add(value);
+                $row.find(".da-box-scan-icon").removeClass("fa-circle-o").addClass("fa-check-circle").css("color", "#28a745");
+                d.$wrapper.find(".da-box-scan-progress").text(__("{0} of {1} boxes scanned", [scanned.size, box_labels.length]));
+                if (scanned.size >= box_labels.length) {
+                    d.enable_primary_action();
+                } else {
+                    d.disable_primary_action();
+                }
+            }
+            d.set_value("scanned_qr", "");
+        };
+        // Handheld scanners emit an Enter/newline after the code rather than
+        // blurring the field, so "change" alone (blur-driven) isn't reliable
+        // for rapid consecutive scans — also catch Enter directly.
+        d.fields_dict.scanned_qr.$input.on("change", (e) => register_scan(e.target.value));
+        d.fields_dict.scanned_qr.$input.on("keydown", (e) => {
+            if (e.key === "Enter") {
+                e.preventDefault();
+                register_scan(e.target.value);
+            }
+        });
+        d.show();
+    }
+
     _submit_leg_accept(manifest, stock_entry, trip, overrideEmptyStops, in_trip_view, capture) {
         frappe.dom.freeze(__("Accepting…"));
         this._call_promise(TRIP_API + "driver_accept_manifest_row", {
@@ -2289,6 +2288,7 @@ class DeliveryApp {
             lng: capture.lng,
             gps_accuracy_m: capture.gps_accuracy_m,
             override_empty_stops: overrideEmptyStops ? 1 : 0,
+            additional_scanned_qrs: capture.additional_scanned_qrs,
         }).then(() => {
             frappe.dom.unfreeze();
             frappe.show_alert({ message: __("Shipment accepted"), indicator: "green" });

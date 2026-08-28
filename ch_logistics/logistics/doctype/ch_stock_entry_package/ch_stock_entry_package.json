@@ -11,6 +11,7 @@
   "weight_kg",
   "dimensions_cm",
   "seal_number",
+  "seal_status",
   "sec_break_items",
   "items",
   "sec_break_meta",
@@ -57,6 +58,14 @@
    "fieldname": "seal_number",
    "fieldtype": "Data",
    "label": "Seal / Tamper Tag"
+  },
+  {
+   "description": "Visual state of the seal at pack time, separate from the seal_number tag ID used for chain-of-custody verification at delivery.",
+   "fieldname": "seal_status",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "label": "Seal Status",
+   "options": "\nSealed\nOpen"
   },
   {
    "fieldname": "sec_break_items",
