@@ -2223,10 +2223,7 @@ class DeliveryApp {
                 },
                 {
                     fieldname: "box_list_html", fieldtype: "HTML",
-                    options: `<div class="da-box-scan-list">${box_labels.map(box_row_html).join("")}</div>
-                        <div class="da-box-scan-progress" style="margin-top:6px;font-size:12px;color:#888">
-                            ${__("0 of {0} boxes scanned", [box_labels.length])}
-                        </div>`,
+                    options: `<div class="da-box-scan-list">${box_labels.map(box_row_html).join("")}</div>`,
                 },
             ],
             primary_action_label: __("Confirm & Accept"),
@@ -2254,7 +2251,6 @@ class DeliveryApp {
             if (!scanned.has(value)) {
                 scanned.add(value);
                 $row.find(".da-box-scan-icon").removeClass("fa-circle-o").addClass("fa-check-circle").css("color", "#28a745");
-                d.$wrapper.find(".da-box-scan-progress").text(__("{0} of {1} boxes scanned", [scanned.size, box_labels.length]));
                 if (scanned.size >= box_labels.length) {
                     d.enable_primary_action();
                 } else {
