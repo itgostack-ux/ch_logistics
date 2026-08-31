@@ -6,7 +6,7 @@ the scheduler.
 """
 import frappe
 from frappe import _
-from frappe.utils import nowdate, now_datetime, cint, get_url_to_report
+from frappe.utils import cint, get_url_to_report, now_datetime, nowdate
 
 from ch_logistics.api import driver_status as ds
 from ch_logistics.roles import get_int_setting
@@ -202,7 +202,8 @@ def send_logistics_daily_digest():
 @frappe.whitelist()
 def preview_digest(company=None):
     """Render the digest HTML without sending — for a quick admin preview."""
-    from ch_logistics import roles as role_registry, scope_guard
+    from ch_logistics import roles as role_registry
+    from ch_logistics import scope_guard
     role_registry.require("digest_preview", "preview the logistics digest")
     company = company or frappe.defaults.get_user_default("Company")
     if not company:

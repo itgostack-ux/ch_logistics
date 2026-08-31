@@ -1,11 +1,16 @@
 """Driver Delivery Worksheet — a driver's own manifests for a day with proof
 status. Delivery staff see their own row by default; ops can pick any driver."""
 import frappe
+from ch_erp15.ch_erp15.report_scope import scope_where_clause
 from frappe import _
 from frappe.utils import today
 
-from ch_erp15.ch_erp15.report_scope import scope_where_clause
-from ch_logistics.api.report_utils import col, current_driver, is_ops_user, resolve_company
+from ch_logistics.api.report_utils import (
+    col,
+    current_driver,
+    is_ops_user,
+    resolve_company,
+)
 
 
 def execute(filters=None):

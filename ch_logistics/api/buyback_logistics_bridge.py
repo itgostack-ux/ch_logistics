@@ -26,7 +26,6 @@ still review and submit / dispatch via the existing flows.
 from __future__ import annotations
 
 import frappe
-from frappe import _
 from frappe.utils import cint, today
 
 from ch_logistics.api.trip_lock import get_locked_trip, lock_manifests

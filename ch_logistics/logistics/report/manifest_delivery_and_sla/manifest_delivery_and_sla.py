@@ -5,7 +5,7 @@ head. SLA is derived from estimated_delivery_date vs actual delivery (or now).
 """
 import frappe
 from frappe import _
-from frappe.utils import now_datetime, get_datetime, time_diff_in_hours, cint
+from frappe.utils import cint, get_datetime, now_datetime, time_diff_in_hours
 
 from ch_logistics.api.report_utils import col, manifest_conditions
 

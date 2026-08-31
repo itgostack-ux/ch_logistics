@@ -49,7 +49,6 @@ import frappe
 from frappe import _
 from frappe.utils import cint
 
-
 # SEED SOURCE ONLY — not a runtime fallback.  setup._provision_access_control()
 # copies these into CH Logistics Settings -> Role Matrix once per function key
 # (never overwriting existing rows), and get_roles_for() then reads the DB

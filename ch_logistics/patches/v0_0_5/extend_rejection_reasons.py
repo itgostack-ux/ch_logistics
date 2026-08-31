@@ -19,7 +19,6 @@ Two changes — both idempotent so the patch can be re-run safely:
 import frappe
 from frappe.custom.doctype.custom_field.custom_field import create_custom_fields
 
-
 REJECTION_REASON_OPTIONS = "\n".join([
     "",
     # Pickup-time reasons

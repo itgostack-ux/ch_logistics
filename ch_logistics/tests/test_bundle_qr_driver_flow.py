@@ -38,7 +38,6 @@ from frappe.utils import nowdate
 
 from ch_logistics.api import logistics_api as api
 
-
 _TAG = "BUNDLE-DRIVER-E2E"
 
 

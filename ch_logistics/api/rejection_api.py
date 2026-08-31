@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import frappe
 from frappe import _
-from frappe.utils import cint, flt, now_datetime
+from frappe.utils import cint, flt
 
 
 def _current_driver() -> str | None:
@@ -178,8 +178,8 @@ def _maybe_complete_manifest_pickup(manifest_name: str) -> None:
 
 	No-op if the manifest isn't fully accepted yet, or is already rolled up.
 	"""
-	from ch_logistics.api.trip_lock import get_locked_trip
 	from ch_logistics.api.logistics_api import _set_driver_availability
+	from ch_logistics.api.trip_lock import get_locked_trip
 
 	lock_key = f"manifest_status_{frappe.scrub(manifest_name)}"
 	if not frappe.db.sql("SELECT GET_LOCK(%s, 10)", (lock_key,))[0][0]:
@@ -280,7 +280,8 @@ def driver_reject_manifest_row(manifest: str, stock_entry: str, rejection_reason
 def list_rejections(status: str | None = None, driver: str | None = None,
 					limit: int = 100) -> list[dict]:
 	"""Dispatcher view — recent rejections, optionally filtered."""
-	from ch_logistics import roles as role_registry, scope_guard
+	from ch_logistics import roles as role_registry
+	from ch_logistics import scope_guard
 
 	role_registry.require("ops_view")
 	filters = {}

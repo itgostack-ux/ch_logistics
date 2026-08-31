@@ -11,7 +11,6 @@ from ch_logistics.logistics.doctype.ch_transfer_manifest.ch_transfer_manifest im
     delivery_otp_digest,
 )
 
-
 _ACTIVE_MANIFEST_STATUSES = (
     "Draft",
     "Packed",

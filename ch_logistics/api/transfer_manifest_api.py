@@ -17,7 +17,6 @@ from frappe import _
 from frappe.rate_limiter import rate_limit
 from frappe.utils import cint, flt
 
-
 # ── Role gating (Phase B — Outward / Inward governance) ─────────────────────
 # Stage → allowed-roles mapping lives in the central registry
 # (ch_logistics.roles), overridable per-site via CH Logistics Settings →
@@ -161,8 +160,10 @@ def get_manifest(manifest) -> dict:
     """Return full manifest doc as dict."""
     doc = frappe.get_doc("CH Transfer Manifest", manifest)
     doc.check_permission("read")
-    from ch_logistics.api.driver_resolver import assert_manifest_driver_access
-    from ch_logistics.api.driver_resolver import resolve_current_driver
+    from ch_logistics.api.driver_resolver import (
+        assert_manifest_driver_access,
+        resolve_current_driver,
+    )
 
     assert_manifest_driver_access(doc, scope_side="either")
     if resolve_current_driver(throw=False) == doc.driver:

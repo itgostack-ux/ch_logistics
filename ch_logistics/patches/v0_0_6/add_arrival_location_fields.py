@@ -19,7 +19,6 @@ order: pickup → arrival → delivery.
 import frappe
 from frappe.custom.doctype.custom_field.custom_field import create_custom_fields
 
-
 CUSTOM_FIELDS = {
     "CH Transfer Manifest": [
         {

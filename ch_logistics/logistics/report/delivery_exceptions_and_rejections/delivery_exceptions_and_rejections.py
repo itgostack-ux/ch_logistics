@@ -1,9 +1,9 @@
 """Delivery Exceptions and Rejections — one inbox of every pickup rejection and
 in-trip exception, for logistics head / ops follow-up."""
 import frappe
+from ch_erp15.ch_erp15.report_scope import scope_where_clause
 from frappe import _
 
-from ch_erp15.ch_erp15.report_scope import scope_where_clause
 from ch_logistics.api.report_utils import col, resolve_company
 
 

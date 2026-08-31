@@ -23,11 +23,11 @@ from frappe import _
 from frappe.rate_limiter import rate_limit
 from frappe.utils import add_to_date, cint, flt, now_datetime
 
+from ch_logistics import roles as role_registry
+from ch_logistics import scope_guard
 from ch_logistics.logistics.doctype.ch_tracking_settings.ch_tracking_settings import (
 	get_public_config,
 )
-from ch_logistics import roles as role_registry, scope_guard
-
 
 # ----- Driver resolution ---------------------------------------------------
 

@@ -27,10 +27,10 @@ Efficiency by Lane, D365 Route Utilisation by Driver.
 from __future__ import annotations
 
 import frappe
+from ch_erp15.ch_erp15.report_scope import scope_where_clause
 from frappe import _
 from frappe.utils import add_days, flt, getdate, nowdate
 
-from ch_erp15.ch_erp15.report_scope import scope_where_clause
 from ch_logistics import roles as role_registry
 from ch_logistics.api.report_utils import col, resolve_company
 

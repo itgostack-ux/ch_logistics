@@ -13,9 +13,8 @@ in-scope users receive an OR chain across all relevant store / warehouse
 columns, and scoped users with an empty scope receive ``1=0`` (zero rows).
 """
 import frappe
-from frappe.utils import flt  # noqa: F401  (re-exported for report convenience)
-
 from ch_erp15.ch_erp15.report_scope import scope_where_clause
+from frappe.utils import flt  # noqa: F401  (re-exported for report convenience)
 
 
 def resolve_company(filters):

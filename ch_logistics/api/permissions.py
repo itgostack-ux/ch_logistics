@@ -32,7 +32,8 @@ def _scope_clause(table: str, warehouse_field: str, company_field: str, user: st
 
 
 def _trip_visible(doc, user: str, write: bool = False) -> bool:
-	from ch_logistics import roles as role_registry, scope_guard
+	from ch_logistics import roles as role_registry
+	from ch_logistics import scope_guard
 
 	if role_registry.is_privileged(user):
 		return True
@@ -107,7 +108,8 @@ def driver_break_query_condition(user: str | None = None) -> str:
 
 
 def has_driver_break_permission(doc, user: str | None = None, permission_type: str | None = None) -> bool:
-	from ch_logistics import roles as role_registry, scope_guard
+	from ch_logistics import roles as role_registry
+	from ch_logistics import scope_guard
 
 	user = user or frappe.session.user
 	if role_registry.is_privileged(user) or doc.get("driver") == _driver_for_user(user):
@@ -140,7 +142,8 @@ def driver_location_query_condition(user: str | None = None) -> str:
 
 
 def has_driver_location_permission(doc, user: str | None = None, permission_type: str | None = None) -> bool:
-	from ch_logistics import roles as role_registry, scope_guard
+	from ch_logistics import roles as role_registry
+	from ch_logistics import scope_guard
 
 	user = user or frappe.session.user
 	if role_registry.is_privileged(user) or doc.get("driver") == _driver_for_user(user):
@@ -173,7 +176,8 @@ def manifest_rejection_query_condition(user: str | None = None) -> str:
 
 
 def has_manifest_rejection_permission(doc, user: str | None = None, permission_type: str | None = None) -> bool:
-	from ch_logistics import roles as role_registry, scope_guard
+	from ch_logistics import roles as role_registry
+	from ch_logistics import scope_guard
 
 	user = user or frappe.session.user
 	if role_registry.is_privileged(user) or doc.get("driver") == _driver_for_user(user):

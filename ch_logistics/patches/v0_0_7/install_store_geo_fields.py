@@ -16,7 +16,6 @@ Idempotent.
 import frappe
 from frappe.custom.doctype.custom_field.custom_field import create_custom_fields
 
-
 CUSTOM_FIELDS = {
     "CH Store": [
         {
@@ -131,7 +130,7 @@ def execute():
     if frappe.db.has_column("Warehouse", "custom_latitude") and frappe.db.has_column(
         "Warehouse", "custom_longitude"
     ):
-        for store_name in STORE_SEED.keys():
+        for store_name in STORE_SEED:
             row = frappe.db.get_value(
                 "CH Store",
                 store_name,

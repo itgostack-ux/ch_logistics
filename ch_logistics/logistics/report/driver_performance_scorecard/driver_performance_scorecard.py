@@ -5,10 +5,10 @@ Driver filter). Merges trip, delivery, rejection, exception and scan-compliance
 aggregates into one row per driver.
 """
 import frappe
+from ch_erp15.ch_erp15.report_scope import scope_where_clause
 from frappe import _
 from frappe.utils import flt
 
-from ch_erp15.ch_erp15.report_scope import scope_where_clause
 from ch_logistics.api.report_utils import col, resolve_company
 
 

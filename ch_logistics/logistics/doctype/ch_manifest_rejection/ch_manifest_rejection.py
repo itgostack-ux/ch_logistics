@@ -111,7 +111,9 @@ class CHManifestRejection(Document):
 		company = frappe.db.get_value("CH Transfer Manifest", self.manifest, "company")
 		if company:
 			try:
-				from ch_erp15.ch_erp15.notification_router import filter_users_by_company
+				from ch_erp15.ch_erp15.notification_router import (
+					filter_users_by_company,
+				)
 
 				dispatchers = filter_users_by_company(dispatchers, company)
 			except Exception:

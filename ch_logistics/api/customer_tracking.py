@@ -12,7 +12,7 @@ import re
 import frappe
 from frappe import _
 from frappe.rate_limiter import rate_limit
-from frappe.utils import cint, get_url, now_datetime
+from frappe.utils import cint, get_url
 
 # Public, recipient-safe status labels (no internal vocabulary leaked).
 _PUBLIC_STATUS = {
@@ -196,7 +196,9 @@ def _destination_contacts(destination_store):
     """Resolve (users, emails, phones) for the destination store, reusing the
     transfer-manifest contact resolver."""
     try:
-        from ch_logistics.api.transfer_manifest_api import _collect_store_manager_contacts
+        from ch_logistics.api.transfer_manifest_api import (
+            _collect_store_manager_contacts,
+        )
         return _collect_store_manager_contacts(destination_store)
     except Exception:
         return ([], [], [])

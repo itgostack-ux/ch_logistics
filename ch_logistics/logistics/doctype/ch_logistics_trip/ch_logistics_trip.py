@@ -5,7 +5,6 @@ from frappe import _
 from frappe.model.document import Document
 from frappe.utils import get_datetime, now_datetime
 
-
 # Status machine -----------------------------------------------------------
 # Draft → Assigned → Started → Completed → Closed
 #               ↘ Cancelled (from Draft / Assigned only)
@@ -94,7 +93,8 @@ class CHLogisticsTrip(Document):
             )
 
     def _validate_actor_scope(self):
-        from ch_logistics import roles as role_registry, scope_guard
+        from ch_logistics import roles as role_registry
+        from ch_logistics import scope_guard
 
         if role_registry.is_privileged():
             return
@@ -329,9 +329,7 @@ class CHLogisticsTrip(Document):
     def _recompute_totals(self):
         # Total shipments = manifests linked to this trip (resolved on save).
         rows = []
-        if self.is_new() or not self.name:
-            self.total_shipments = 0
-        elif not frappe.db.has_column("CH Transfer Manifest", "trip"):
+        if self.is_new() or not self.name or not frappe.db.has_column("CH Transfer Manifest", "trip"):
             self.total_shipments = 0
         else:
             has_seq = frappe.db.has_column("CH Transfer Manifest", "stop_sequence")

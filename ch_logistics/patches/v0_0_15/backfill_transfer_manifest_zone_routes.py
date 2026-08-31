@@ -8,7 +8,6 @@ manifests are already submitted.
 from __future__ import annotations
 
 import frappe
-
 from ch_erp15.ch_erp15.doctype.ch_route.ch_route import (
     get_or_create_zone_route,
     get_route_for_destination,

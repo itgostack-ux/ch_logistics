@@ -73,12 +73,11 @@ class TestManifestReversalWorkflow(unittest.TestCase):
     def test_duplicate_return_scan_is_rejected(self):
         with patch.object(
             self.manifest, "get_return_requirements", return_value=self._requirements()
-        ):
-            with self.assertRaises(frappe.ValidationError):
-                self.manifest.confirm_return(
-                    return_photo="/files/return.jpg",
-                    returned_serials=["IMEI-001", "IMEI-001"],
-                )
+        ), self.assertRaises(frappe.ValidationError):
+            self.manifest.confirm_return(
+                return_photo="/files/return.jpg",
+                returned_serials=["IMEI-001", "IMEI-001"],
+            )
 
     def test_nonserialized_return_requires_exact_physical_count(self):
         requirements = {
@@ -161,9 +160,8 @@ class TestManifestReversalWorkflow(unittest.TestCase):
             self.manifest,
             "_reverse_stock_entries",
             side_effect=frappe.ValidationError("cannot reverse"),
-        ):
-            with self.assertRaises(frappe.ValidationError):
-                self.manifest.cancel_before_departure("Trip cancelled")
+        ), self.assertRaises(frappe.ValidationError):
+            self.manifest.cancel_before_departure("Trip cancelled")
         self.assertEqual(
             frappe.db.get_value("CH Transfer Manifest", self.manifest.name, "status"),
             "Packed",

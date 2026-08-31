@@ -11,8 +11,8 @@ import frappe
 
 from ch_logistics import roles, scope_guard
 from ch_logistics.api import (
-    digest,
     customer_tracking,
+    digest,
     driver_api,
     driver_resolver,
     logistics_api,

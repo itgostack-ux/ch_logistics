@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import frappe
 
-
 _DOCTYPES = (
 	"CH Logistics Trip",
 	"CH Logistics Trip Stop",

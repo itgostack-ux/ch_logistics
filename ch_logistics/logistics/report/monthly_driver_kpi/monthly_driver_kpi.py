@@ -27,10 +27,10 @@ Manager Monthly KPI, D365 Transportation Monthly Performance.
 from __future__ import annotations
 
 import frappe
+from ch_erp15.ch_erp15.report_scope import scope_where_clause
 from frappe import _
 from frappe.utils import flt
 
-from ch_erp15.ch_erp15.report_scope import scope_where_clause
 from ch_logistics.api.report_utils import col, resolve_company
 
 

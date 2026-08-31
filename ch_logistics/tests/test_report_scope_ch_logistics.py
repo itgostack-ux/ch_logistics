@@ -27,13 +27,12 @@ from __future__ import annotations
 import unittest
 
 import frappe
-
 from ch_erp15.ch_erp15.scope import clear_scope_cache
+
 from ch_logistics.api.report_utils import (
     manifest_conditions,
     trip_conditions,
 )
-
 
 _TEST_USER = "tier4-log-user@ch-tests.local"
 _TEST_STORE = "TIER4-LOG-STORE-A"
@@ -183,17 +182,17 @@ class TestReportScopeChLogistics(unittest.TestCase):
 
     # 6 — reports routed through manifest_conditions / trip_conditions
     def test_06_helper_reports_scoped(self):
-        from ch_logistics.logistics.report.freight_and_delivery_cost.freight_and_delivery_cost import (
-            execute as freight_execute,
-        )
-        from ch_logistics.logistics.report.manifest_delivery_and_sla.manifest_delivery_and_sla import (
-            execute as sla_execute,
-        )
         from ch_logistics.logistics.report.fleet_and_vehicle_utilization.fleet_and_vehicle_utilization import (
             execute as fleet_execute,
         )
+        from ch_logistics.logistics.report.freight_and_delivery_cost.freight_and_delivery_cost import (
+            execute as freight_execute,
+        )
         from ch_logistics.logistics.report.logistics_trip_performance.logistics_trip_performance import (
             execute as trip_execute,
+        )
+        from ch_logistics.logistics.report.manifest_delivery_and_sla.manifest_delivery_and_sla import (
+            execute as sla_execute,
         )
         for fn in (freight_execute, sla_execute, fleet_execute, trip_execute):
             result = fn({})
@@ -201,17 +200,17 @@ class TestReportScopeChLogistics(unittest.TestCase):
 
     # 7 — outlier reports run cleanly for scoped user
     def test_07_outlier_reports_scoped(self):
+        from ch_logistics.logistics.report.delivery_exceptions_and_rejections.delivery_exceptions_and_rejections import (
+            execute as excrej_execute,
+        )
         from ch_logistics.logistics.report.driver_delivery_worksheet.driver_delivery_worksheet import (
             execute as worksheet_execute,
-        )
-        from ch_logistics.logistics.report.store_transfer_register.store_transfer_register import (
-            execute as reg_execute,
         )
         from ch_logistics.logistics.report.driver_performance_scorecard.driver_performance_scorecard import (
             execute as scorecard_execute,
         )
-        from ch_logistics.logistics.report.delivery_exceptions_and_rejections.delivery_exceptions_and_rejections import (
-            execute as excrej_execute,
+        from ch_logistics.logistics.report.store_transfer_register.store_transfer_register import (
+            execute as reg_execute,
         )
         for fn in (worksheet_execute, reg_execute, scorecard_execute, excrej_execute):
             result = fn({})
@@ -220,20 +219,20 @@ class TestReportScopeChLogistics(unittest.TestCase):
     # 8 — Administrator bypass runs every touched report
     def test_08_administrator_bypass(self):
         frappe.set_user("Administrator")
-        from ch_logistics.logistics.report.freight_and_delivery_cost.freight_and_delivery_cost import (
-            execute as freight_execute,
+        from ch_logistics.logistics.report.delivery_exceptions_and_rejections.delivery_exceptions_and_rejections import (
+            execute as excrej_execute,
         )
         from ch_logistics.logistics.report.driver_delivery_worksheet.driver_delivery_worksheet import (
             execute as worksheet_execute,
         )
-        from ch_logistics.logistics.report.store_transfer_register.store_transfer_register import (
-            execute as reg_execute,
-        )
         from ch_logistics.logistics.report.driver_performance_scorecard.driver_performance_scorecard import (
             execute as scorecard_execute,
         )
-        from ch_logistics.logistics.report.delivery_exceptions_and_rejections.delivery_exceptions_and_rejections import (
-            execute as excrej_execute,
+        from ch_logistics.logistics.report.freight_and_delivery_cost.freight_and_delivery_cost import (
+            execute as freight_execute,
+        )
+        from ch_logistics.logistics.report.store_transfer_register.store_transfer_register import (
+            execute as reg_execute,
         )
         freight_execute({})
         worksheet_execute({})

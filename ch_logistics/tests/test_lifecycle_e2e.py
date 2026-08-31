@@ -19,10 +19,9 @@ Self-cleans via _teardown so re-runs are idempotent.
 from __future__ import annotations
 
 import frappe
-from frappe.utils import nowdate, now_datetime
+from frappe.utils import now_datetime, nowdate
 
 from ch_logistics.api import logistics_api as api
-
 
 _TAG = "LIFECYCLE-E2E"
 

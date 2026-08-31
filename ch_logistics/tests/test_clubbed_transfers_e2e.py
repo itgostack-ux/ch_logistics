@@ -34,7 +34,6 @@ from frappe.utils import nowdate
 
 from ch_logistics.api import logistics_api as api
 
-
 # ---------------------------------------------------------------------------
 # Fixture helpers (idempotent; safe to re-run inside the rollback block)
 # ---------------------------------------------------------------------------

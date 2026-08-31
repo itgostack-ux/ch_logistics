@@ -5,20 +5,20 @@ Frontend (delivery-app page, desk forms) calls into here.
 """
 from __future__ import annotations
 
-import math
 import hmac
+import json
+import math
+
 import frappe
 from frappe import _
 from frappe.rate_limiter import rate_limit
 from frappe.utils import cint, flt, now_datetime
-import json
 
+from ch_logistics import roles as role_registry
+from ch_logistics import scope_guard
 from ch_logistics.api import driver_status as ds
 from ch_logistics.api import stop_roles
 from ch_logistics.api.trip_lock import get_locked_trip, lock_manifests
-from ch_logistics import roles as role_registry
-from ch_logistics import scope_guard
-
 
 _TRIP_CLOSE_TERMINAL_MANIFEST_STATUSES = {
     "Closed", "Delivered", "Received", "Partially Received", "Cancelled", "Returned",
@@ -3655,8 +3655,8 @@ def request_stop_otp(trip, sequence, lat=None, lng=None):
     the UI can confirm where the code went without leaking PII.
     """
     from ch_logistics.api.transfer_manifest_api import (
-        _send_delivery_otp,
         _require_stage_role,
+        _send_delivery_otp,
     )
 
     _require_stage_role("complete_delivery")
@@ -4010,8 +4010,9 @@ def get_stop_label(trip, sequence, kind="pickup"):
     label-printer driver. The QR is a Code 128 / Data URI rendered by
     frappe.utils.qrcode so no extra dependency is required.
     """
-    from frappe.utils import escape_html
     from urllib.parse import quote
+
+    from frappe.utils import escape_html
 
     if kind not in ("pickup", "delivery"):
         frappe.throw(_("kind must be 'pickup' or 'delivery'."), title=_("API Error"))

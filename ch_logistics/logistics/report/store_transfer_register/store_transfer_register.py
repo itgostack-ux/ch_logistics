@@ -2,9 +2,9 @@
 receipt status. The store-manager view of "what's coming, what I sent, what's
 still to be received"."""
 import frappe
+from ch_erp15.ch_erp15.report_scope import scope_where_clause
 from frappe import _
 
-from ch_erp15.ch_erp15.report_scope import scope_where_clause
 from ch_logistics.api.report_utils import col, resolve_company
 
 

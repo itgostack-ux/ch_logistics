@@ -14,7 +14,6 @@ from ch_logistics.logistics.doctype.ch_tracking_settings.ch_tracking_settings im
 	get_google_maps_api_key,
 )
 
-
 _ALLOWED_LIBRARIES = {"places", "geometry", "drawing", "marker"}
 
 

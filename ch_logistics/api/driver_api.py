@@ -13,9 +13,9 @@ passes a driver id from the client.
 import frappe
 from frappe import _
 
+from ch_logistics import roles as role_registry
 from ch_logistics.api import driver_status as ds
 from ch_logistics.api.driver_resolver import resolve_current_driver
-from ch_logistics import roles as role_registry
 from ch_logistics.logistics.doctype.ch_driver_device.ch_driver_device import (
     deactivate_devices,
     register_device,

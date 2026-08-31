@@ -23,7 +23,7 @@ import math
 
 import frappe
 from frappe import _
-from frappe.utils import cint, flt, now_datetime, add_to_date
+from frappe.utils import add_to_date, cint, flt, now_datetime
 
 from ch_logistics.api.trip_lock import get_locked_trip
 

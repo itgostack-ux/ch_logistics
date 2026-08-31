@@ -13,9 +13,16 @@ import secrets
 import frappe
 from frappe import _
 from frappe.model.document import Document
-from frappe.utils import add_to_date, get_datetime, now_datetime, cint, flt, getdate, nowdate
+from frappe.utils import (
+    add_to_date,
+    cint,
+    flt,
+    get_datetime,
+    getdate,
+    now_datetime,
+    nowdate,
+)
 from frappe.utils.password import get_encryption_key
-
 
 _OTP_DIGEST_PREFIX = "hmac-sha256$"
 
@@ -1579,13 +1586,18 @@ class CHTransferManifest(Document):
             recipients = set()
             if self.owner:
                 recipients.add(self.owner)
-            from ch_logistics.roles import filter_notification_users, get_notification_role_users
+            from ch_logistics.roles import (
+                filter_notification_users,
+                get_notification_role_users,
+            )
 
             recipients.update(get_notification_role_users("rejection_dispatcher_notify"))
             recipients = filter_notification_users(recipients)
             if self.company:
                 try:
-                    from ch_erp15.ch_erp15.notification_router import filter_users_by_company
+                    from ch_erp15.ch_erp15.notification_router import (
+                        filter_users_by_company,
+                    )
 
                     recipients = filter_users_by_company(recipients, self.company)
                 except Exception:
@@ -2350,8 +2362,8 @@ class CHTransferManifest(Document):
         if not trip_name:
             return
         from ch_logistics.logistics.doctype.ch_logistics_trip.ch_logistics_trip import (
-            _MANIFEST_PREDELIVERY,
             _MANIFEST_BLOCKS_TRIP_CLOSE,
+            _MANIFEST_PREDELIVERY,
         )
         try:
             trip = frappe.get_doc("CH Logistics Trip", trip_name)
@@ -3265,7 +3277,8 @@ def refresh_ewaybill_summary(manifest):
     """
     if not manifest:
         frappe.throw(_("Manifest name is required."))
-    from ch_logistics import roles as role_registry, scope_guard
+    from ch_logistics import roles as role_registry
+    from ch_logistics import scope_guard
 
     role_registry.require("ewaybill_sync", _("refresh e-Way Bills"))
     doc = frappe.get_doc("CH Transfer Manifest", manifest)
@@ -3281,7 +3294,8 @@ def resync_ewaybills(manifest):
     write to the manifest."""
     if not manifest:
         frappe.throw(_("Manifest name is required."))
-    from ch_logistics import roles as role_registry, scope_guard
+    from ch_logistics import roles as role_registry
+    from ch_logistics import scope_guard
 
     role_registry.require("ewaybill_sync", _("resync e-Way Bills"))
     doc = frappe.get_doc("CH Transfer Manifest", manifest)

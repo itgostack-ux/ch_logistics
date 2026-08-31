@@ -23,7 +23,10 @@ def after_migrate():
 		install_logistics_phase2_fields,
 	)
 	from ch_logistics.patches.v0_0_4 import install_geo_optimization_fields
-	from ch_logistics.patches.v0_0_5 import extend_rejection_reasons, install_tracking_token
+	from ch_logistics.patches.v0_0_5 import (
+		extend_rejection_reasons,
+		install_tracking_token,
+	)
 	from ch_logistics.patches.v0_0_6 import add_arrival_location_fields
 	from ch_logistics.patches.v0_0_7 import install_store_geo_fields
 	from ch_logistics.patches.v0_0_9 import install_driver_status_fields

@@ -20,7 +20,6 @@ from ch_logistics.logistics.doctype.ch_transfer_manifest.ch_transfer_manifest im
     CHTransferManifest,
 )
 
-
 # A real qr_payload is a 32-char random hash. The stub must NOT reuse the
 # manifest name: the QR validators treat a name-equals-token (or anything
 # under 22 chars) as a legacy row and throw "missing a secure QR token"

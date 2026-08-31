@@ -14,7 +14,9 @@ the operational flow that triggered the notification.
 import frappe
 from frappe.utils import now_datetime
 
-from ch_logistics.logistics.doctype.ch_driver_device.ch_driver_device import active_tokens
+from ch_logistics.logistics.doctype.ch_driver_device.ch_driver_device import (
+    active_tokens,
+)
 
 
 def _provider() -> str:
@@ -89,7 +91,7 @@ def _send_fcm(driver, title, body, data):
     if not tokens:
         return 0
 
-    from ch_logistics.api.fcm import send_to_tokens, _deactivate_invalid
+    from ch_logistics.api.fcm import _deactivate_invalid, send_to_tokens
 
     res = send_to_tokens(tokens, title, body, data)
     if res.get("failed"):

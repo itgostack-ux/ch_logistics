@@ -26,10 +26,7 @@ Pure in-memory: builds plain dicts against the predicate, touches no DB rows.
 """
 from __future__ import annotations
 
-import frappe
-
 from ch_logistics.api import stop_roles
-
 
 HUB = "Chennai - Hub - BM"
 SPOKE_A = "GG-ALWARTHIRUNAGAR-Sellable - BM"
