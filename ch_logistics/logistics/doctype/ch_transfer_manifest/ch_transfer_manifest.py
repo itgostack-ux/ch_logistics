@@ -1128,6 +1128,47 @@ class CHTransferManifest(Document):
                 title=_("Scan All Boxes"),
             )
 
+    def _validate_delivery_qr_multi(self, stock_entry, scanned_list):
+        """Delivery-side mirror of _validate_pickup_qr_multi — a Stock Entry
+        leg with MULTIPLE physical boxes (CH Stock Entry Package) must have
+        every box's own label scanned before delivery can be confirmed, not
+        just any one of them (or the bare manifest QR). Without this, a
+        driver carrying e.g. 3 boxes for one shipment could scan just 1 and
+        still mark the whole thing Delivered while 2 boxes stayed on the
+        truck — accept and deliver now enforce the same completeness
+        guarantee. A Stock Entry with 0 or 1 box falls back to the existing
+        single-scan _validate_delivery_qr unchanged.
+        """
+        scanned_list = [(s or "").strip() for s in (scanned_list or []) if (s or "").strip()]
+        box_labels = [
+            b for b in frappe.get_all(
+                "CH Stock Entry Package", filters={"parent": stock_entry}, pluck="package_label"
+            ) if b
+        ]
+        if len(box_labels) <= 1:
+            self._validate_delivery_qr(scanned_list[0] if scanned_list else "")
+            return
+
+        enforce = frappe.db.get_single_value("CH Logistics Settings", "enforce_delivery_qr")
+        if enforce is not None and not int(enforce):
+            return
+
+        if not scanned_list:
+            frappe.throw(
+                _("Scan all {0} box QR codes for {1} before delivering.").format(
+                    len(box_labels), stock_entry
+                ),
+                title=_("Scan Required"),
+            )
+        missing = [b for b in box_labels if b not in scanned_list]
+        if missing:
+            frappe.throw(
+                _("{0} box(es) still need to be scanned for {1}: {2}").format(
+                    len(missing), stock_entry, ", ".join(missing)
+                ),
+                title=_("Scan All Boxes"),
+            )
+
     def _validate_delivery_qr(self, scanned_qr):
         """Enforce the mandatory delivery scan (same handover ritual as pickup,
         on the receiver side). Gated by ``enforce_delivery_qr`` so it can be

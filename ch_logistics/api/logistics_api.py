@@ -4148,6 +4148,68 @@ def get_manifest_items_bulk(manifests):
 
 
 @frappe.whitelist()
+def get_manifest_stock_entries_bulk(manifests):
+    """Stock-Entry-level summary for a set of manifests — Stage 1 of the
+    Control Tower's manifest drill-down (Manifest -> Stock Entry -> Item ->
+    IMEI). CH Transfer Manifest Item already carries from_warehouse/
+    to_warehouse/total_qty per linked Stock Entry, so this reads that
+    directly rather than re-aggregating from Stock Entry Detail the way
+    get_manifest_items_bulk (Stage 2/3's item-level data) has to.
+    """
+    if isinstance(manifests, str):
+        manifests = frappe.parse_json(manifests)
+    manifests = list(dict.fromkeys(manifests or []))
+    if not manifests:
+        return {}
+
+    manifest_rows = frappe.get_all(
+        "CH Transfer Manifest",
+        filters={"name": ["in", manifests]},
+        fields=["name", "company"],
+    )
+    allowed = set()
+    for m in manifest_rows:
+        try:
+            frappe.get_doc("CH Transfer Manifest", m.name).check_permission("read")
+            allowed.add(m.name)
+        except frappe.PermissionError:
+            continue
+    if not allowed:
+        return {}
+
+    manifest_items = frappe.get_all(
+        "CH Transfer Manifest Item",
+        filters={"parent": ["in", list(allowed)]},
+        fields=["parent", "stock_entry", "from_warehouse", "to_warehouse", "total_qty", "item_count"],
+    )
+    se_names = list({row.stock_entry for row in manifest_items if row.stock_entry})
+    se_meta = {
+        r.name: r
+        for r in frappe.get_all(
+            "Stock Entry",
+            filters={"name": ["in", se_names or ["__none__"]]},
+            fields=["name", "posting_date", "custom_status"],
+        )
+    }
+
+    out = {name: [] for name in allowed}
+    for row in manifest_items:
+        if not row.stock_entry:
+            continue
+        se = se_meta.get(row.stock_entry)
+        out[row.parent].append({
+            "stock_entry": row.stock_entry,
+            "qty": flt(row.total_qty),
+            "item_count": row.item_count,
+            "from_warehouse": row.from_warehouse,
+            "to_warehouse": row.to_warehouse,
+            "posting_date": se.posting_date if se else None,
+            "status": se.custom_status if se else None,
+        })
+    return out
+
+
+@frappe.whitelist()
 def get_stock_entry_serial_detail(stock_entry, item_code=None):
     """Per-IMEI breakdown for one Stock Entry — backs the Control Tower's
     manifest drill-down: clicking an Item Name there goes one level deeper

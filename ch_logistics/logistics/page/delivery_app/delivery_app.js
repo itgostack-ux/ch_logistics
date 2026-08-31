@@ -2354,9 +2354,17 @@ class DeliveryApp {
         }
 
         frappe.dom.freeze(__("Capturing location…"));
-        this._capture_gps_promise()
-            .then((gps) => {
+        Promise.all([
+            this._capture_gps_promise(),
+            this._call_promise(TRIP_API + "get_stock_entry_box_labels", { stock_entry }).catch(() => []),
+        ])
+            .then(([gps, box_labels]) => {
                 frappe.dom.unfreeze();
+                box_labels = box_labels || [];
+                if (box_labels.length > 1) {
+                    this._open_leg_deliver_dialog_multibox(manifest, stock_entry, trip, in_trip_view, gps, box_labels, recipients_html);
+                    return;
+                }
                 const d = new frappe.ui.Dialog({
                     title: __("Deliver — {0}", [stock_entry]),
                     size: "small",
@@ -2401,6 +2409,100 @@ class DeliveryApp {
             });
     }
 
+    /**
+     * Multi-box variant of the deliver dialog — mirrors
+     * _open_leg_pickup_dialog_multibox exactly, on the delivery side: a
+     * Stock Entry with more than one physical box must have EVERY box's own
+     * label scanned before delivery can be confirmed, otherwise a driver
+     * carrying 3 boxes could scan just 1 (or the bare manifest QR) and mark
+     * the whole shipment delivered with 2 boxes still on the truck.
+     */
+    _open_leg_deliver_dialog_multibox(manifest, stock_entry, trip, in_trip_view, gps, box_labels, recipients_html) {
+        const scanned = new Set();
+        const box_row_html = (label) => `
+            <div class="da-box-scan-row" data-box="${frappe.utils.escape_html(label)}" style="display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid #eee;">
+                <i class="fa fa-circle-o da-box-scan-icon" style="color:#ccc;width:16px"></i>
+                <span style="font-family:monospace">${frappe.utils.escape_html(label)}</span>
+            </div>`;
+        const d = new frappe.ui.Dialog({
+            title: __("Deliver — {0}", [stock_entry]),
+            size: "small",
+            fields: [
+                { fieldname: "recipients_info", fieldtype: "HTML", options: recipients_html },
+                {
+                    fieldname: "summary", fieldtype: "HTML",
+                    options: `<div class="alert alert-info" style="padding:8px 10px;border-radius:6px;margin-bottom:8px;">
+                        ${__("This shipment has <b>{0}</b> boxes — scan each box's own QR label before delivering.", [box_labels.length])}
+                    </div>`,
+                },
+                ...this._gps_display_fields(gps),
+                {
+                    fieldname: "delivery_photo", fieldtype: "Attach Image",
+                    label: __("Photo of Delivery"), reqd: 1,
+                },
+                {
+                    fieldname: "scanned_qr", fieldtype: "Data", options: "Barcode",
+                    label: __("Scan Box QR"),
+                },
+                {
+                    fieldname: "box_list_html", fieldtype: "HTML",
+                    options: `<div class="da-box-scan-list">${box_labels.map(box_row_html).join("")}</div>`,
+                },
+                {
+                    fieldname: "receiver_name", fieldtype: "Data",
+                    label: __("Receiver Name"), reqd: 1,
+                },
+                {
+                    fieldname: "otp", fieldtype: "Data",
+                    label: __("Delivery OTP"), reqd: 1,
+                    description: __("Ask the receiver for the OTP just sent to them."),
+                },
+            ],
+            primary_action_label: __("Confirm & Deliver"),
+            primary_action: (values) => {
+                d.hide();
+                const all_scans = Array.from(scanned);
+                this._submit_leg_deliver(manifest, stock_entry, trip, in_trip_view, {
+                    delivery_photo: values.delivery_photo,
+                    scanned_qr: all_scans[0],
+                    additional_scanned_qrs: JSON.stringify(all_scans.slice(1)),
+                    receiver_name: values.receiver_name,
+                    otp: values.otp,
+                    lat: gps.lat, lng: gps.lng, gps_accuracy_m: gps.accuracy,
+                });
+            },
+        });
+        d.disable_primary_action();
+
+        const register_scan = (value) => {
+            value = (value || "").trim();
+            if (!value) return;
+            const $row = d.$wrapper.find(`.da-box-scan-row[data-box="${$.escapeSelector(value)}"]`);
+            if (!$row.length) {
+                frappe.show_alert({ message: __("{0} is not one of this shipment's boxes.", [value]), indicator: "red" });
+                return;
+            }
+            if (!scanned.has(value)) {
+                scanned.add(value);
+                $row.find(".da-box-scan-icon").removeClass("fa-circle-o").addClass("fa-check-circle").css("color", "#28a745");
+                if (scanned.size >= box_labels.length) {
+                    d.enable_primary_action();
+                } else {
+                    d.disable_primary_action();
+                }
+            }
+            d.set_value("scanned_qr", "");
+        };
+        d.fields_dict.scanned_qr.$input.on("change", (e) => register_scan(e.target.value));
+        d.fields_dict.scanned_qr.$input.on("keydown", (e) => {
+            if (e.key === "Enter") {
+                e.preventDefault();
+                register_scan(e.target.value);
+            }
+        });
+        d.show();
+    }
+
     _submit_leg_deliver(manifest, stock_entry, trip, in_trip_view, capture) {
         frappe.dom.freeze(__("Delivering…"));
         this._call_promise(API + "driver_complete_delivery_row", {
@@ -2409,6 +2511,7 @@ class DeliveryApp {
             delivery_photo: capture.delivery_photo,
             receiver_name: capture.receiver_name,
             scanned_qr: capture.scanned_qr,
+            additional_scanned_qrs: capture.additional_scanned_qrs,
             otp: capture.otp,
             lat: capture.lat,
             lng: capture.lng,

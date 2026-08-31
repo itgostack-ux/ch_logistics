@@ -1541,77 +1541,119 @@ class LogisticsCommandCenter {
 	}
 
 	async _ops_show_manifest_items(name) {
+		// 3-stage drill-down: Stock Entry list (this dialog's initial view)
+		// -> click one -> its Items -> click an item -> IMEIs
+		// (_ops_show_order_serials, unchanged). Each stage replaces the
+		// same dialog's content rather than opening a new dialog, with a
+		// "Back" link to step out one level.
 		const d = new frappe.ui.Dialog({
 			title: __("Manifest {0}", [name]),
 			size: "large",
 			fields: [{ fieldname: "items_html", fieldtype: "HTML" }],
 		});
-		d.fields_dict.items_html.$wrapper.html(
-			`<div class="lcc-loading"><i class="fa fa-spinner fa-spin"></i> ${__("Loading…")}</div>`
-		);
+		const $wrap = () => d.fields_dict.items_html.$wrapper;
+		const esc = frappe.utils.escape_html;
+		const loc = (wh) => window.ch_wh_label_html ? ch_wh_label_html(wh, "—") : esc(wh || "—");
+		const date = (val) => val ? frappe.datetime.str_to_user(val) : "—";
+
+		$wrap().html(`<div class="lcc-loading"><i class="fa fa-spinner fa-spin"></i> ${__("Loading…")}</div>`);
 		d.show();
+
+		let se_rows = [];
+		let item_rows = [];
+
+		const render_stock_entries = () => {
+			d.set_title(__("Manifest {0}", [name]));
+			if (!se_rows.length) {
+				$wrap().html(`<div class="lcc-empty">${__("No Stock Entries found for this manifest.")}</div>`);
+				return;
+			}
+			const body = se_rows.map((se) => `<tr>
+					<td>
+						<a href="#" class="lcc-se-open" data-se="${esc(se.stock_entry)}">${esc(se.stock_entry)}</a>
+					</td>
+					<td class="tr">${se.qty != null ? se.qty : "—"}</td>
+					<td>${date(se.posting_date)}</td>
+					<td>${loc(se.from_warehouse)}</td>
+					<td>${loc(se.to_warehouse)}</td>
+					<td><span class="indicator-pill ${this._status_color(se.status)}"><span>${esc(this._status_label(se.status))}</span></span></td>
+				</tr>`).join("");
+			$wrap().html(`
+				<div class="lcc-table-wrap"><table class="lcc-table">
+					<thead><tr>
+						<th>${__("Stock Entry")}</th>
+						<th class="tr">${__("Qty")}</th>
+						<th>${__("Date")}</th>
+						<th>${__("From")}</th>
+						<th>${__("To")}</th>
+						<th>${__("Status")}</th>
+					</tr></thead>
+					<tbody>${body}</tbody>
+				</table></div>`);
+		};
+
+		const render_items = (se) => {
+			d.set_title(__("{0} — Items", [se.stock_entry]));
+			const rows = item_rows.filter((r) => r.stock_entry === se.stock_entry);
+			const back = `<div class="lcc-back" style="margin-bottom:8px">
+				<a href="#" class="lcc-back-to-se"><i class="fa fa-arrow-left"></i> ${__("Back to Stock Entries")}</a>
+			</div>`;
+			if (!rows.length) {
+				$wrap().html(`${back}<div class="lcc-empty">${__("No item detail found for this Stock Entry.")}</div>`);
+				return;
+			}
+			const body = rows.map((row) => `<tr>
+					<td>
+						<a href="#" class="lcc-item-open" data-order="${esc(se.stock_entry)}" data-item="${esc(row.item_code || "")}">
+							${esc(row.item_name || row.item_code || "—")}
+						</a>
+					</td>
+					<td class="tr">${row.qty != null ? row.qty : "—"}${row.uom ? " " + esc(row.uom) : ""}</td>
+					<td>${date(se.posting_date)}</td>
+					<td>${loc(se.from_warehouse)}</td>
+					<td>${loc(se.to_warehouse)}</td>
+					<td><span class="indicator-pill ${this._status_color(row.status)}"><span>${esc(this._status_label(row.status))}</span></span></td>
+				</tr>`).join("");
+			$wrap().html(`${back}
+				<div class="lcc-table-wrap"><table class="lcc-table">
+					<thead><tr>
+						<th>${__("Item Name")}</th>
+						<th class="tr">${__("Qty")}</th>
+						<th>${__("Date")}</th>
+						<th>${__("From")}</th>
+						<th>${__("To")}</th>
+						<th>${__("Status")}</th>
+					</tr></thead>
+					<tbody>${body}</tbody>
+				</table></div>`);
+		};
+
+		$wrap().on("click", ".lcc-se-open", (e) => {
+			e.preventDefault();
+			const se_name = $(e.currentTarget).data("se");
+			const se = se_rows.find((r) => r.stock_entry === se_name);
+			if (se) render_items(se);
+		});
+		$wrap().on("click", ".lcc-back-to-se", (e) => {
+			e.preventDefault();
+			render_stock_entries();
+		});
 		d.$wrapper.on("click", ".lcc-item-open", (e) => {
 			e.preventDefault();
 			const $t = $(e.currentTarget);
 			this._ops_show_order_serials($t.data("order"), $t.data("item"));
 		});
+
 		try {
-			const r = await frappe.call({
-				method: _LCC + "get_manifest_items_bulk",
-				args: { manifests: [name] },
-			});
-			const rows = (r.message && r.message[name]) || [];
-			if (!rows.length) {
-				d.fields_dict.items_html.$wrapper.html(
-					`<div class="lcc-empty">${__("No item detail found for this manifest.")}</div>`
-				);
-				return;
-			}
-			// Level 1: Stock Entry (Order Id) — grouped, not a flat repeated
-			// column, so a manifest with several Stock Entries reads as
-			// distinct shipments. Level 2 (Item Name, below) drills into
-			// Level 3 (IMEI) via _ops_show_order_serials, same as before.
-			const esc = frappe.utils.escape_html;
-			const groups = {};
-			for (const row of rows) {
-				const key = row.stock_entry || "—";
-				(groups[key] = groups[key] || []).push(row);
-			}
-			const stock_entries = Object.keys(groups).sort();
-			const sections = stock_entries.map((se) => {
-				const item_rows = groups[se].map((row) => `<tr>
-						<td>
-							<a href="#" class="lcc-item-open"
-								data-order="${esc(se)}"
-								data-item="${esc(row.item_code || "")}">
-								${esc(row.item_name || row.item_code || "—")}
-							</a>
-						</td>
-						<td class="tr">${row.qty != null ? row.qty : "—"}${row.uom ? " " + esc(row.uom) : ""}</td>
-						<td><span class="indicator-pill ${this._status_color(row.status)}"><span>${esc(this._status_label(row.status))}</span></span></td>
-					</tr>`).join("");
-				return `
-					<div class="lcc-se-group" style="margin-bottom:16px">
-						<div class="lcc-se-group-header" style="font-weight:700;font-size:13px;padding:4px 0 6px;border-bottom:2px solid #e5e7eb;display:flex;align-items:center;gap:8px">
-							<i class="fa fa-file-text-o" style="color:#888"></i>
-							<a href="/app/stock-entry/${encodeURIComponent(se)}" target="_blank">${esc(se)}</a>
-							<span class="lcc-muted" style="font-weight:400;font-size:11px">${groups[se].length} ${__("item(s)")}</span>
-						</div>
-						<table class="lcc-table">
-							<thead><tr>
-								<th>${__("Item Name")}</th>
-								<th class="tr">${__("Qty")}</th>
-								<th>${__("Status")}</th>
-							</tr></thead>
-							<tbody>${item_rows}</tbody>
-						</table>
-					</div>`;
-			}).join("");
-			d.fields_dict.items_html.$wrapper.html(
-				`<div class="lcc-table-wrap">${sections}</div>`
-			);
+			const [se_r, item_r] = await Promise.all([
+				frappe.call({ method: _LCC + "get_manifest_stock_entries_bulk", args: { manifests: [name] } }),
+				frappe.call({ method: _LCC + "get_manifest_items_bulk", args: { manifests: [name] } }),
+			]);
+			se_rows = (se_r.message && se_r.message[name]) || [];
+			item_rows = (item_r.message && item_r.message[name]) || [];
+			render_stock_entries();
 		} catch (e) {
-			d.fields_dict.items_html.$wrapper.html(
+			$wrap().html(
 				`<div class="lcc-empty"><i class="fa fa-exclamation-triangle"></i> ${__("Failed to load manifest items.")}</div>`
 			);
 		}

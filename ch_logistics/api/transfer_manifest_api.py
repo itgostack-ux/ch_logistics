@@ -588,7 +588,8 @@ def complete_delivery(manifest, delivery_photo, receiver_name, otp=None,
 )
 def driver_complete_delivery_row(manifest, stock_entry, delivery_photo, receiver_name,
                                  scanned_qr, otp=None, lat=None, lng=None,
-                                 gps_accuracy_m=None, geofence_override_reason=None) -> dict:
+                                 gps_accuracy_m=None, geofence_override_reason=None,
+                                 additional_scanned_qrs=None) -> dict:
     """Driver completes delivery of ONE Stock Entry leg inside a multi-entry
     manifest — the delivery-side mirror of ``driver_accept_manifest_row``.
 
@@ -648,7 +649,9 @@ def driver_complete_delivery_row(manifest, stock_entry, delivery_photo, receiver
         if mf.status not in ("Assigned", "In Transit"):
             frappe.throw(_("Manifest must be Assigned or In Transit to deliver a shipment (current status: {0}).").format(mf.status))
 
-        mf._validate_delivery_qr(scanned_qr)
+        extra_scans = frappe.parse_json(additional_scanned_qrs) if additional_scanned_qrs else []
+        all_scans = [scanned_qr] + list(extra_scans or [])
+        mf._validate_delivery_qr_multi(stock_entry, all_scans)
         if not delivery_photo:
             frappe.throw(_("Delivery photo is mandatory."), title=_("Ch Transfer Manifest Error"))
         if not receiver_name:
