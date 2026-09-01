@@ -1917,8 +1917,17 @@ class CHTransferManifest(Document):
             if current_status != self.status:
                 self.status = current_status
 
-            if self.status not in ("Delivered",):
-                frappe.throw(_("Can only accept when status is Delivered."), title=_("Ch Transfer Manifest Error"))
+            # The custom transit flow keeps the Stock Entry in Draft until the
+            # store receives, and the manifest cannot reach Delivered while a
+            # linked SE is Draft. Receiving is therefore what PRODUCES
+            # Delivered, so it has to be reachable from In Transit -- gating it
+            # behind Delivered deadlocked that flow entirely. "Delivered" stays
+            # accepted for the standard flow, whose SEs were submitted up front.
+            if self.status not in ("Delivered", "In Transit"):
+                frappe.throw(
+                    _("Can only accept when status is Delivered or In Transit."),
+                    title=_("Ch Transfer Manifest Error"),
+                )
             self.received_by = received_by or frappe.session.user
             self.received_datetime = now_datetime()
             self.damage_reported = cint(damage_reported)
@@ -1961,6 +1970,34 @@ class CHTransferManifest(Document):
                     })
 
             partially_received = bool(received_map) and total_shortage > 0
+
+            # Post the ledger BEFORE deciding the status, so the status
+            # describes what actually happened. Setting Received first and
+            # submitting afterwards meant a failed submit left a manifest
+            # reading Received over Draft Stock Entries -- goods reported on
+            # the books that the ledger had never taken in.
+            self._auto_submit_stock_entries(received_map)
+
+            names = [row.stock_entry for row in (self.transfers or []) if row.stock_entry]
+            unsubmitted = frappe.db.count(
+                "Stock Entry", {"name": ("in", names), "docstatus": ("!=", 1)}
+            ) if names else 0
+
+            if unsubmitted:
+                # Receipt did not post. The shipment is still in transit as far
+                # as the books are concerned; _auto_submit_stock_entries has
+                # already recorded why on the manifest timeline.
+                self.status = "In Transit"
+                self.flags.ignore_validate_update_after_submit = True
+                self.save()
+                frappe.msgprint(
+                    _("{0} of {1} transfers could not be posted, so this manifest stays In Transit. "
+                      "Resolve the errors above and receive again.").format(unsubmitted, len(names)),
+                    title=_("Receipt not posted"),
+                    indicator="red",
+                )
+                return {"status": self.status, "unsubmitted": unsubmitted}
+
             self.status = "Partially Received" if partially_received else "Received"
             self.flags.ignore_validate_update_after_submit = True
             self.save()
@@ -1969,9 +2006,6 @@ class CHTransferManifest(Document):
                 self._auto_create_damage_claim(damage_notes, damage_photo)
             if partially_received:
                 self._auto_create_shortage_claim(shortage_rows, total_shortage)
-
-            # GAP-2: auto-submit Draft SEs so ledger reflects physical receipt immediately
-            self._auto_submit_stock_entries(received_map)
             # Cascade to parent trip's drop stop (Pending → Completed), then let
             # the parent trip auto-close now that this shipment is settled
             # (Received). When it's the last outstanding shipment the trip
