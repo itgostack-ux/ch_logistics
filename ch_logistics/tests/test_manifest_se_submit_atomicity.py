@@ -207,64 +207,52 @@ class TestManifestSubmitAtomicity(unittest.TestCase):
 
     # ── (d): Delivered is unreachable while a linked SE is Draft ───────
 
-    def test_delivered_refused_with_draft_stock_entry_on_draft_manifest(self):
+    def test_delivered_is_allowed_while_the_stock_entry_is_still_draft(self):
+        """Delivered is the PHYSICAL milestone and says nothing about the ledger.
+
+        Earlier revisions refused this transition, reasoning that stock had not
+        moved. That conflated two different facts and deadlocked the custom
+        transit flow, whose Stock Entry is submitted BY the receive that
+        Delivered gates. The estate's answer is two statuses: Delivered when the
+        courier arrives, Received once every Stock Entry is submitted -- so a
+        Delivered manifest over a Draft Stock Entry is not a defect, it is the
+        true statement that the goods arrived and have not been taken onto the
+        books yet.
+        """
         manifest, transfer = self._build_world()
-        manifest.status = "Delivered"
-        with self.assertRaises(frappe.ValidationError) as ctx:
-            manifest.save()
-        self.assertIn(transfer.name, str(ctx.exception))
-        self.assertEqual(
-            frappe.db.get_value("CH Transfer Manifest", manifest.name, "status"),
-            "Draft",
-        )
-
-    def test_delivered_refused_with_draft_stock_entry_after_submit(self):
-        # Real production shape: manifests are SUBMITTED long before
-        # delivery, and a submitted doc's saves bypass validate() entirely
-        # (frappe runs before_update_after_submit instead) — so the gate is
-        # proven on that hook path, then the same manifest is shown to
-        # deliver cleanly once the Stock Entry is genuinely submitted.
-        from ch_logistics.logistics.doctype.ch_transfer_manifest.ch_transfer_manifest import (
-            CHTransferManifest,
-        )
-
-        manifest, transfer = self._build_world()
-        # Packing-slip/photo site settings are irrelevant to this proof;
-        # bypass them so the manifest can reach docstatus=1.
-        with (
-            patch.object(CHTransferManifest, "_packing_required", return_value=False),
-            patch.object(CHTransferManifest, "_packing_photo_required", return_value=False),
-        ):
-            manifest.submit()  # Draft → Packed
-        manifest.reload()
+        self.assertEqual(frappe.db.get_value("Stock Entry", transfer.name, "docstatus"), 0)
 
         manifest.status = "Delivered"
-        manifest.flags.ignore_validate_update_after_submit = True
-        with self.assertRaises(frappe.ValidationError) as ctx:
-            manifest.save()
-        self.assertIn(transfer.name, str(ctx.exception))
-        self.assertEqual(
-            frappe.db.get_value("CH Transfer Manifest", manifest.name, "status"),
-            "Packed",
-        )
-
-        # Submit the Stock Entry for real — the transition must now pass.
-        se_doc = frappe.get_doc("Stock Entry", transfer.name)
-        se_doc.flags.ignore_permissions = True
-        # Bypass the ch_erp15 desk-submit guardrail for this fixture submit,
-        # exactly as the controller's own system submits do.
-        se_doc.flags.ignore_procurement_guardrails = True
-        se_doc.submit()
-        manifest.reload()
-        manifest.status = "Delivered"
-        manifest.flags.ignore_validate_update_after_submit = True
         manifest.save()
+
         self.assertEqual(
             frappe.db.get_value("CH Transfer Manifest", manifest.name, "status"),
             "Delivered",
         )
 
-    # ── (c): per-row errors are aggregated, not first-row-fatal ────────
+    def test_received_is_withheld_until_every_stock_entry_is_submitted(self):
+        """Received is the ACCOUNTING milestone: it requires docstatus 1.
+
+        This is the guarantee that replaced the old Delivered gate. Delivery may
+        run ahead of the ledger; receipt may not.
+        """
+        from ch_erp15.ch_erp15.custom.stock_entry import (
+            _rollup_manifest_received_for_reporting,
+        )
+
+        manifest, transfer = self._build_world()
+        manifest.status = "Delivered"
+        manifest.save()
+
+        se_doc = frappe.get_doc("Stock Entry", transfer.name)
+        # Draft Stock Entry, however its custom_status reads: no Received.
+        se_doc.db_set("custom_status", "Transferred", update_modified=False)
+        _rollup_manifest_received_for_reporting(se_doc)
+        self.assertEqual(
+            frappe.db.get_value("CH Transfer Manifest", manifest.name, "status"),
+            "Delivered",
+            "Received must not be granted while a Stock Entry is unsubmitted",
+        )
 
     def test_invalid_stock_entry_rows_reported_together(self):
         company = self._company()

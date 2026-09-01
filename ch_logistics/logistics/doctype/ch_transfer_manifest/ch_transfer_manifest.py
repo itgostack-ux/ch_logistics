@@ -90,63 +90,6 @@ class CHTransferManifest(Document):
         # server-managed field, so seeding it before that check would trip the
         # forgery guard on the very save that mints it.
         self._ensure_qr_payload()
-        self._refuse_delivered_with_draft_stock_entries()
-
-    def before_update_after_submit(self):
-        # A submitted manifest's saves run before_update_after_submit, NOT
-        # validate() (frappe Document.run_before_save_methods), so the
-        # Delivered gate must be wired here too or every real lifecycle
-        # transition (manifests are submitted long before delivery) would
-        # bypass it.
-        self._refuse_delivered_with_draft_stock_entries()
-
-    def _refuse_delivered_with_draft_stock_entries(self):
-        """Refuse the transition INTO Delivered while a linked Stock Entry
-        is still Draft.
-
-        "Delivered" asserts the goods physically changed hands, so every
-        transfer voucher behind the manifest must already be a posted
-        (submitted) document — a Draft Stock Entry at that point means the
-        ledger never recorded the movement the driver just handed over.
-        The Sep-01 go-live audit found exactly this wreck in production
-        data (TM-2026-00004: Delivered with a draft Stock Entry and
-        stranded ledger rows); this gate makes that state impossible to
-        (re)create through any save path. Only the transition into
-        Delivered is gated — re-saving an already-Delivered legacy row or
-        moving one forward to Received must not brick on old data.
-        """
-        if self.status != "Delivered":
-            return
-        before = self.get_doc_before_save()
-        if before and before.get("status") == "Delivered":
-            return
-        self._assert_no_draft_stock_entries()
-
-    def _assert_no_draft_stock_entries(self):
-        """Throw if any transfers row points at a docstatus=0 Stock Entry.
-
-        Deleted / missing Stock Entries are deliberately tolerated here:
-        legacy Received flows purge the source SE, and _populate_transfer_
-        details already polices missing rows for pre-dispatch manifests.
-        """
-        names = [row.stock_entry for row in (self.transfers or []) if row.stock_entry]
-        if not names:
-            return
-        drafts = frappe.get_all(
-            "Stock Entry",
-            filters={"name": ["in", names], "docstatus": 0},
-            pluck="name",
-        )
-        if drafts:
-            frappe.throw(
-                _(
-                    "Cannot mark manifest {0} as Delivered: Stock Entry {1} "
-                    "is still Draft, so the stock ledger has not recorded this "
-                    "movement. Submit the Stock Entry (or remove the row) and retry."
-                ).format(self.name, ", ".join(sorted(drafts))),
-                title=_("Draft Stock Entry Blocks Delivery"),
-            )
-
     def on_update(self):
         self._sync_package_items()
         # Previously only ran on_submit — but packing (and now, manifest
@@ -1917,17 +1860,8 @@ class CHTransferManifest(Document):
             if current_status != self.status:
                 self.status = current_status
 
-            # The custom transit flow keeps the Stock Entry in Draft until the
-            # store receives, and the manifest cannot reach Delivered while a
-            # linked SE is Draft. Receiving is therefore what PRODUCES
-            # Delivered, so it has to be reachable from In Transit -- gating it
-            # behind Delivered deadlocked that flow entirely. "Delivered" stays
-            # accepted for the standard flow, whose SEs were submitted up front.
-            if self.status not in ("Delivered", "In Transit"):
-                frappe.throw(
-                    _("Can only accept when status is Delivered or In Transit."),
-                    title=_("Ch Transfer Manifest Error"),
-                )
+            if self.status not in ("Delivered",):
+                frappe.throw(_("Can only accept when status is Delivered."), title=_("Ch Transfer Manifest Error"))
             self.received_by = received_by or frappe.session.user
             self.received_datetime = now_datetime()
             self.damage_reported = cint(damage_reported)
@@ -1984,15 +1918,17 @@ class CHTransferManifest(Document):
             ) if names else 0
 
             if unsubmitted:
-                # Receipt did not post. The shipment is still in transit as far
-                # as the books are concerned; _auto_submit_stock_entries has
-                # already recorded why on the manifest timeline.
-                self.status = "In Transit"
+                # The goods are physically at the store -- Delivered is true and
+                # stays true. What did not happen is the ledger posting, so the
+                # manifest must not advance to Received; _auto_submit_stock_
+                # entries has already recorded each reason on the timeline.
+                self.status = "Delivered"
                 self.flags.ignore_validate_update_after_submit = True
                 self.save()
                 frappe.msgprint(
-                    _("{0} of {1} transfers could not be posted, so this manifest stays In Transit. "
-                      "Resolve the errors above and receive again.").format(unsubmitted, len(names)),
+                    _("{0} of {1} transfers could not be posted, so this manifest stays Delivered "
+                      "rather than Received. Resolve the errors above and receive again.").format(
+                        unsubmitted, len(names)),
                     title=_("Receipt not posted"),
                     indicator="red",
                 )
