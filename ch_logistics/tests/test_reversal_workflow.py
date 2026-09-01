@@ -258,6 +258,32 @@ class TestManifestReversalWorkflow(unittest.TestCase):
         item.is_stock_item = 1
         if item.meta.has_field("ch_lifecycle_status"):
             item.ch_lifecycle_status = "Active"
+        # india_compliance now enforces a valid HSN/SAC on every Item;
+        # borrow any code already seeded on the site.
+        if item.meta.has_field("gst_hsn_code"):
+            item.gst_hsn_code = frappe.db.get_value("GST HSN Code", {}, "name")
+        # ch_item_master: MRP is now mandatory on stock items.
+        if item.meta.has_field("ch_item_mrp"):
+            item.ch_item_mrp = 500
+        # PLM default "NPI" blocks Stock Entries entirely.
+        if item.meta.has_field("ch_plm_status"):
+            item.ch_plm_status = "Active Production"
+        # ch_item_master governance: an Active item needs a sub-category
+        # (and its parent category).
+        if item.meta.has_field("ch_sub_category"):
+            sub_category = frappe.db.get_value(
+                "CH Sub Category",
+                {
+                    "item_nature": ["not in", ["Service", "Subscription", "Asset / Capital"]],
+                    "disabled": 0,
+                },
+                ["name", "category"],
+                as_dict=True,
+            )
+            if sub_category:
+                item.ch_sub_category = sub_category.name
+                if item.meta.has_field("ch_category"):
+                    item.ch_category = sub_category.category
         barcode = f"REVBC{suffix}"
         item.append("barcodes", {"barcode": barcode})
         item.insert(ignore_permissions=True)
@@ -299,10 +325,31 @@ class TestManifestReversalWorkflow(unittest.TestCase):
 
         self.assertTrue(received_qty(transfer.name, barcode)["success"])
         self.assertTrue(received_qty(transfer.name, barcode)["success"])
-        ready = set_custom_status(transfer.name, "Ready For Pickup")
-        manifest = frappe.get_doc(
-            "CH Transfer Manifest", ready["transfer_manifest"]
+        # DELIBERATE behaviour change (go-live): "Ready For Pickup" is now
+        # only reachable from custom_status "Packed", and "Packed" itself
+        # requires every unit boxed (with photo) via the Stock Entry's own
+        # packages table — packing became a first-class stage of the
+        # transit flow instead of an optional manifest-side activity.
+        # Grouping into a dispatch manifest (Control Tower "New Manifest")
+        # is now also what advances Packed → Ready For Pickup; the old
+        # direct set_custom_status(..., "Ready For Pickup") jump no longer
+        # exists as a Stock Entry-level action.
+        from ch_erp15.ch_erp15.custom.stock_entry import (
+            group_stock_entries_into_manifest,
+            pack_box_stock_entry,
         )
+
+        pack_box_stock_entry(
+            transfer.name, packed_qty=2, packing_photo="/files/test-pack.jpg"
+        )
+        packed = set_custom_status(transfer.name, "Packed")
+        self.assertEqual(packed["custom_status"], "Packed")
+        manifest_name = group_stock_entries_into_manifest([transfer.name])
+        self.assertEqual(
+            frappe.db.get_value("Stock Entry", transfer.name, "custom_status"),
+            "Ready For Pickup",
+        )
+        manifest = frappe.get_doc("CH Transfer Manifest", manifest_name)
         manifest.cancel_before_departure("E2E pre-departure cancellation")
 
         source_after = frappe.db.get_value(
@@ -337,17 +384,22 @@ class TestTripCancellationOrchestration(unittest.TestCase):
         trip.add_comment = MagicMock()
         return trip
 
-    def test_predeparture_trip_cancel_cascades_to_manifest_and_stock(self):
+    def test_predeparture_trip_cancel_releases_manifests_to_packed_pool(self):
+        # DELIBERATE behaviour change (go-live): trip_cancel no longer
+        # cancels its manifests or reverses stock. Nothing has physically
+        # moved pre-departure, so each manifest is released back to the
+        # dispatch pool instead — status reset to Packed with trip/driver
+        # attribution cleared — ready to attach to a replacement trip.
+        # Only the trip itself becomes Cancelled.
         trip = self._trip()
         manifest = MagicMock()
-        manifest.cancel_before_departure.return_value = [
-            "MAT-STE-TEST (custom transit reversed)"
-        ]
         rows = [
             frappe._dict(
                 name="MANIFEST-TEST",
                 status="Assigned",
                 pickup_datetime=None,
+                ewaybill_status=None,
+                ewaybill_count=0,
             )
         ]
         with (
@@ -356,19 +408,23 @@ class TestTripCancellationOrchestration(unittest.TestCase):
             patch.object(logistics_api.scope_guard, "assert_trip_scope"),
             patch.object(logistics_api, "lock_manifests"),
             patch.object(logistics_api.frappe, "get_all", return_value=rows),
+            patch.object(logistics_api.frappe.db, "set_value") as set_value,
             patch.object(logistics_api.frappe, "get_doc", return_value=manifest),
             patch.object(logistics_api, "_trip_audit"),
             patch.object(logistics_api, "_set_driver_availability"),
         ):
             result = logistics_api.trip_cancel("TRIP-TEST", reason="Vehicle unavailable")
 
-        manifest.cancel_before_departure.assert_called_once()
+        manifest.cancel_before_departure.assert_not_called()
+        args = set_value.call_args.args
+        self.assertEqual(args[0], "CH Transfer Manifest")
+        self.assertEqual(args[1], "MANIFEST-TEST")
+        payload = args[2]
+        self.assertEqual(payload["status"], "Packed")
+        self.assertIsNone(payload["trip"])
+        self.assertIsNone(payload["driver"])
         self.assertEqual(trip.status, "Cancelled")
-        self.assertEqual(result["cancelled_manifests"], ["MANIFEST-TEST"])
-        self.assertEqual(
-            result["stock_reversals"],
-            ["MAT-STE-TEST (custom transit reversed)"],
-        )
+        self.assertEqual(result["released_manifests"], ["MANIFEST-TEST"])
 
     def test_trip_cancel_blocks_after_physical_pickup(self):
         trip = self._trip()

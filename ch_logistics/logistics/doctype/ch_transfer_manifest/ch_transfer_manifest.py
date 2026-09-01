@@ -90,6 +90,62 @@ class CHTransferManifest(Document):
         # server-managed field, so seeding it before that check would trip the
         # forgery guard on the very save that mints it.
         self._ensure_qr_payload()
+        self._refuse_delivered_with_draft_stock_entries()
+
+    def before_update_after_submit(self):
+        # A submitted manifest's saves run before_update_after_submit, NOT
+        # validate() (frappe Document.run_before_save_methods), so the
+        # Delivered gate must be wired here too or every real lifecycle
+        # transition (manifests are submitted long before delivery) would
+        # bypass it.
+        self._refuse_delivered_with_draft_stock_entries()
+
+    def _refuse_delivered_with_draft_stock_entries(self):
+        """Refuse the transition INTO Delivered while a linked Stock Entry
+        is still Draft.
+
+        "Delivered" asserts the goods physically changed hands, so every
+        transfer voucher behind the manifest must already be a posted
+        (submitted) document — a Draft Stock Entry at that point means the
+        ledger never recorded the movement the driver just handed over.
+        The Sep-01 go-live audit found exactly this wreck in production
+        data (TM-2026-00004: Delivered with a draft Stock Entry and
+        stranded ledger rows); this gate makes that state impossible to
+        (re)create through any save path. Only the transition into
+        Delivered is gated — re-saving an already-Delivered legacy row or
+        moving one forward to Received must not brick on old data.
+        """
+        if self.status != "Delivered":
+            return
+        before = self.get_doc_before_save()
+        if before and before.get("status") == "Delivered":
+            return
+        self._assert_no_draft_stock_entries()
+
+    def _assert_no_draft_stock_entries(self):
+        """Throw if any transfers row points at a docstatus=0 Stock Entry.
+
+        Deleted / missing Stock Entries are deliberately tolerated here:
+        legacy Received flows purge the source SE, and _populate_transfer_
+        details already polices missing rows for pre-dispatch manifests.
+        """
+        names = [row.stock_entry for row in (self.transfers or []) if row.stock_entry]
+        if not names:
+            return
+        drafts = frappe.get_all(
+            "Stock Entry",
+            filters={"name": ["in", names], "docstatus": 0},
+            pluck="name",
+        )
+        if drafts:
+            frappe.throw(
+                _(
+                    "Cannot mark manifest {0} as Delivered: Stock Entry {1} "
+                    "is still Draft, so the stock ledger has not recorded this "
+                    "movement. Submit the Stock Entry (or remove the row) and retry."
+                ).format(self.name, ", ".join(sorted(drafts))),
+                title=_("Draft Stock Entry Blocks Delivery"),
+            )
 
     def on_update(self):
         self._sync_package_items()
@@ -325,6 +381,13 @@ class CHTransferManifest(Document):
         # shipment lines stay queryable after their underlying GR is
         # cancelled).
         post_draft = (self.status or "Draft") not in ("Draft", "")
+        # Collect every bad row instead of frappe.throw-ing mid-loop: a
+        # multi-SE manifest used to abort at the FIRST invalid Stock Entry,
+        # so later rows were never even looked at and the user discovered
+        # problems one save at a time (and a partially-processed pass left
+        # earlier rows populated while later ones stayed stale). One
+        # aggregated refusal reports the whole picture in a single save.
+        row_errors = []
         for row in self.transfers:
             if not row.stock_entry:
                 continue
@@ -339,17 +402,20 @@ class CHTransferManifest(Document):
                     # Legacy / post-recall row — keep whatever was stamped
                     # on the manifest line and move on.
                     continue
-                frappe.throw(_("Stock Entry {0} not found.").format(row.stock_entry), title=_("Ch Transfer Manifest Error"))
+                row_errors.append(_("Row {0}: Stock Entry {1} not found.").format(row.idx, row.stock_entry))
+                continue
             if se.docstatus == 2:
                 if post_draft:
                     continue
-                frappe.throw(_("Stock Entry {0} is cancelled.").format(row.stock_entry), title=_("Ch Transfer Manifest Error"))
+                row_errors.append(_("Row {0}: Stock Entry {1} is cancelled.").format(row.idx, row.stock_entry))
+                continue
             if se.stock_entry_type != "Material Transfer":
-                frappe.throw(
-                    _("Stock Entry {0} is not a Material Transfer (type: {1}).").format(
-                        row.stock_entry, se.stock_entry_type
+                row_errors.append(
+                    _("Row {0}: Stock Entry {1} is not a Material Transfer (type: {2}).").format(
+                        row.idx, row.stock_entry, se.stock_entry_type
                     )
                 )
+                continue
             row.from_warehouse = se.from_warehouse
             row.to_warehouse = se.to_warehouse
             # Get material_request from items (it's on the child table)
@@ -369,6 +435,12 @@ class CHTransferManifest(Document):
             )
             row.item_count = cint(items[0].cnt) if items else 0
             row.total_qty = flt(items[0].total_qty) if items else 0
+
+        if row_errors:
+            frappe.throw(
+                "<br>".join(row_errors),
+                title=_("Ch Transfer Manifest Error"),
+            )
 
     def _seed_manifest_stops(self):
         """Ensure a CH Transfer Manifest Stop exists for every from/to
@@ -1935,13 +2007,33 @@ class CHTransferManifest(Document):
         For partial receipt rows: trim SE item quantities to received amounts
         before submitting, so the stock ledger is accurate. Untouched items
         within a partially-received SE are trimmed proportionally.
+
+        Each Stock Entry submit runs inside its OWN database savepoint.
+        Stock Entry submission posts Stock Ledger Entries partway through
+        its submit chain, so a crash later in that chain used to strand
+        already-posted SLE rows against a still-Draft Stock Entry once the
+        surrounding request eventually committed — the Sep-01 go-live audit
+        found 9 such wrecks (ledger rows created seconds into failed
+        submits, voucher never advanced past docstatus=0). Rolling back to
+        the savepoint on ANY exception guarantees a failed submit leaves
+        zero trace, while successful sibling submits in the same pass are
+        preserved.
+
+        Failures surface on the manifest itself (timeline comment + red
+        msgprint) instead of only via frappe.log_error: an Error Log row is
+        invisible to the receiving team, and the old end-of-loop
+        frappe.throw rolled the whole acceptance back anyway — taking the
+        error evidence with it.
         """
         submitted = []
         errors = []
         for row in self.transfers:
+            savepoint = f"ch_se_submit_{frappe.generate_hash(length=10)}"
+            frappe.db.savepoint(savepoint)
             try:
                 se_doc = frappe.get_doc("Stock Entry", row.stock_entry)
                 if se_doc.docstatus != 0:
+                    frappe.db.release_savepoint(savepoint)
                     continue  # already submitted or cancelled — skip
 
                 rcv = flt(row.custom_received_qty)
@@ -1966,13 +2058,37 @@ class CHTransferManifest(Document):
                         _ok = False
                         break
                 if not _ok:
+                    frappe.db.release_savepoint(savepoint)
                     continue  # skip this SE
 
                 se_doc.flags.ignore_permissions = True
+                # Same rationale as _create_reverse_se: this is a controlled,
+                # system-generated submit fired only after the manifest's own
+                # transit lifecycle completed (packed → picked → delivered →
+                # accepted), which is precisely the visibility the ch_erp15
+                # direct-Material-Transfer guardrail exists to protect. Without
+                # this flag the guardrail refuses EVERY delivery-acceptance
+                # auto-submit and GAP-2 can never post the receipt.
+                se_doc.flags.ignore_procurement_guardrails = True
                 se_doc.submit()
+                frappe.db.release_savepoint(savepoint)
                 submitted.append(row.stock_entry)
-            except Exception:
-                errors.append(row.stock_entry)
+            except Exception as exc:
+                # ATOMIC: throw away everything this submit attempt wrote
+                # (SLEs, GL rows, serial moves, the docstatus flip itself)
+                # so a half-submitted Stock Entry can never reach the
+                # database. log_error AFTER the rollback so the log row
+                # survives it.
+                frappe.db.rollback(save_point=savepoint)
+                if isinstance(exc, frappe.ValidationError):
+                    # Swallowing a frappe.throw does NOT clear its
+                    # message_log entry — without this, every caught
+                    # validation failure would still pop up on the client
+                    # alongside our consolidated msgprint below.
+                    frappe.clear_last_message()
+                errors.append(
+                    f"{row.stock_entry}: {frappe.utils.escape_html(str(exc) or type(exc).__name__)}"
+                )
                 frappe.log_error(
                     frappe.get_traceback(),
                     f"Auto-submit SE failed for manifest {self.name}: {row.stock_entry}",
@@ -1986,12 +2102,26 @@ class CHTransferManifest(Document):
                 ),
             )
         if errors:
-            frappe.throw(
+            detail = "; ".join(errors)
+            # Persist the failure on the manifest timeline AND tell the user.
+            # Deliberately no frappe.throw here: throwing would roll back the
+            # acceptance, the successful sibling submits and this very
+            # comment, leaving the failure visible only in Error Log — the
+            # exact silent wreck this method previously produced.
+            self.add_comment(
+                "Comment",
+                _("Auto-submit FAILED for {0} Stock Entry row(s) on delivery acceptance: {1}. "
+                  "These entries remain Draft and the stock ledger does not yet reflect "
+                  "their receipt.").format(len(errors), detail),
+            )
+            frappe.msgprint(
                 _(
-                    "Delivery acceptance cannot complete because {0} linked Stock Entry row(s) "
-                    "could not be submitted: {1}. Fix stock or the transfer document and retry."
-                ).format(len(errors), ", ".join(errors)),
+                    "{0} linked Stock Entry row(s) could not be submitted and remain Draft: {1}. "
+                    "The stock ledger does not reflect this receipt for those rows — fix the "
+                    "underlying issue and submit them from the Stock Entry list."
+                ).format(len(errors), detail),
                 title=_("Stock Ledger Not Updated"),
+                indicator="red",
             )
 
     def _create_landed_cost_voucher(self) -> None:

@@ -1570,6 +1570,12 @@ def poll_courier_statuses(dry_run=0) -> dict:
 
             if _can_apply_courier_status(row.status, mapped_status):
                 doc = frappe.get_doc("CH Transfer Manifest", row.name)
+                if mapped_status == "Delivered":
+                    # db_set bypasses the controller's save hooks, so the
+                    # Delivered-with-draft-Stock-Entry gate must be invoked
+                    # explicitly here — a courier webhook must not be able
+                    # to create the exact wreck the controller refuses.
+                    doc._assert_no_draft_stock_entries()
                 doc.flags.ignore_validate_update_after_submit = True
                 doc.db_set("status", mapped_status, update_modified=True)
                 doc._sync_logistics_status_to_entries(mapped_status)

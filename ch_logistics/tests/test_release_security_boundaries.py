@@ -52,6 +52,13 @@ class TestLogisticsReleaseSecurityBoundaries(unittest.TestCase):
             patch.object(logistics_api.frappe, "get_all", return_value=rows),
             patch.object(logistics_api.frappe.db, "get_value", return_value=None),
             patch.object(logistics_api.frappe.db, "bulk_update") as bulk_update,
+            # _propagate_trip_driver_to_manifests now also pushes Stock Entry
+            # custom_status="Assigned" for the promoted manifests. That helper
+            # must be mocked here: left real, it re-enters frappe with the
+            # patched-out frappe.get_all/db.get_value above, feeding these
+            # fake manifest dicts into a real frappe.db.set_value (and dying
+            # earlier on get_meta once db.get_value returns None).
+            patch.object(logistics_api, "_sync_assigned_status_to_entries") as sync_entries,
         ):
             propagated = logistics_api._propagate_trip_driver_to_manifests(
                 "TRIP-2", "DRIVER-1"
@@ -61,6 +68,7 @@ class TestLogisticsReleaseSecurityBoundaries(unittest.TestCase):
         updates = bulk_update.call_args.args[1]
         self.assertEqual(updates["MAN-DRAFT"]["status"], "Assigned")
         self.assertEqual(updates["MAN-PACKED"]["status"], "Assigned")
+        sync_entries.assert_called_once_with(["MAN-DRAFT", "MAN-PACKED"])
 
     def test_notification_policy_excludes_privileged_and_configured_roles(self):
         with (
