@@ -25,6 +25,10 @@ def _scope(user: str | None = None) -> dict:
         "stores": set(resolved.get("stores") or set()),
         "warehouses": set(resolved.get("warehouses") or set()),
         "companies": set(resolved.get("companies") or set()),
+        # Explicit CH User Scope company rows only — never the companies
+        # back-filled from store grants. An explicit grant covers the whole
+        # company, including its non-store warehouses (hubs, transit).
+        "direct_companies": set(resolved.get("direct_companies") or set()),
     }
 
 
@@ -40,12 +44,26 @@ def is_in_scope(
     if resolved["bypass"]:
         return True
     locations = resolved["stores"] | resolved["warehouses"]
+    direct_companies = resolved.get("direct_companies") or set()
     if store or warehouse:
-        return bool(
-            locations
-            and ((store and store in locations) or (warehouse and warehouse in locations))
-        )
+        if locations and (
+            (store and store in locations) or (warehouse and warehouse in locations)
+        ):
+            return True
+        # Scope warehouses derive from stores, so hub/transit warehouses can
+        # never appear in them. An EXPLICIT company grant covers every
+        # location of that company, non-store warehouses included.
+        if direct_companies:
+            anchor_company = None
+            if warehouse:
+                anchor_company = frappe.get_cached_value("Warehouse", warehouse, "company")
+            elif store:
+                anchor_company = frappe.db.get_value("CH Store", store, "company")
+            return bool(anchor_company) and anchor_company in direct_companies
+        return False
     if company:
+        if company in direct_companies:
+            return True
         if locations:
             return False
         return company in resolved["companies"]
@@ -75,11 +93,27 @@ def build_scope_sql(
     if resolved["bypass"]:
         return "1=1", {}
 
+    clauses: list[str] = []
+    params: dict = {}
+
     locations = sorted(resolved["stores"] | resolved["warehouses"])
     if locations and location_fields:
-        params = {f"{prefix}_location_{idx}": value for idx, value in enumerate(locations)}
-        placeholders = ", ".join(f"%({key})s" for key in params)
-        clauses = [f"{field} IN ({placeholders})" for field in location_fields]
+        loc_params = {f"{prefix}_location_{idx}": value for idx, value in enumerate(locations)}
+        placeholders = ", ".join(f"%({key})s" for key in loc_params)
+        clauses.extend(f"{field} IN ({placeholders})" for field in location_fields)
+        params.update(loc_params)
+
+    # An EXPLICIT company grant covers every location of that company —
+    # including hub/transit warehouses, which derive from no store and can
+    # therefore never appear in the location set.
+    direct_companies = sorted(resolved.get("direct_companies") or ())
+    if direct_companies and company_field:
+        dc_params = {f"{prefix}_direct_co_{idx}": value for idx, value in enumerate(direct_companies)}
+        placeholders = ", ".join(f"%({key})s" for key in dc_params)
+        clauses.append(f"{company_field} IN ({placeholders})")
+        params.update(dc_params)
+
+    if clauses:
         return f"({' OR '.join(clauses)})", params
 
     companies = sorted(resolved["companies"])

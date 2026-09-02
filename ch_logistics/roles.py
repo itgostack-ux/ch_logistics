@@ -80,11 +80,11 @@ DEFAULT_ROLE_MATRIX: dict[str, set[str]] = {
     "ewaybill_sync": {"Delivery Manager", "Stock Manager", "Operations Manager"},
     "head_override": {"Logistics Head", "Logistic Head"},
     "resequence_override": {"Logistics Head", "Logistic Head", "Operations Manager"},
-    "app_access": {"Logistics Manager", "Logistics User"},
+    "app_access": {"Logistics Manager", "Logistics User", "Delivery Manager"},
     "report_ops": {"Delivery Manager", "Stock Manager", "Operations Manager"},
     "digest_recipients": {"Delivery Manager", "Stock Manager"},
     "digest_preview": {"Delivery Manager"},
-    "rejection_dispatcher_notify": {"Logistics Manager"},
+    "rejection_dispatcher_notify": {"Logistics Manager", "Delivery Manager"},
 }
 
 # Roles referenced anywhere in the matrix that are NOT created by any

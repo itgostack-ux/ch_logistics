@@ -20,10 +20,20 @@ def _scope_clause(table: str, warehouse_field: str, company_field: str, user: st
 	scope = scope_guard._scope(user)
 	if scope.get("bypass"):
 		return "1=1"
+	clauses = []
 	locations = sorted(set(scope.get("stores") or ()) | set(scope.get("warehouses") or ()))
 	if locations:
 		values = ", ".join(frappe.db.escape(value) for value in locations)
-		return f"`tab{table}`.`{warehouse_field}` IN ({values})"
+		clauses.append(f"`tab{table}`.`{warehouse_field}` IN ({values})")
+	# An EXPLICIT company grant covers every location of that company —
+	# including hub/transit warehouses, which derive from no store and can
+	# therefore never appear in the location set.
+	direct_companies = sorted(scope.get("direct_companies") or ())
+	if direct_companies:
+		values = ", ".join(frappe.db.escape(value) for value in direct_companies)
+		clauses.append(f"`tab{table}`.`{company_field}` IN ({values})")
+	if clauses:
+		return "(" + " OR ".join(clauses) + ")"
 	companies = sorted(scope.get("companies") or ())
 	if companies:
 		values = ", ".join(frappe.db.escape(value) for value in companies)
