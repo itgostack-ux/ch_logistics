@@ -66,10 +66,11 @@
    "search_index": 1
   },
   {
+   "description": "Operating company for this trip (freight and report attribution). The trip is a cross-company container: its stops and manifests may belong to any company.",
    "fieldname": "company",
    "fieldtype": "Link",
    "in_standard_filter": 1,
-   "label": "Company",
+   "label": "Operating Company",
    "options": "Company",
    "reqd": 1
   },
@@ -284,7 +285,7 @@
   }
  ],
  "links": [],
- "modified": "2026-07-22 12:00:00.000000",
+ "modified": "2026-09-02 12:00:00.000000",
  "modified_by": "Administrator",
  "module": "Logistics",
  "name": "CH Logistics Trip",

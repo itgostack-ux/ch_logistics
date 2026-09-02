@@ -132,12 +132,15 @@ class CHLogisticsTrip(Document):
         if not self.stops:
             return
         warehouse_names = {row.warehouse for row in self.stops if row.warehouse}
+        warehouse_fields = ["name", "company"]
+        if frappe.get_meta("Warehouse").has_field("ch_store"):
+            warehouse_fields.append("ch_store")
         warehouse_rows = {
             row.name: row
             for row in frappe.get_all(
                 "Warehouse",
                 filters={"name": ("in", tuple(warehouse_names))},
-                fields=["name", "company"],
+                fields=warehouse_fields,
                 limit_page_length=max(len(warehouse_names), 1),
             )
         } if warehouse_names else {}
@@ -166,20 +169,28 @@ class CHLogisticsTrip(Document):
             seen.add(row.sequence)
             if not row.warehouse or row.warehouse not in warehouse_rows:
                 frappe.throw(_("Stop {0} has an unknown warehouse.").format(row.sequence))
-            if warehouse_rows[row.warehouse].company != self.company:
-                frappe.throw(
-                    _("Stop {0} warehouse belongs to another company.").format(row.sequence),
-                    frappe.PermissionError,
-                )
+            # A trip is a cross-company container: one vehicle carries every
+            # company's parcels on the same run. Stops may therefore belong
+            # to any company — trip.company is only the OPERATING company
+            # (freight, reports, digest attribution). Each parcel's stock and
+            # GL stay per-manifest-company; the trip posts nothing itself.
+            # What still must hold: the warehouse exists, the store exists,
+            # and a store's stop points at that store's own warehouse.
             if row.store:
                 store = store_rows.get(row.store)
-                if not store or store.company != self.company:
+                if not store:
                     frappe.throw(
-                        _("Stop {0} store belongs to another company.").format(row.sequence),
+                        _("Stop {0} has an unknown store.").format(row.sequence),
                         frappe.PermissionError,
                     )
+                # A stop's warehouse must be one of THAT store's warehouses:
+                # its configured base warehouse, or any bin tagged with the
+                # store (Warehouse.ch_store) — GoFix custody manifests, for
+                # example, ship from the store's Customer Device bin, which
+                # is still physically the same stop.
                 configured = {store.get(fieldname) for fieldname in store_warehouse_fields}
-                if configured and row.warehouse not in configured:
+                belongs_to_store = warehouse_rows[row.warehouse].get("ch_store") == row.store
+                if configured and row.warehouse not in configured and not belongs_to_store:
                     frappe.throw(
                         _("Stop {0} store is not configured for its warehouse.").format(row.sequence),
                         frappe.PermissionError,

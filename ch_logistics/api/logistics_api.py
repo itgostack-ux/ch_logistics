@@ -86,8 +86,11 @@ def trip_create(trip_date, company, route=None, driver=None, vehicle=None,
             ["source_store", "source_warehouse", "company"],
             as_dict=True,
         )
-        if not manifest_scope or manifest_scope.company != company:
-            frappe.throw(_("A selected manifest is outside the trip company."), frappe.PermissionError)
+        if not manifest_scope:
+            frappe.throw(_("Manifest {0} was not found.").format(manifest_name))
+        # Cross-company trips: a trip may carry manifests of ANY company —
+        # trip.company is only the operating company. Per-manifest access is
+        # still enforced through the actor's scope.
         scope_guard.assert_manifest_scope(manifest_scope, side="source")
     doc = frappe.new_doc("CH Logistics Trip")
     doc.trip_date = trip_date
@@ -1478,18 +1481,23 @@ def dynamic_insert_stop(trip, manifest=None, store=None, warehouse=None, stop_ty
     if not target_wh:
         frappe.throw(_("Warehouse is required to insert a stop."))
     warehouse_company = frappe.db.get_value("Warehouse", target_wh, "company")
-    if not warehouse_company or warehouse_company != doc.company:
-        frappe.throw(_("The stop warehouse must belong to the trip company."), frappe.PermissionError)
+    if not warehouse_company:
+        frappe.throw(_("The stop warehouse was not found."), frappe.PermissionError)
+    # Cross-company trips: the stop may belong to any company — the trip's
+    # company is only the operating company. The store must still be real
+    # and point at its own warehouse.
     if target_store:
         store_row = frappe.db.get_value(
             "CH Store", target_store, ["company", "warehouse"], as_dict=True
         )
+        # The warehouse must be one of the store's own: its base warehouse
+        # or any bin tagged with the store (e.g. a GoFix custody bin).
+        wh_store = frappe.db.get_value("Warehouse", target_wh, "ch_store")
         if (
             not store_row
-            or store_row.company != doc.company
-            or (store_row.warehouse and store_row.warehouse != target_wh)
+            or (store_row.warehouse and store_row.warehouse != target_wh and wh_store != target_store)
         ):
-            frappe.throw(_("The stop store does not match the trip warehouse/company."), frappe.PermissionError)
+            frappe.throw(_("The stop store does not match the stop warehouse."), frappe.PermissionError)
     scope_guard.assert_scope(
         store=target_store, warehouse=target_wh, company=doc.company
     )
@@ -3834,11 +3842,13 @@ def club_transfers_into_trip(source_warehouse, trip_date=None, company=None,
 
     trip_date = trip_date or frappe.utils.today()
     warehouse_company = frappe.db.get_value("Warehouse", source_warehouse, "company")
+    if not warehouse_company:
+        frappe.throw(_("Source warehouse was not found."), frappe.PermissionError)
+    # Cross-company trips: `company` is the trip's OPERATING company and may
+    # differ from the source warehouse's company. Defaults to the latter.
     company = company or warehouse_company
     if not company:
         frappe.throw(_("Company is required to create a trip."), title=_("API Error"))
-    if not warehouse_company or warehouse_company != company:
-        frappe.throw(_("Source warehouse does not belong to the selected company."), frappe.PermissionError)
 
     filters = {
         "source_warehouse": source_warehouse,
@@ -3879,8 +3889,8 @@ def club_transfers_into_trip(source_warehouse, trip_date=None, company=None,
     if selected_names and selected_names != {row.name for row in pool}:
         frappe.throw(_("One or more selected manifests are not attachable from this warehouse."), frappe.PermissionError)
     for row in pool:
-        if row.source_warehouse != source_warehouse or row.company != company:
-            frappe.throw(_("A selected manifest is outside the trip warehouse/company."), frappe.PermissionError)
+        if row.source_warehouse != source_warehouse:
+            frappe.throw(_("A selected manifest is outside the trip warehouse."), frappe.PermissionError)
         scope_guard.assert_manifest_scope(row, side="source")
 
     # Group by destination — preserve first-seen order for deterministic stops.
