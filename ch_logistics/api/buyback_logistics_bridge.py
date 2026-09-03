@@ -28,7 +28,7 @@ from __future__ import annotations
 import frappe
 from frappe.utils import cint, today
 
-from ch_logistics.api.trip_lock import get_locked_trip, lock_manifests
+from ch_logistics.api.trip_lock import get_locked_trip, lock_manifests, set_manifest_trip
 
 
 def on_stock_entry_submit(doc, method=None):
@@ -223,14 +223,14 @@ def _attach_manifest_to_trip(trip, manifest):
         "sequence",
     )
 
-    updates = {"trip": trip}
+    extra = {}
     meta = frappe.get_meta("CH Transfer Manifest")
     if seq and meta.has_field("stop_sequence"):
-        updates["stop_sequence"] = cint(seq)
+        extra["stop_sequence"] = cint(seq)
     savepoint = f"buyback_trip_{frappe.generate_hash(length=10)}"
     frappe.db.savepoint(savepoint)
     try:
-        frappe.db.set_value("CH Transfer Manifest", manifest, updates)
+        set_manifest_trip(manifest, trip, extra=extra)
 
         # Saving the trip recomputes totals/derived state. The manifest link
         # and the trip refresh are one integrity unit and must not diverge.

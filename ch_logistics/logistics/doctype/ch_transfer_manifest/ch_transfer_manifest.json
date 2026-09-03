@@ -14,6 +14,7 @@
   "col_break_header",
   "status",
   "trip",
+  "trip_attached_at",
   "route",
   "amended_from",
   "sec_route",
@@ -155,6 +156,14 @@
    "options": "CH Logistics Trip",
    "read_only": 1,
    "search_index": 1
+  },
+  {
+   "fieldname": "trip_attached_at",
+   "fieldtype": "Datetime",
+   "label": "Attached To Trip At",
+   "read_only": 1,
+   "allow_on_submit": 1,
+   "description": "When this consignment was put on a trip. Stamped by the assignment itself, so the pipeline report can show a captured moment rather than inferring one from the trip's creation."
   },
   {
    "fieldname": "route",
@@ -687,10 +696,10 @@
   {
    "fieldname": "freight_amount",
    "fieldtype": "Currency",
-   "label": "Freight Amount (\u20b9)",
+   "label": "Freight Amount (₹)",
    "read_only": 1,
    "insert_after": "total_weight_kg",
-   "description": "Auto-computed from courier rate card \u00d7 billable weight"
+   "description": "Auto-computed from courier rate card × billable weight"
   },
   {
    "fieldname": "col_break_freight",
@@ -754,7 +763,7 @@
  "index_web_pages_for_search": 0,
  "is_submittable": 1,
  "links": [],
- "modified": "2026-04-23 10:00:00.000000",
+ "modified": "2026-09-03 10:15:00.000000",
  "modified_by": "Administrator",
  "module": "Logistics",
  "name": "CH Transfer Manifest",

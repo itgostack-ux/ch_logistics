@@ -18,7 +18,7 @@ from ch_logistics import roles as role_registry
 from ch_logistics import scope_guard
 from ch_logistics.api import driver_status as ds
 from ch_logistics.api import stop_roles
-from ch_logistics.api.trip_lock import get_locked_trip, lock_manifests
+from ch_logistics.api.trip_lock import get_locked_trip, lock_manifests, set_manifest_trip
 
 _TRIP_CLOSE_TERMINAL_MANIFEST_STATUSES = {
     "Closed", "Delivered", "Received", "Partially Received", "Cancelled", "Returned",
@@ -1316,7 +1316,7 @@ def _attach_manifests(trip, manifests):
             )
         scope_guard.assert_manifest_scope(mf)
         _validate_manifest_attachable(trip_doc, manifest_name, mf)
-        frappe.db.set_value("CH Transfer Manifest", manifest_name, "trip", trip)
+        set_manifest_trip(manifest_name, trip)
         # Runs AFTER stop assignment, deliberately: _assign_stop_sequence()
         # reads direction fresh from the DB too (via _manifest_target_for_trip),
         # so correcting it first would also flip what stop_sequence resolves
@@ -1432,7 +1432,7 @@ def detach_manifest(manifest):
     trip_doc.flags.ignore_mandatory = True
     if trip_doc.status in ("Completed", "Closed", "Cancelled"):
         frappe.throw(_("Cannot detach manifest from a {0} trip").format(trip_doc.status))
-    frappe.db.set_value("CH Transfer Manifest", manifest, "trip", None)
+    set_manifest_trip(manifest, None)
     if _has_manifest_stop_seq_field():
         # Int column is NOT NULL — writing None raises IntegrityError.
         frappe.db.set_value("CH Transfer Manifest", manifest, "stop_sequence", 0)
@@ -1540,8 +1540,13 @@ def dynamic_insert_stop(trip, manifest=None, store=None, warehouse=None, stop_ty
 
     if manifest and _has_manifest_trip_field():
         if frappe.db.get_value("CH Transfer Manifest", manifest, "trip") != doc.name:
-            frappe.db.set_value("CH Transfer Manifest", manifest, "trip", doc.name)
-        if _has_manifest_stop_seq_field():
+            set_manifest_trip(
+                manifest, doc.name,
+                extra={"stop_sequence": insert_seq} if _has_manifest_stop_seq_field() else None,
+            )
+        elif _has_manifest_stop_seq_field():
+            # Already on this trip — only the position moved, so the
+            # attachment stamp must not be reset.
             frappe.db.set_value("CH Transfer Manifest", manifest, "stop_sequence", insert_seq)
 
     return {
