@@ -19,6 +19,7 @@
   "packed_at",
   "sec_break_photo",
   "packing_photo",
+  "additional_photos",
   "notes"
  ],
  "fields": [
@@ -104,6 +105,13 @@
    "fieldtype": "Attach Image",
    "label": "Packing Photo",
    "reqd": 1
+  },
+  {
+   "description": "Extra photos beyond the required one above — different angles, contents, damage close-ups, etc. JSON array of file URLs; the Pack Box dialog renders/edits this with its own thumbnail widget, not the default table grid.",
+   "fieldname": "additional_photos",
+   "fieldtype": "JSON",
+   "hidden": 1,
+   "label": "Additional Photos"
   },
   {
    "fieldname": "notes",

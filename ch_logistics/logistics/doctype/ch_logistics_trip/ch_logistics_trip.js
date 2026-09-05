@@ -4,6 +4,17 @@
 
 frappe.ui.form.on("CH Logistics Trip", {
 	refresh(frm) {
+		// Company is auto-filled and locked read-only by the app-wide
+		// company_lock.js the moment the form exists (every doctype's
+		// "company" Link field gets this treatment) — the user never picks
+		// it either way. On a brand-new trip that makes the field pure
+		// clutter, since it's set from the active company before the user
+		// does anything; hide it there. Once the trip is saved, still show
+		// it (read-only) for audit/reference, matching how every other
+		// doctype in this app displays its locked company field.
+		frm.set_df_property("company", "hidden", frm.is_new() ? 1 : 0);
+		frm.refresh_field("company");
+
 		// Resolve role capabilities server-side (CH Logistics Settings → Role
 		// Matrix) once, then paint the buttons. Cosmetic only — trip_close
 		// re-checks head_override on the server.
