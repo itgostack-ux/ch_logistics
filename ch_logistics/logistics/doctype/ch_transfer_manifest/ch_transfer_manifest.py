@@ -2417,6 +2417,23 @@ class CHTransferManifest(Document):
                 "Stock Entry", row.stock_entry, update,
                 update_modified=False,
             )
+            # frappe.db.set_value bypasses doc events, so Stock Entry Inward
+            # (ch_erp15's mirrored Scan & Receive screen, which listens on
+            # Stock Entry's on_update) would never learn a transfer just
+            # became receive-eligible. Drive that sync explicitly here so a
+            # driver's "Delivered" action shows up there immediately.
+            if update.get("custom_status") in ("Ready For Receive", "Receive At Transit",
+                                                "Partially Transferred", "Transferred"):
+                try:
+                    from ch_erp15.ch_erp15.doctype.stock_entry_inward.stock_entry_inward import (
+                        sync_inward_for_stock_entry,
+                    )
+                    sync_inward_for_stock_entry(frappe.get_doc("Stock Entry", row.stock_entry))
+                except Exception:
+                    frappe.log_error(
+                        title="Stock Entry Inward sync failed from CH Transfer Manifest",
+                        message=frappe.get_traceback(),
+                    )
 
     def _sync_custom_status_only(self, target_status):
         """Push a manifest-status-driven value onto linked Stock Entries'
