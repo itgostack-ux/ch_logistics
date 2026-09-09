@@ -1,7 +1,6 @@
 {
  "actions": [],
  "allow_import": 1,
- "allow_rename": 0,
  "autoname": "naming_series:",
  "creation": "2026-05-26 00:00:00.000000",
  "doctype": "DocType",
@@ -48,17 +47,17 @@
  ],
  "fields": [
   {
+   "default": "TRIP-.YYYY.-.#####",
    "fieldname": "naming_series",
    "fieldtype": "Select",
    "hidden": 1,
    "label": "Naming Series",
-   "options": "TRIP-.YYYY.-.#####",
-   "default": "TRIP-.YYYY.-.#####"
+   "options": "TRIP-.YYYY.-.#####"
   },
   {
+   "default": "Today",
    "fieldname": "trip_date",
    "fieldtype": "Date",
-   "default": "Today",
    "in_list_view": 1,
    "in_standard_filter": 1,
    "label": "Trip Date",
@@ -79,9 +78,9 @@
    "fieldtype": "Column Break"
   },
   {
+   "default": "Draft",
    "fieldname": "status",
    "fieldtype": "Select",
-   "default": "Draft",
    "in_list_view": 1,
    "in_standard_filter": 1,
    "label": "Status",
@@ -90,9 +89,9 @@
    "search_index": 1
   },
   {
+   "default": "Forward",
    "fieldname": "direction",
    "fieldtype": "Select",
-   "default": "Forward",
    "in_standard_filter": 1,
    "label": "Direction",
    "options": "Forward\nReverse\nMixed"
@@ -103,19 +102,19 @@
    "label": "Route"
   },
   {
+   "description": "Auto-resolved from this trip's own Drop stops when left blank (or when the stops table changes). Hand-correct it if the auto-match picked the wrong overlapping route.",
    "fieldname": "route",
    "fieldtype": "Link",
    "in_list_view": 1,
    "label": "Route",
-   "options": "CH Route",
-   "description": "Auto-resolved from this trip's own Drop stops when left blank (or when the stops table changes). Hand-correct it if the auto-match picked the wrong overlapping route."
+   "options": "CH Route"
   },
   {
+   "fetch_from": "route.hub_warehouse",
    "fieldname": "hub_warehouse",
    "fieldtype": "Link",
    "label": "Hub Warehouse",
-   "options": "Warehouse",
-   "fetch_from": "route.hub_warehouse"
+   "options": "Warehouse"
   },
   {
    "fieldname": "col_break_route",
@@ -144,21 +143,21 @@
    "in_list_view": 1,
    "in_standard_filter": 1,
    "label": "Driver",
+   "mandatory_depends_on": "eval:doc.status==\"Started\"",
    "options": "Driver",
-   "search_index": 1,
-   "mandatory_depends_on": "eval:doc.status==\"Started\""
+   "search_index": 1
   },
   {
+   "fetch_from": "driver.full_name",
    "fieldname": "driver_name",
    "fieldtype": "Data",
-   "fetch_from": "driver.full_name",
    "label": "Driver Name",
    "read_only": 1
   },
   {
+   "fetch_from": "driver.cell_number",
    "fieldname": "driver_phone",
    "fieldtype": "Data",
-   "fetch_from": "driver.cell_number",
    "label": "Driver Phone",
    "read_only": 1
   },
@@ -170,13 +169,13 @@
    "fieldname": "vehicle",
    "fieldtype": "Link",
    "label": "Vehicle",
-   "options": "Vehicle",
-   "mandatory_depends_on": "eval:doc.status==\"Started\""
+   "mandatory_depends_on": "eval:doc.status==\"Started\"",
+   "options": "Vehicle"
   },
   {
+   "fetch_from": "vehicle.license_plate",
    "fieldname": "vehicle_number",
    "fieldtype": "Data",
-   "fetch_from": "vehicle.license_plate",
    "label": "Vehicle Number",
    "read_only": 1
   },
@@ -192,10 +191,10 @@
    "options": "CH Logistics Trip Stop"
   },
   {
+   "collapsible": 1,
    "fieldname": "sec_execution",
    "fieldtype": "Section Break",
-   "label": "Execution",
-   "collapsible": 1
+   "label": "Execution"
   },
   {
    "fieldname": "actual_start",
@@ -232,10 +231,10 @@
    "read_only": 1
   },
   {
+   "collapsible": 1,
    "fieldname": "sec_exceptions",
    "fieldtype": "Section Break",
-   "label": "Exceptions",
-   "collapsible": 1
+   "label": "Exceptions"
   },
   {
    "fieldname": "exceptions",
@@ -244,10 +243,10 @@
    "options": "CH Logistics Exception"
   },
   {
+   "collapsible": 1,
    "fieldname": "sec_notes",
    "fieldtype": "Section Break",
-   "label": "Notes",
-   "collapsible": 1
+   "label": "Notes"
   },
   {
    "fieldname": "notes",
@@ -255,54 +254,54 @@
    "label": "Notes"
   },
   {
+   "collapsible": 1,
+   "depends_on": "eval:doc.status=='Cancelled'",
    "fieldname": "sec_cancellation",
    "fieldtype": "Section Break",
-   "label": "Cancellation",
-   "collapsible": 1,
-   "depends_on": "eval:doc.status=='Cancelled'"
+   "label": "Cancellation"
   },
   {
    "fieldname": "cancelled_by",
    "fieldtype": "Link",
    "label": "Cancelled By",
+   "no_copy": 1,
    "options": "User",
-   "read_only": 1,
-   "no_copy": 1
+   "read_only": 1
   },
   {
    "fieldname": "cancelled_on",
    "fieldtype": "Datetime",
    "label": "Cancelled On",
-   "read_only": 1,
-   "no_copy": 1
+   "no_copy": 1,
+   "read_only": 1
   },
   {
    "fieldname": "cancellation_reason",
    "fieldtype": "Small Text",
    "label": "Cancellation Reason",
-   "read_only": 1,
-   "no_copy": 1
+   "no_copy": 1,
+   "read_only": 1
   }
  ],
  "links": [],
- "modified": "2026-09-02 12:00:00.000000",
+ "modified": "2026-09-07 12:47:33.092549",
  "modified_by": "Administrator",
  "module": "Logistics",
  "name": "CH Logistics Trip",
  "owner": "Administrator",
  "permissions": [
   {
-   "role": "System Manager",
-   "read": 1,
-   "write": 1,
    "create": 1,
    "delete": 1,
    "email": 1,
    "export": 1,
    "import": 1,
    "print": 1,
+   "read": 1,
    "report": 1,
-   "share": 1
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
   },
   {
    "permlevel": 1,
@@ -311,51 +310,46 @@
    "write": 1
   },
   {
-   "role": "Operations Manager",
-   "read": 1,
-   "write": 1,
    "create": 1,
    "delete": 1,
    "email": 1,
    "export": 1,
    "print": 1,
+   "read": 1,
    "report": 1,
-   "share": 1
+   "role": "Operations Manager",
+   "share": 1,
+   "write": 1
   },
   {
-   "role": "Stock User",
-   "read": 1,
-   "write": 1,
    "create": 1,
    "email": 1,
    "export": 1,
    "print": 1,
-   "report": 1
-  },
-  {
-   "role": "Delivery Manager",
    "read": 1,
-   "write": 1,
-   "create": 1
-  },
-  {
-   "role": "Delivery User",
-   "read": 1,
+   "report": 1,
+   "role": "Stock User",
    "write": 1
   },
   {
-   "role": "Logistics Head",
+   "create": 1,
    "read": 1,
-   "write": 1,
-   "create": 1
+   "role": "Delivery Manager",
+   "write": 1
   },
   {
-   "role": "Logistic Head",
    "read": 1,
-   "write": 1,
-   "create": 1
+   "role": "Delivery User",
+   "write": 1
+  },
+  {
+   "create": 1,
+   "read": 1,
+   "role": "Logistics Head",
+   "write": 1
   }
  ],
+ "row_format": "Dynamic",
  "sort_field": "modified",
  "sort_order": "DESC",
  "states": [],
