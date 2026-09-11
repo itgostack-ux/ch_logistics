@@ -2,7 +2,7 @@
  "app": "ch_logistics",
  "charts": [],
  "content": "[{\"id\": \"lr_hdr\", \"type\": \"header\", \"data\": {\"text\": \"<span class=\\\"h4\\\">Logistics Reports</span>\", \"col\": 12}}, {\"id\": \"lr_sp1\", \"type\": \"spacer\", \"data\": {\"col\": 12}}, {\"id\": \"lr_sc1\", \"type\": \"shortcut\", \"data\": {\"shortcut_name\": \"Delivery & SLA\", \"col\": 3}}, {\"id\": \"lr_sc2\", \"type\": \"shortcut\", \"data\": {\"shortcut_name\": \"Driver Scorecard\", \"col\": 3}}, {\"id\": \"lr_sc3\", \"type\": \"shortcut\", \"data\": {\"shortcut_name\": \"Exceptions & Rejections\", \"col\": 3}}, {\"id\": \"lr_sc4\", \"type\": \"shortcut\", \"data\": {\"shortcut_name\": \"Store Transfers\", \"col\": 3}}, {\"id\": \"lr_sp2\", \"type\": \"spacer\", \"data\": {\"col\": 12}}, {\"id\": \"lr_cd1\", \"type\": \"card\", \"data\": {\"card_name\": \"Managers & Logistics Head\", \"col\": 4}}, {\"id\": \"lr_cd2\", \"type\": \"card\", \"data\": {\"card_name\": \"Stores\", \"col\": 4}}, {\"id\": \"lr_cd3\", \"type\": \"card\", \"data\": {\"card_name\": \"Delivery Staff\", \"col\": 4}}]",
- "creation": "2026-06-23 00:00:00.000000",
+ "creation": "2026-06-23 00:00:00",
  "custom_blocks": [],
  "docstatus": 0,
  "doctype": "Workspace",
@@ -122,6 +122,8 @@
    "type": "Link"
   }
  ],
+ "modified": "2026-09-10 13:42:18.952769",
+ "modified_by": "Administrator",
  "module": "Logistics",
  "name": "Logistics Reports",
  "number_cards": [],
@@ -131,7 +133,19 @@
  "quick_lists": [],
  "roles": [
   {
+   "role": "Administrator"
+  },
+  {
    "role": "System Manager"
+  },
+  {
+   "role": "Logistics Manager"
+  },
+  {
+   "role": "Logistics Head"
+  },
+  {
+   "role": "Logistics User"
   },
   {
    "role": "Delivery Manager"
@@ -149,36 +163,36 @@
  "sequence_id": 99.0,
  "shortcuts": [
   {
-   "type": "Report",
+   "color": "Blue",
+   "doc_view": "List",
    "label": "Delivery & SLA",
    "link_to": "Manifest Delivery and SLA",
    "report_ref_doctype": "CH Transfer Manifest",
-   "doc_view": "List",
-   "color": "Blue"
+   "type": "Report"
   },
   {
-   "type": "Report",
+   "color": "Green",
+   "doc_view": "List",
    "label": "Driver Scorecard",
    "link_to": "Driver Performance Scorecard",
    "report_ref_doctype": "CH Logistics Trip",
-   "doc_view": "List",
-   "color": "Green"
+   "type": "Report"
   },
   {
-   "type": "Report",
+   "color": "Red",
+   "doc_view": "List",
    "label": "Exceptions & Rejections",
    "link_to": "Delivery Exceptions and Rejections",
    "report_ref_doctype": "CH Transfer Manifest",
-   "doc_view": "List",
-   "color": "Red"
+   "type": "Report"
   },
   {
-   "type": "Report",
+   "color": "Orange",
+   "doc_view": "List",
    "label": "Store Transfers",
    "link_to": "Store Transfer Register",
    "report_ref_doctype": "CH Transfer Manifest",
-   "doc_view": "List",
-   "color": "Orange"
+   "type": "Report"
   }
  ],
  "title": "Logistics Reports",
