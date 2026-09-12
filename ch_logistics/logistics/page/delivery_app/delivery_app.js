@@ -2269,6 +2269,26 @@ class DeliveryApp {
                 register_scan(e.target.value);
             }
         });
+        // Mobile: the Barcode field's built-in scan icon (setup_barcode_field
+        // in frappe's data.js control) reads the camera and calls
+        // control.set_value() — that only updates the model, it never fires
+        // a native change/Enter event, so the handlers above never see a
+        // camera scan. Rebind the icon to call register_scan() directly so
+        // tapping it checks off a box exactly like a handheld scanner does.
+        const $scan_btn = d.fields_dict.scanned_qr.$scan_btn;
+        if ($scan_btn && $scan_btn.length) {
+            $scan_btn.off("click").on("click", "a", () => {
+                new frappe.ui.Scanner({
+                    dialog: true,
+                    multiple: false,
+                    on_scan(data) {
+                        if (data && data.result && data.result.text) {
+                            register_scan(data.result.text);
+                        }
+                    },
+                });
+            });
+        }
         d.show();
     }
 
@@ -2500,6 +2520,25 @@ class DeliveryApp {
                 register_scan(e.target.value);
             }
         });
+        // Mobile: see the matching comment in _open_leg_pickup_dialog_multibox
+        // — the Barcode field's built-in scan icon fills the value via
+        // set_value(), which fires neither change nor Enter, so a camera
+        // scan would otherwise never check off a box. Rebind it to call
+        // register_scan() directly.
+        const $scan_btn = d.fields_dict.scanned_qr.$scan_btn;
+        if ($scan_btn && $scan_btn.length) {
+            $scan_btn.off("click").on("click", "a", () => {
+                new frappe.ui.Scanner({
+                    dialog: true,
+                    multiple: false,
+                    on_scan(data) {
+                        if (data && data.result && data.result.text) {
+                            register_scan(data.result.text);
+                        }
+                    },
+                });
+            });
+        }
         d.show();
     }
 

@@ -707,7 +707,6 @@ class LogisticsCommandCenter {
 		if (!this._dp_events_bound) {
 			const $r = this.$root;
 			$r.on("click", ".lcc-dp-refresh-btn", () => this._draft_pending_load());
-			$r.on("click", ".lcc-dp-open", (e) => { e.preventDefault(); frappe.set_route("Form", "Stock Entry", $(e.currentTarget).data("name")); });
 			$r.on("click", ".lcc-dp-sortable", (e) => {
 				const field = $(e.currentTarget).data("field");
 				const st = this.dp_state;
@@ -813,7 +812,7 @@ class LogisticsCommandCenter {
 			const status_color = status_colors[status] || "gray";
 			const since = se.custom_status_since || se.creation;
 			return `<tr>
-				<td><a href="#" class="lcc-dp-open" data-name="${nm}">${nm}</a></td>
+				<td>${nm}</td>
 				<td>${since ? frappe.datetime.str_to_user(since) : "—"}</td>
 				<td><span class="indicator-pill ${status_color}"><span>${frappe.utils.escape_html(__(status))}</span></span></td>
 				<td>${window.ch_wh_label_html ? ch_wh_label_html(se.from_warehouse, "—") : frappe.utils.escape_html(se.from_warehouse || "—")}</td>
@@ -909,7 +908,6 @@ class LogisticsCommandCenter {
 			const $r = this.$root;
 			$r.on("click", ".lcc-pack-refresh-btn",         () => this._pack_load());
 			$r.on("click", ".lcc-pack-create-manifest-btn", () => this._pack_create_manifest());
-			$r.on("click", ".lcc-pack-open",                (e) => { e.preventDefault(); frappe.set_route("Form", "Stock Entry", $(e.currentTarget).data("name")); });
 			$r.on("change", ".lcc-pack-select-all", (e) => {
 				$r.find(".lcc-pack-row-check").prop("checked", e.currentTarget.checked);
 				this._pack_update_create_btn();
@@ -972,7 +970,7 @@ class LogisticsCommandCenter {
 			const since = se.custom_status_since || se.creation;
 			return `<tr>
 				<td><input type="checkbox" class="lcc-pack-row-check" data-name="${nm}"></td>
-				<td><a href="#" class="lcc-pack-open" data-name="${nm}">${nm}</a></td>
+				<td>${nm}</td>
 				<td>${since ? frappe.datetime.str_to_user(since) : "—"}</td>
 				<td><span class="indicator-pill ${status_color}"><span>${frappe.utils.escape_html(__(status))}</span></span></td>
 				<td>${window.ch_wh_label_html ? ch_wh_label_html(se.from_warehouse, "—") : frappe.utils.escape_html(se.from_warehouse || "—")}</td>
