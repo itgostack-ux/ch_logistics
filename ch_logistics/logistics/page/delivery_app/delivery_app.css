@@ -544,3 +544,13 @@
 .da-st-in-transit { background: #ede7f6; color: #5e35b1; }
 .da-st-break      { background: #fff3cd; color: #856404; }
 .da-st-idle       { background: #ffe0b2; color: #e65100; }
+
+/* ── Full width on a driver's phone ───────────────────
+   Hides the desk workspace nav while the Delivery App is on screen. Scoped to
+   the body class set in delivery_app.js, so every other desk page is
+   unaffected and the sidebar returns the moment the driver routes away. */
+body.ch-delivery-fullscreen .body-sidebar-container,
+body.ch-delivery-fullscreen .body-sidebar,
+body.ch-delivery-fullscreen .layout-side-section {
+    display: none !important;
+}

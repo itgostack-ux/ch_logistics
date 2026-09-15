@@ -23,6 +23,18 @@ frappe.pages["delivery-app"].refresh = function (wrapper) {
     if (wrapper.delivery_app) wrapper.delivery_app.refresh();
 };
 
+// A driver works one-handed on a phone; the desk workspace nav is dead weight
+// there and steals the width the manifest cards need. Toggled by body class
+// only — no inline styles are written, so routing away restores the sidebar
+// with nothing left to clean up.
+frappe.pages["delivery-app"].on_page_show = function () {
+    $("body").addClass("ch-delivery-fullscreen");
+};
+
+frappe.pages["delivery-app"].on_page_hide = function () {
+    $("body").removeClass("ch-delivery-fullscreen");
+};
+
 class DeliveryApp {
     // "Has been picked up" — the Drops tile/dialog counts a manifest from
     // the moment it's picked up all the way through delivery, rather than
