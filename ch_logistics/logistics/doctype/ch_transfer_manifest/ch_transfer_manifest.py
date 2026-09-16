@@ -48,6 +48,24 @@ def verify_delivery_otp(stored: str | None, candidate: str | None) -> bool:
     return hmac.compare_digest(stored, candidate)
 
 
+def _refresh_mr_list_summary(stock_entries) -> None:
+    """Refresh ch_erp15's Material Request list roll-up for Stock Entries
+    whose status was written with frappe.db.set_value (no doc_events)."""
+    try:
+        from ch_erp15.ch_erp15.custom.material_request_list_summary import (
+            refresh_for_stock_entries,
+        )
+    except ImportError:
+        return
+    try:
+        refresh_for_stock_entries(list(stock_entries))
+    except Exception:
+        frappe.log_error(
+            title="MR list summary refresh failed from CH Transfer Manifest",
+            message=frappe.get_traceback(),
+        )
+
+
 class GeofenceError(frappe.ValidationError):
     """Raised when a driver's location fails the geofence.
 
@@ -2435,6 +2453,10 @@ class CHTransferManifest(Document):
                         message=frappe.get_traceback(),
                     )
 
+        # set_value skipped Stock Entry doc_events, so refresh the Material
+        # Request list roll-up (Latest Status / dispatched qty) explicitly.
+        _refresh_mr_list_summary(row.stock_entry for row in self.transfers)
+
     def _sync_custom_status_only(self, target_status):
         """Push a manifest-status-driven value onto linked Stock Entries'
         ``custom_status`` only — unlike ``_sync_logistics_status_to_entries``,
@@ -2460,6 +2482,7 @@ class CHTransferManifest(Document):
                 "Stock Entry", row.stock_entry, "custom_status", target_status,
                 update_modified=False,
             )
+        _refresh_mr_list_summary(row.stock_entry for row in self.transfers)
 
     def _maybe_auto_close_parent_trip(self):
         """Advance the parent trip as its manifests settle.

@@ -351,6 +351,12 @@ def _sync_assigned_status_to_entries(manifest_names):
             continue
         frappe.db.set_value("Stock Entry", se, "custom_status", "Assigned", update_modified=False)
 
+    from ch_logistics.logistics.doctype.ch_transfer_manifest.ch_transfer_manifest import (
+        _refresh_mr_list_summary,
+    )
+
+    _refresh_mr_list_summary(se_names)
+
 
 def _clear_trip_driver_from_manifests(trip, driver=None):
     """Detach driver attribution from pre-pickup manifests on a trip.
