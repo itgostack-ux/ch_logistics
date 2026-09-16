@@ -1152,7 +1152,7 @@ class DeliveryApp {
                         ${__("OTP regenerated, but no warehouse contact is configured. Ask the store directly.")}
                     </div>`;
                 }
-                this._open_delivery_dialog(recipients_html);
+                this._open_delivery_dialog(recipients_html, info.receiver_options || []);
             },
             error: () => {
                 frappe.dom.unfreeze();
@@ -1161,13 +1161,14 @@ class DeliveryApp {
                 this._open_delivery_dialog(
                     `<div class="alert alert-danger" style="padding:10px;border-radius:6px;margin-bottom:10px;">
                         ${__("OTP send failed. Ask the store for the OTP shown on their screen.")}
-                    </div>`
+                    </div>`,
+                    []
                 );
             },
         });
     }
 
-    _open_delivery_dialog(recipients_html) {
+    _open_delivery_dialog(recipients_html, receiver_options) {
         const seals = ((this._detail || {}).packed_seals || []).filter(Boolean);
         let d = new frappe.ui.Dialog({
             title: __("Complete Delivery"),
@@ -1188,10 +1189,20 @@ class DeliveryApp {
                     reqd: 1,
                 },
                 {
+                    // Who actually took custody. As free text this was filled
+                    // with the store or location name, which proves nothing
+                    // about a person. The options are the destination contacts
+                    // the delivery OTP was just sent to — Autocomplete, not
+                    // Select, because somebody else genuinely can be at the
+                    // counter and refusing that would strand the driver.
                     fieldname: "receiver_name",
-                    fieldtype: "Data",
+                    fieldtype: "Autocomplete",
                     label: __("Receiver Name"),
                     reqd: 1,
+                    options: (receiver_options || []).map((n) => ({ value: n, label: n })),
+                    description: (receiver_options || []).length
+                        ? __("Pick who took the delivery, or type another name.")
+                        : __("Name the person who took the delivery — not the store."),
                 },
                 {
                     fieldname: "otp",

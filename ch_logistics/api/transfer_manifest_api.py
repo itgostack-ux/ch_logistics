@@ -1263,6 +1263,60 @@ def _send_delivery_otp(doc, plaintext_otp=None) -> dict:
     return recipients
 
 
+def _receiver_candidates(doc) -> list:
+    """Who is entitled to sign for this manifest at the destination.
+
+    The driver app asked for a Receiver Name as free text, so whatever was
+    typed became the proof of delivery — in practice the store or location
+    name rather than a person, which proves nothing about who took custody.
+
+    The people who can actually receive are already known: they are the ones
+    the delivery OTP is sent to. Offering that list turns the field into a
+    real handover record while still allowing a name that is not on it —
+    someone else genuinely can be at the counter, and refusing that would
+    strand the driver.
+    """
+    if not doc.destination_store:
+        return []
+
+    users = []
+    # The store's managers, per the configured approval roles.
+    try:
+        managers, _emails, _mobiles = _collect_store_manager_contacts(doc.destination_store)
+        users.extend(managers)
+    except Exception:  # noqa: BLE001 — a missing roster must not block delivery
+        frappe.log_error(frappe.get_traceback(), "Manifest OTP — receiver candidates lookup failed")
+
+    # Plus whoever actually works that counter. This matters in practice:
+    # the manager list comes from `material_request_approval_roles`, and a
+    # site that has not configured that gate resolves nobody — which is the
+    # state this estate is in. The POS Executive roster is the store's real
+    # staff list and is populated, so the driver still gets names to pick.
+    try:
+        users.extend(frappe.get_all(
+            "POS Executive",
+            filters={"store": doc.destination_store, "is_active": 1},
+            pluck="user",
+        ))
+    except Exception:  # noqa: BLE001 — same reason
+        frappe.log_error(frappe.get_traceback(), "Manifest OTP — POS Executive lookup failed")
+
+    # Administrator holds POS Executive rows on some stores; it is not a
+    # person who can take custody of a delivery.
+    users = _uniq_keep_order([u for u in users if u and u not in ("Administrator", "Guest")])
+    if not users:
+        return []
+    names = {
+        row.name: (row.full_name or row.name)
+        for row in frappe.get_all(
+            "User",
+            filters={"name": ("in", users), "enabled": 1},
+            fields=["name", "full_name"],
+        )
+    }
+    return _uniq_keep_order([names[u] for u in users if u in names])
+
+
 @frappe.whitelist(methods=["POST"])
 @rate_limit(
     limit=lambda: role_registry.get_int_setting("delivery_otp_attempts_per_minute", 10),
@@ -1324,6 +1378,9 @@ def request_delivery_otp(manifest) -> dict:
         "masked_mobiles": [_mask_mobile(m) for m in recipients.get("mobiles", [])],
         "email_count": len(recipients.get("emails", [])),
         "sms_count": len(recipients.get("mobiles", [])),
+        # Who the driver can name as having taken custody. Same people the
+        # code just went to; the field still accepts anyone else.
+        "receiver_options": _receiver_candidates(doc),
     }
 
 
