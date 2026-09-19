@@ -233,7 +233,6 @@
   {
    "fieldname": "courier_partner",
    "fieldtype": "Link",
-   "hidden": 1,
    "in_standard_filter": 1,
    "label": "Courier Partner",
    "options": "Courier Partner"
@@ -241,7 +240,6 @@
   {
    "fieldname": "tracking_number",
    "fieldtype": "Data",
-   "hidden": 1,
    "label": "Tracking / AWB Number"
   },
   {
