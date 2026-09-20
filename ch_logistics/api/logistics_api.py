@@ -64,7 +64,8 @@ def _has_manifest_box_count_field() -> bool:
 @frappe.whitelist(methods=["POST"])
 def trip_create(trip_date, company, route=None, driver=None, vehicle=None,
                 planned_start=None, planned_end=None, direction="Forward",
-                manifests=None):
+                manifests=None, transport_mode=None, courier_partner=None,
+                tracking_number=None, carrier_name=None):
     """Create a CH Logistics Trip, optionally pre-populating stops from route
     and attaching a list of CH Transfer Manifest names.
 
@@ -96,6 +97,19 @@ def trip_create(trip_date, company, route=None, driver=None, vehicle=None,
     doc.trip_date = trip_date
     doc.company = company
     doc.direction = direction or "Forward"
+    # Who is actually carrying it. Our own driver takes a vehicle and a trip
+    # they accept; a courier takes the consignment and gives back a tracking
+    # number, and the two sets of details never both apply.
+    doc.transport_mode = transport_mode or "Own"
+    if doc.transport_mode == "Courier":
+        doc.courier_partner = courier_partner
+        doc.tracking_number = tracking_number
+        driver = vehicle = None
+    elif doc.transport_mode == "Others":
+        # Somebody outside the network is carrying it, so the trip names them
+        # rather than pointing at a driver record that does not exist.
+        doc.carrier_name = carrier_name
+        driver = vehicle = None
     if route:
         doc.route = route
     if driver:

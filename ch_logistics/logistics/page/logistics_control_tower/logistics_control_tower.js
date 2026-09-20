@@ -2481,12 +2481,25 @@ class LogisticsCommandCenter {
 			fields: [
 				{ fieldtype: "Date",     fieldname: "trip_date",     label: __("Trip Date"),   reqd: 1, default: this.trip_date },
 				{ fieldtype: "Link",     fieldname: "company",       label: __("Company"),     options: "Company", reqd: 1, default: frappe.defaults.get_default("company") },
-				{ fieldtype: "Select",   fieldname: "direction",     label: __("Direction"),   options: "Forward\nReverse\nMixed", default: "Forward" },
-				{ fieldtype: "Link",     fieldname: "route",         label: __("Route"),       options: "CH Route",
+				// A consignment we are not carrying travels someone else's
+				// network — no leg of ours to plan, no route of ours to walk.
+				{ fieldtype: "Select", fieldname: "direction", label: __("Direction"),
+					options: "Forward\nReverse\nMixed", default: "Forward",
+					depends_on: "eval:doc.transport_mode=='Own'" },
+				{ fieldtype: "Link", fieldname: "route", label: __("Route"), options: "CH Route",
+					depends_on: "eval:doc.transport_mode=='Own'",
 					description: __("Optional — pre-populates stops from this route. Leave blank to auto-resolve from stops once they're added, or when manifests are attached.") },
 				{ fieldtype: "Column Break" },
+				// Who carries it. Our own driver takes a vehicle; a courier
+				// takes the consignment and hands back a tracking number, so
+				// only one pair of fields can ever apply to a trip.
+				{
+					fieldtype: "Select", fieldname: "transport_mode", label: __("Mode"),
+					options: "Own\nCourier\nOthers", default: "Own", reqd: 1,
+				},
 				{
 					fieldtype: "Link", fieldname: "driver", label: __("Driver"), options: "Driver",
+					depends_on: "eval:doc.transport_mode=='Own'",
 					get_query: () => ({ query: "ch_logistics.api.logistics_api.unassigned_drivers_query" }),
 					onchange: () => {
 						const driver = d.get_value("driver");
@@ -2496,7 +2509,26 @@ class LogisticsCommandCenter {
 						});
 					},
 				},
-				{ fieldtype: "Link",     fieldname: "vehicle",       label: __("Vehicle"),     options: "Vehicle" },
+				{ fieldtype: "Link", fieldname: "vehicle", label: __("Vehicle"), options: "Vehicle",
+					depends_on: "eval:doc.transport_mode=='Own'" },
+				{
+					fieldtype: "Link", fieldname: "courier_partner", label: __("Courier Partner"),
+					options: "Courier Partner",
+					depends_on: "eval:doc.transport_mode=='Courier'",
+					mandatory_depends_on: "eval:doc.transport_mode=='Courier'",
+				},
+				{
+					fieldtype: "Data", fieldname: "tracking_number",
+					label: __("Tracking / AWB Number"),
+					depends_on: "eval:doc.transport_mode=='Courier'",
+					description: __("The courier's own number, if they have given one yet."),
+				},
+				{
+					fieldtype: "Data", fieldname: "carrier_name", label: __("Carried By"),
+					depends_on: "eval:doc.transport_mode=='Others'",
+					mandatory_depends_on: "eval:doc.transport_mode=='Others'",
+					description: __("Who is carrying it — no driver or courier record will hold it."),
+				},
 				{ fieldtype: "Datetime", fieldname: "planned_start", label: __("Planned Start") },
 				{ fieldtype: "Datetime", fieldname: "planned_end",   label: __("Planned End") },
 				...(manifests ? [

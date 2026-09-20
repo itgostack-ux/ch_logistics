@@ -414,11 +414,31 @@ class CHLogisticsTrip(Document):
         )
         return [r.name for r in rows if (r.status or "Draft") in blocking_statuses]
 
+    # A trip we are not driving never reaches the driver app, so nothing can
+    # move it: ops types the status in as the courier or the carrier reports
+    # back. The order still holds — handed over, picked up, delivered — but a
+    # wrong entry has to be correctable, because no one else will fix it.
+    _MANUAL_MODE_TRANSITIONS = {
+        "Draft": {"Assigned", "Started", "Cancelled"},
+        "Assigned": {"Started", "Completed", "Draft", "Cancelled"},
+        "Started": {"Completed", "Assigned", "Cancelled"},
+        "Completed": {"Closed", "Started"},
+        "Closed": set(),
+        "Cancelled": {"Draft"},
+    }
+
     def _enforce_status_transition(self):
         if self.is_new():
             return
         previous = self.get_doc_before_save()
         if not previous or previous.status == self.status:
+            return
+        if (self.get("transport_mode") or "Own") != "Own":
+            allowed = self._MANUAL_MODE_TRANSITIONS.get(previous.status, set())
+            if self.status not in allowed:
+                frappe.throw(
+                    _("Cannot transition Trip status from {0} to {1}").format(
+                        previous.status, self.status))
             return
         if (
             previous.status == "Started"
