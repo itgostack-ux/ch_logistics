@@ -416,16 +416,83 @@ class CHLogisticsTrip(Document):
 
     # A trip we are not driving never reaches the driver app, so nothing can
     # move it: ops types the status in as the courier or the carrier reports
-    # back. The order still holds — handed over, picked up, delivered — but a
-    # wrong entry has to be correctable, because no one else will fix it.
+    # back. The order still holds — handed over, picked up, out for delivery,
+    # delivered — but a wrong entry has to be correctable, because no one else
+    # will fix it.
     _MANUAL_MODE_TRANSITIONS = {
-        "Draft": {"Assigned", "Started", "Cancelled"},
-        "Assigned": {"Started", "Completed", "Draft", "Cancelled"},
-        "Started": {"Completed", "Assigned", "Cancelled"},
-        "Completed": {"Closed", "Started"},
+        "Draft": {"Assigned", "Cancelled"},
+        "Assigned": {"Picked Up", "Draft", "Cancelled"},
+        "Picked Up": {"Delivery Pending", "Delivered", "Assigned", "Cancelled"},
+        "Delivery Pending": {"Delivered", "Picked Up", "Cancelled"},
+        "Delivered": {"Closed"},
         "Closed": set(),
         "Cancelled": {"Draft"},
     }
+
+    # Delivered is the end of the line for these trips: once the store has the
+    # goods there is nothing left to correct, and stepping back would mean
+    # unposting a stock movement. Closing is all that remains.
+
+    def on_update(self):
+        previous = self.get_doc_before_save()
+        if not previous or previous.status == self.status:
+            return
+        if self.status == "Delivered" and (self.get("transport_mode") or "Own") != "Own":
+            self._settle_manifests_on_manual_delivery()
+
+    def _settle_manifests_on_manual_delivery(self):
+        """Hand the goods to the receiving store when ops marks a courier or
+        third-party trip delivered.
+
+        Delivered means the box is at the store, not that anyone has checked
+        it. So this puts each shipment exactly where a driver's delivery puts
+        it — manifest Delivered, Stock Entry "Ready For Receive" — which is
+        what makes it appear in Stock Entry Inward and light up POS's
+        "Scan & Receive". The store scans the serials, and THAT posts the
+        stock, so the ledger still reflects what somebody physically counted.
+
+        Each manifest is handed over on its own: one that cannot be moved must
+        not stop the others, and what failed is written on the trip where the
+        person who marked it delivered will see it.
+        """
+        handed, failed = [], []
+        for name in frappe.get_all(
+            "CH Transfer Manifest",
+            filters={"trip": self.name, "docstatus": ("<", 2)},
+            pluck="name",
+        ):
+            manifest = frappe.get_doc("CH Transfer Manifest", name)
+            if manifest.status in ("Delivered", "Received", "Partially Received",
+                                   "Closed", "Cancelled", "Returned"):
+                continue
+            savepoint = f"ch_trip_deliver_{frappe.generate_hash(length=10)}"
+            frappe.db.savepoint(savepoint)
+            try:
+                manifest.db_set("status", "Delivered", update_modified=False)
+                manifest.reload()
+                # The same call the driver app's completed delivery makes, so
+                # the receiving side cannot tell the two apart.
+                manifest._sync_logistics_status_to_entries("Delivered")
+                handed.append(name)
+            except Exception as exc:
+                frappe.db.rollback(save_point=savepoint)
+                failed.append(f"{name}: {exc}")
+                frappe.log_error(
+                    frappe.get_traceback(),
+                    f"Trip {self.name}: manifest {name} not handed to the store")
+
+        if handed:
+            self.add_comment(
+                "Info",
+                _("Marked delivered by {0} — waiting for the store to scan it in: {1}").format(
+                    frappe.session.user, ", ".join(handed)))
+        if failed:
+            self.add_comment(
+                "Info", _("Could not hand over: {0}").format("; ".join(failed)))
+            frappe.msgprint(
+                _("The trip is delivered, but these shipments were not handed to the "
+                  "store — open the manifest to see why: {0}").format("<br>".join(failed)),
+                title=_("Not handed over"), indicator="orange")
 
     def _enforce_status_transition(self):
         if self.is_new():

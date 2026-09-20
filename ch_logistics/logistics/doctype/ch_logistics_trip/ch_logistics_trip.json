@@ -30,6 +30,7 @@
   "courier_partner",
   "tracking_number",
   "carrier_name",
+  "packing_photo",
   "vehicle_number",
   "sec_stops",
   "stops",
@@ -88,11 +89,11 @@
    "in_list_view": 1,
    "in_standard_filter": 1,
    "label": "Status",
-   "options": "Draft\nAssigned\nStarted\nCompleted\nClosed\nCancelled",
+   "options": "Draft\nAssigned\nStarted\nPicked Up\nDelivery Pending\nDelivered\nCompleted\nClosed\nCancelled",
    "read_only": 0,
    "search_index": 1,
    "read_only_depends_on": "eval:doc.transport_mode=='Own' || !doc.transport_mode",
-   "description": "Driven by the driver's own actions on an Own trip. On a Courier or Others trip there is no driver app, so ops moves it: Assigned when handed over, Started when picked up, Completed when delivered."
+   "description": "Driven by the driver's own actions on an Own trip. On a Courier or Others trip there is no driver app, so ops moves it: Assigned when handed over, Picked Up when collected, Delivery Pending while it is out, Delivered when the store has it — which posts the Stock Entries."
   },
   {
    "default": "Forward",
@@ -212,6 +213,13 @@
    "depends_on": "eval:doc.transport_mode=='Others'",
    "mandatory_depends_on": "eval:doc.transport_mode=='Others'",
    "description": "Who is carrying it — a bus parcel service, a store's own runner, whoever it is. Named here because no driver or courier record will hold it."
+  },
+  {
+   "fieldname": "packing_photo",
+   "fieldtype": "Attach Image",
+   "label": "Packing Photo",
+   "depends_on": "eval:doc.transport_mode!='Own' || doc.packing_photo",
+   "description": "What was handed over, photographed at the counter. On an Own trip the driver app captures pickup proof; a courier's consignment has nobody to take it, so this is the only record of what left."
   },
   {
    "fetch_from": "vehicle.license_plate",

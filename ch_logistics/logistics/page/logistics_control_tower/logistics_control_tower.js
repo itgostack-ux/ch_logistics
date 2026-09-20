@@ -1224,6 +1224,8 @@ class LogisticsCommandCenter {
 		$r.on("click",  "#lcc-side-close-trip",()=> this._ops_trip_action("trip_close"));
 		$r.on("click",  "#lcc-side-cancel",   () => this._ops_trip_action("trip_unassign"));
 		$r.on("click",  "#lcc-side-cancel-trip", () => this._ops_cancel_trip());
+		$r.on("click",  ".lcc-side-manual-status",
+			(e) => this._ops_manual_status($(e.currentTarget).data("status")));
 		$r.on("click",  "#lcc-side-recall-trip", () => this._ops_recall_trip());
 		$r.on("click",  ".lcc-side-detach",   (e) => this._ops_detach_manifest($(e.currentTarget).data("name")));
 		$r.on("click",  ".lcc-trip-link",     (e) => { e.preventDefault(); this._ops_open_trip($(e.currentTarget).data("name")); });
@@ -2203,6 +2205,7 @@ class LogisticsCommandCenter {
 				<div><b>${__("Created")}:</b> ${frappe.utils.escape_html(t.created_by || "—")}${t.created_on ? ` · ${frappe.datetime.str_to_user(t.created_on)}` : ""}</div>
 				${t.cancelled_by ? `<div class="lcc-cancel-info"><b>${__("Cancelled")}:</b> ${frappe.utils.escape_html(t.cancelled_by)}${t.cancelled_on ? ` · ${frappe.datetime.str_to_user(t.cancelled_on)}` : ""}${t.cancellation_reason ? `<br><span class="lcc-muted">${frappe.utils.escape_html(t.cancellation_reason)}</span>` : ""}</div>` : ""}
 			</div>
+			${this._manual_status_html(t)}
 			<div class="lcc-side-actions">
 				${can_assign   ? `<button class="btn btn-sm btn-default" id="lcc-side-assign"><i class="fa fa-user-plus"></i> ${__("Assign Driver")}</button>` : ""}
 				${can_start    ? `<button class="btn btn-sm btn-warning" id="lcc-side-start" disabled title="${__("Starting a trip from here is currently disabled")}"><i class="fa fa-play"></i> ${__("Start")}</button>` : ""}
@@ -2218,6 +2221,56 @@ class LogisticsCommandCenter {
 			${stops_html}
 			${excs_html}
 		`;
+	}
+
+	// A courier or third-party trip has no driver app to move it, so ops
+	// records each step as the carrier reports back. Delivered is the one that
+	// matters: it hands every shipment to the receiving store, which then
+	// scans the serials in POS — that scan, not this click, posts the stock.
+	_manual_status_html(t) {
+		const mode = t.transport_mode || "Own";
+		if (mode === "Own") return "";
+		const next = {
+			"Draft": ["Assigned"],
+			"Assigned": ["Picked Up"],
+			"Picked Up": ["Delivery Pending", "Delivered"],
+			"Delivery Pending": ["Delivered"],
+		}[t.status] || [];
+		const carrier = t.courier_partner || t.carrier_name || __("not named");
+		return `
+			<div class="lcc-side-sec">${__("Carried by {0}", [frappe.utils.escape_html(carrier)])}${
+				t.tracking_number ? ` · ${frappe.utils.escape_html(t.tracking_number)}` : ""}</div>
+			<div class="lcc-side-actions">
+				${next.map((s) => `
+					<button class="btn btn-sm ${s === "Delivered" ? "btn-success" : "btn-default"}
+							lcc-side-manual-status" data-status="${s}">
+						${s === "Delivered" ? `<i class="fa fa-check"></i> ` : ""}${__("Mark {0}", [__(s)])}
+					</button>`).join("")}
+				${next.length ? "" : `<span class="lcc-muted">${
+					t.status === "Delivered"
+						? __("Waiting for the store to scan it in")
+						: __("Nothing left to record")}</span>`}
+			</div>`;
+	}
+
+	_ops_manual_status(status) {
+		if (!this.active_trip) return;
+		const trip = this.active_trip;
+		const run = () => frappe.call({
+			method: "ch_logistics.api.logistics_api.trip_set_manual_status",
+			args: { trip, status }, freeze: true,
+		}).then(() => {
+			frappe.show_alert({ message: __("Trip {0} — {1}", [trip, __(status)]),
+				indicator: "green" });
+			this._ops_load();
+			this._ops_open_trip(trip);
+		});
+		if (status !== "Delivered") return run();
+		// Delivered is the step that moves goods: it hands every shipment to
+		// the receiving store, and there is no way back from it.
+		frappe.confirm(
+			__("Mark {0} delivered? Each shipment goes to the store to scan in, and the trip cannot be moved back.", [trip]),
+			run);
 	}
 
 	_ops_trip_action(method, prefix = _LCC, extraArgs = {}) {
@@ -2522,6 +2575,22 @@ class LogisticsCommandCenter {
 					label: __("Tracking / AWB Number"),
 					depends_on: "eval:doc.transport_mode=='Courier'",
 					description: __("The courier's own number, if they have given one yet."),
+				},
+				{
+					fieldtype: "Attach Image", fieldname: "packing_photo",
+					label: __("Packing Photo"),
+					depends_on: "eval:doc.transport_mode!='Own'",
+					description: __("What was handed over — the only record of it once a courier has the box."),
+				},
+				{
+					// A courier trip is typed in after the fact, so it can start
+					// at the step it has already reached. Delivered is not here:
+					// it books stock in, and a new trip has no manifests yet.
+					fieldtype: "Select", fieldname: "status", label: __("Status"),
+					options: "Draft\nAssigned\nPicked Up\nDelivery Pending",
+					default: "Assigned",
+					depends_on: "eval:doc.transport_mode!='Own'",
+					description: __("Move it on from the trip itself once the carrier reports back."),
 				},
 				{
 					fieldtype: "Data", fieldname: "carrier_name", label: __("Carried By"),
