@@ -107,8 +107,32 @@ CUSTOM_FIELDS = {
 }
 
 
+def _fields_still_custom(custom_fields: dict) -> dict:
+    """Drop every field the doctype now carries as a standard field.
+
+    Phase 3 (2026-06-23) moved `trip`, `direction`, `stop_sequence`,
+    `shipment_priority`, `box_count` and `qr_payload` into the CH Transfer
+    Manifest doctype JSON. Custom Field refuses to shadow a standard field, so
+    from the day the old Custom Field rows went, this installer threw on
+    `trip` — the first Manifest field — and never reached Driver. On every
+    site since 2026-09-05, `Driver.max_stops_per_trip` was declared here and
+    installed nowhere.
+    """
+    remaining = {}
+    for doctype, fields in custom_fields.items():
+        meta = frappe.get_meta(doctype)
+        kept = [
+            field for field in fields
+            if not meta.get_field(field["fieldname"])
+            or frappe.db.exists("Custom Field", f"{doctype}-{field['fieldname']}")
+        ]
+        if kept:
+            remaining[doctype] = kept
+    return remaining
+
+
 def execute():
-    create_custom_fields(CUSTOM_FIELDS, update=True)
+    create_custom_fields(_fields_still_custom(CUSTOM_FIELDS), update=True)
     _backfill_direction()
 
 
