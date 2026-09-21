@@ -62,9 +62,59 @@ def _has_manifest_box_count_field() -> bool:
 
 
 @frappe.whitelist(methods=["POST"])
+def trip_set_manual_status(trip, status):
+    """Move a Courier or Others trip by hand.
+
+    These trips never reach the driver app — the courier telephones, and ops
+    records it. The trip's own transition rules still apply, so the steps can
+    only run in order, and Delivered still hands every shipment to the
+    receiving store to scan in.
+    """
+    role_registry.require("ops_control", _("move logistics trips"))
+    doc = frappe.get_doc("CH Logistics Trip", trip)
+    if (doc.get("transport_mode") or "Own") == "Own":
+        frappe.throw(_("An Own trip moves through the driver app, not by hand."))
+    doc.check_permission("write")
+    doc.status = status
+    doc.save()
+    return {"name": doc.name, "status": doc.status}
+
+
+def _attach_photo_to_trip(doc, file_url) -> None:
+    """Tie the packing photo to the trip it was taken for.
+
+    A photo uploaded from a dialog belongs to no document, and Frappe shows a
+    private file with no parent only to whoever uploaded it — so without this
+    the packing proof would be invisible to everyone else who opens the trip.
+    Never raises: the trip is the point, the attachment is housekeeping.
+    """
+    if not file_url:
+        return
+    try:
+        free = frappe.get_all(
+            "File",
+            filters={"file_url": file_url, "attached_to_doctype": ("in", ("", None))},
+            fields=["name"], order_by="creation desc", limit=1)
+        if free:
+            frappe.db.set_value("File", free[0].name, {
+                "attached_to_doctype": "CH Logistics Trip",
+                "attached_to_name": doc.name,
+            }, update_modified=False)
+    except Exception:
+        frappe.log_error(frappe.get_traceback(),
+                         f"Trip {doc.name}: packing photo not attached")
+
+
+# Where a manually-run trip may start. Delivered is deliberately absent.
+_TRIP_MANUAL_START_STATUSES = ("Draft", "Assigned", "Picked Up", "Delivery Pending")
+
+
+@frappe.whitelist(methods=["POST"])
 def trip_create(trip_date, company, route=None, driver=None, vehicle=None,
                 planned_start=None, planned_end=None, direction="Forward",
-                manifests=None):
+                manifests=None, transport_mode=None, courier_partner=None,
+                tracking_number=None, carrier_name=None, status=None,
+                packing_photo=None):
     """Create a CH Logistics Trip, optionally pre-populating stops from route
     and attaching a list of CH Transfer Manifest names.
 
@@ -96,6 +146,28 @@ def trip_create(trip_date, company, route=None, driver=None, vehicle=None,
     doc.trip_date = trip_date
     doc.company = company
     doc.direction = direction or "Forward"
+    # Who is actually carrying it. Our own driver takes a vehicle and a trip
+    # they accept; a courier takes the consignment and gives back a tracking
+    # number, and the two sets of details never both apply.
+    doc.transport_mode = transport_mode or "Own"
+    if doc.transport_mode == "Courier":
+        doc.courier_partner = courier_partner
+        doc.tracking_number = tracking_number
+        driver = vehicle = None
+    elif doc.transport_mode == "Others":
+        # Somebody outside the network is carrying it, so the trip names them
+        # rather than pointing at a driver record that does not exist.
+        doc.carrier_name = carrier_name
+        driver = vehicle = None
+    if packing_photo:
+        doc.packing_photo = packing_photo
+    if doc.transport_mode != "Own" and status in _TRIP_MANUAL_START_STATUSES:
+        # A courier trip is usually typed in after the fact — the consignment
+        # was handed over this morning and somebody is recording it now — so
+        # it can start at the step it has actually reached. Delivered is not
+        # offered: that books the stock in, and a brand-new trip has no
+        # manifests attached for it to book.
+        doc.status = status
     if route:
         doc.route = route
     if driver:
@@ -119,6 +191,7 @@ def trip_create(trip_date, company, route=None, driver=None, vehicle=None,
     elif not manifests:
         scope_guard.assert_scope(company=company)
     doc.insert()
+    _attach_photo_to_trip(doc, packing_photo)
 
     if driver:
         # Mirror trip_assign_driver: a driver assigned at creation time must
@@ -1967,6 +2040,11 @@ def get_trip_detail(trip):
         "planned_end": doc.planned_end,
         "actual_start": doc.actual_start,
         "actual_end": doc.actual_end,
+        "transport_mode": doc.get("transport_mode") or "Own",
+        "courier_partner": doc.get("courier_partner"),
+        "tracking_number": doc.get("tracking_number"),
+        "carrier_name": doc.get("carrier_name"),
+        "packing_photo": doc.get("packing_photo"),
         "total_shipments": doc.total_shipments,
         "total_distance_actual_km": doc.total_distance_actual_km,
         "total_duration_actual_min": doc.total_duration_actual_min,
