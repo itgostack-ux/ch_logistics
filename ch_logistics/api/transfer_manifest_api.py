@@ -1285,21 +1285,34 @@ def _send_delivery_otp(doc, plaintext_otp=None, receiver=None) -> dict:
 
 
 @frappe.whitelist()
-def delivery_receivers(manifest) -> list:
-    """The people who may take delivery at the destination store.
+def delivery_receivers(manifest, stock_entry=None) -> list:
+    """The people who may take delivery, at the store this leg is going to.
 
     A driver hands the box to somebody who works there, and until now their
     name was typed in free text — unverifiable, and no way to send that person
     the OTP. POS Executive is the store's own roster, so it answers both: who
     may sign for it, and where the code goes.
+
+    ``stock_entry`` names the leg being delivered. A manifest can carry legs to
+    three different stores, and each is received by that store's own people —
+    without it, all three legs offered the header store's roster and the driver
+    would have sent the code to somebody in the wrong shop.
     """
     doc = frappe.get_doc("CH Transfer Manifest", manifest)
     doc.check_permission("read")
+    destination = None
+    if stock_entry:
+        destination = frappe.db.get_value(
+            "CH Transfer Manifest Item",
+            {"parent": manifest, "stock_entry": stock_entry},
+            "to_warehouse",
+        )
+    destination = destination or doc.destination_warehouse
     # A manifest raised from a transfer often names only the warehouse it is
     # going to, so the store is resolved from that — the same way the Request
     # Fulfilment Hub resolves it.
-    store = doc.destination_store or frappe.db.get_value(
-        "CH Store", {"warehouse": doc.destination_warehouse}, "name")
+    store = (doc.destination_store if destination == doc.destination_warehouse else None) \
+        or frappe.db.get_value("CH Store", {"warehouse": destination}, "name")
     if not store or not frappe.db.exists("DocType", "POS Executive"):
         return []
     out = []

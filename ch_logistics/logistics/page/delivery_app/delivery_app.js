@@ -2354,7 +2354,8 @@ class DeliveryApp {
         // The code goes to the person signing for it, so nothing is sent until
         // the driver says who that is. Fetch the store's roster first.
         frappe.dom.freeze(__("Loading receivers…"));
-        this._call_promise(API + "delivery_receivers", { manifest })
+        // Each leg goes to its own store, so the roster follows the leg.
+        this._call_promise(API + "delivery_receivers", { manifest, stock_entry })
             .then((receivers) => {
                 frappe.dom.unfreeze();
                 this._open_leg_deliver_dialog(manifest, stock_entry, trip, in_trip_view,
