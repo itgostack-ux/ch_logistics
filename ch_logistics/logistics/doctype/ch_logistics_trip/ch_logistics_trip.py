@@ -122,10 +122,37 @@ class CHLogisticsTrip(Document):
             frappe.throw(_("Trip assignment fields can only be changed by dispatch."), frappe.PermissionError)
         protected = (
             "company", "trip_date", "direction", "route", "hub_warehouse",
-            "vehicle", "planned_start", "planned_end", "stops",
+            "vehicle", "planned_start", "planned_end",
         )
-        if any(self.has_value_changed(fieldname) for fieldname in protected):
+        if any(self.has_value_changed(fieldname) for fieldname in protected) \
+                or self._stop_plan_changed(previous):
             frappe.throw(_("Trip planning fields can only be changed by dispatch."), frappe.PermissionError)
+
+    # Which stops the trip visits, and in what order — the part of the stops
+    # table that is planning. Everything else on a stop (status, ETA, actual
+    # arrival, GPS, scan tokens and times) is the driver's own progress, which
+    # is precisely what they are here to record.
+    _STOP_PLAN_FIELDS = ("sequence", "route_stop", "warehouse", "store", "stop_type")
+
+    def _stop_plan_changed(self, previous) -> bool:
+        """True when the driver has re-planned the route, not just worked it.
+
+        has_value_changed() cannot answer this for a child table: it compares
+        two lists of Document objects, which are never equal, so it reported
+        every driver save as a planning change — and a driver accepting their
+        first shipment (which saves the trip to start it) was refused every
+        time with "Trip planning fields can only be changed by dispatch."
+        """
+        if not previous:
+            return False
+
+        def plan(doc):
+            return [
+                tuple(row.get(f) for f in self._STOP_PLAN_FIELDS)
+                for row in (doc.get("stops") or [])
+            ]
+
+        return plan(self) != plan(previous)
 
     # ------------------------------------------------------------------
     def _validate_stops(self):
