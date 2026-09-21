@@ -555,11 +555,17 @@ def unassigned_drivers_query(doctype, txt, searchfield, start, page_len, filters
     start = max(cint(start), 0)
     page_len = min(max(cint(page_len) or 20, 1), 100)
 
-    busy_drivers = frappe.get_all(
-        "CH Logistics Trip",
-        filters={"status": ["in", ("Assigned", "Started")]},
-        pluck="driver",
-    )
+    # A Courier or Others trip is Assigned with no driver of ours, so this
+    # list now contains nulls. Left in, `name NOT IN (NULL, …)` is NULL for
+    # every row in SQL and the picker came back empty — every driver looked
+    # busy the moment one courier trip was assigned.
+    busy_drivers = [
+        driver for driver in frappe.get_all(
+            "CH Logistics Trip",
+            filters={"status": ["in", ("Assigned", "Started")]},
+            pluck="driver",
+        ) if driver
+    ]
 
     driver_filters = {"status": "Active"}
     if busy_drivers:
