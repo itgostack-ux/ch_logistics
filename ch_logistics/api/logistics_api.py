@@ -2337,16 +2337,20 @@ def _trip_live_origin(trip_doc):
     return _warehouse_coords(trip_doc.get("hub_warehouse"))
 
 
+# A trip in any of these is still work in hand, whatever its planned date.
+_OPS_OPEN_TRIP_STATUSES = ("Draft", "Assigned", "Started", "Picked Up", "Delivery Pending")
+
+
 @frappe.whitelist()
 def ops_board(trip_date=None, include_days=1):
     """Trips for the day grouped by status, with light KPI summary.
 
-    In addition to date-windowed trips, always surface every Draft
-    trip (the dispatcher's backlog) regardless of trip_date.  Draft
-    trips with stale or missing planned dates are precisely the ones
-    that need scheduling — hiding them behind the date filter created
-    the bug where freshly Packed manifests attached to a stale-dated
-    Draft trip "vanished" from Operations.  Mirrors SAP TM Freight
+    In addition to date-windowed trips, always surface every trip that
+    is still open — Draft, Assigned, Started, Picked Up or Delivery
+    Pending — regardless of trip_date.  Open trips with stale or missing
+    planned dates are precisely the ones that need attention; hiding them
+    behind the date filter made the board look cleared each morning while
+    the goods were still moving.  Mirrors SAP TM Freight
     Order Cockpit / Oracle TM Transportation Cockpit behaviour where
     every un-dispatched freight order stays in the cockpit until it is
     either scheduled + assigned or cancelled.
@@ -2387,21 +2391,24 @@ def ops_board(trip_date=None, include_days=1):
         as_dict=True,
     )
 
-    # Backlog: Draft trips outside the date window (un-scheduled or
-    # carrying a stale planned date).  Returned regardless of the date
-    # filter so the dispatcher can schedule + assign drivers.  Cap
-    # separately so a huge backlog can't crowd out today's view.
+    # Backlog: every trip still in play outside the date window — not just
+    # the un-scheduled ones.  A trip that is still Draft, Assigned, Started,
+    # Picked Up or waiting on delivery is open work; hiding it because the
+    # clock passed midnight made the board look cleared each morning while
+    # the goods were still on the road.  Only finished trips (Delivered,
+    # Completed, Closed, Cancelled) fall out of view with the date window.
+    # Capped separately so a long backlog can't crowd out today's view.
     backlog_rows = frappe.db.sql(
         f"""
         SELECT {select_fields}
         FROM `tabCH Logistics Trip`
-        WHERE status = 'Draft'
+        WHERE status IN %(open_statuses)s
           AND (trip_date IS NULL OR trip_date NOT BETWEEN %(start)s AND %(end)s)
           AND {trip_scope}
-        ORDER BY creation DESC, name ASC
-        LIMIT 50
+        ORDER BY trip_date DESC, creation DESC, name ASC
+        LIMIT 200
         """,
-        query_params,
+        {**query_params, "open_statuses": _OPS_OPEN_TRIP_STATUSES},
         as_dict=True,
     )
 
@@ -2458,8 +2465,10 @@ def ops_lifecycle_counts(trip_date=None, include_days=1):
 
     Each chip is a count of *real* docs currently in that stage; the
     front-end lets the dispatcher click a chip to filter the canvas.
-    Counts are scoped to the same date window the trip board uses so the
-    numbers stay consistent with what the dispatcher sees on the board.
+    Counts follow the same rule as the trip board: anything still open is
+    counted whatever its planned date, and only finished work (delivered,
+    closed) is scoped to the date window — so the strip and the board
+    underneath it always agree.
     """
     _require_ops()
     trip_date = trip_date or frappe.utils.today()
@@ -2509,15 +2518,21 @@ def ops_lifecycle_counts(trip_date=None, include_days=1):
         company_field="company",
         prefix="ops_lifecycle_trip",
     )
+    # Open trips count wherever their planned date sits, matching the board
+    # below them (ops_board keeps open work in view past midnight). Counting
+    # them strictly inside the window left the strip reading 0 while the
+    # board underneath showed the very same trips.
     trip_status_count = frappe.db.sql(
         f"""
         SELECT status, COUNT(*) AS cnt
         FROM `tabCH Logistics Trip`
-        WHERE trip_date BETWEEN %(start)s AND %(end)s
+        WHERE (trip_date BETWEEN %(start)s AND %(end)s
+               OR status IN %(open_statuses)s)
           AND {trip_scope}
         GROUP BY status
         """,
-        {"start": trip_date, "end": end_date, **trip_scope_params},
+        {"start": trip_date, "end": end_date,
+         "open_statuses": _OPS_OPEN_TRIP_STATUSES, **trip_scope_params},
         as_dict=True,
     )
     by_status = {r.status: cint(r.cnt) for r in trip_status_count}
