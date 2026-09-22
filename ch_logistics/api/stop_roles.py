@@ -110,6 +110,15 @@ def manifest_roles_at_stop(manifest, stop, wh_by_store=None) -> set[str]:
         roles.add(PICKUP)
     if location_matches(stop, _get(manifest, "destination_store"), _get(manifest, "destination_warehouse"), wh_by_store):
         roles.add(DROP)
+    # A manifest can carry legs to several warehouses — each is delivered and
+    # signed for at its own. Matching the header alone left those other stops
+    # showing nothing, so the driver arrived at Pallavaram with a box on board
+    # and no shipment listed there to deliver.
+    for leg in _get(manifest, "transfers") or ():
+        if location_matches(stop, None, _get(leg, "from_warehouse"), wh_by_store):
+            roles.add(PICKUP)
+        if location_matches(stop, None, _get(leg, "to_warehouse"), wh_by_store):
+            roles.add(DROP)
     return roles
 
 

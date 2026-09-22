@@ -2362,22 +2362,86 @@ class DeliveryApp {
             return;
         }
         const in_trip_view = !!trip && this.active_trip === trip && this._trip_detail && this._trip_detail.name === trip;
-        frappe.dom.freeze(__("Sending OTP…"));
-        this._call_promise(API + "request_delivery_otp", { manifest })
-            .then((info) => {
+        // The code goes to the person signing for it, so nothing is sent until
+        // the driver says who that is. Fetch the store's roster first.
+        frappe.dom.freeze(__("Loading receivers…"));
+        // Each leg goes to its own store, so the roster follows the leg.
+        this._call_promise(API + "delivery_receivers", { manifest, stock_entry })
+            .then((receivers) => {
                 frappe.dom.unfreeze();
-                this._open_leg_deliver_dialog(manifest, stock_entry, trip, in_trip_view, info || {});
+                this._open_leg_deliver_dialog(manifest, stock_entry, trip, in_trip_view,
+                    {}, receivers || []);
             })
             .catch(() => {
                 frappe.dom.unfreeze();
-                // Even if OTP send failed (e.g. no SMTP), still let the driver
-                // try to complete — server gates on enforce_delivery_otp,
-                // same fallback do_delivery already uses.
-                this._open_leg_deliver_dialog(manifest, stock_entry, trip, in_trip_view, {});
+                this._open_leg_deliver_dialog(manifest, stock_entry, trip, in_trip_view, {}, []);
             });
     }
 
-    _open_leg_deliver_dialog(manifest, stock_entry, trip, in_trip_view, otp_info) {
+    // Who is taking the delivery, chosen from the destination store's own POS
+    // Executives — and the button that sends them the code. A typed name
+    // proves nothing and gives the OTP nowhere to go; a store with nobody on
+    // its roster falls back to free text so a delivery is never blocked by
+    // missing master data.
+    _receiver_fields(manifest, receivers) {
+        receivers = receivers || [];
+        if (!receivers.length) {
+            return [{
+                fieldname: "receiver_name", fieldtype: "Data",
+                label: __("Receiver Name"), reqd: 1,
+                description: __("No POS Executive is on file for this store."),
+            }, {
+                fieldname: "send_otp", fieldtype: "Button", label: __("Send OTP"),
+                click: () => this._send_receiver_otp(manifest, null),
+            }];
+        }
+        return [{
+            fieldname: "receiver", fieldtype: "Select", label: __("Receiver Name"), reqd: 1,
+            options: [""].concat(receivers.map((r) => r.executive_name)),
+            description: __("Who is signing for it at this store."),
+        }, {
+            fieldname: "send_otp", fieldtype: "Button", label: __("Send OTP"),
+            click: () => {
+                const chosen = cur_dialog && cur_dialog.get_value("receiver");
+                const match = receivers.find((r) => r.executive_name === chosen);
+                if (!match) {
+                    frappe.msgprint(__("Choose who is taking the delivery first."));
+                    return;
+                }
+                if (!match.has_email && !match.has_mobile) {
+                    frappe.msgprint(__("{0} has no email or mobile on file — the code cannot reach them.",
+                        [match.executive_name]));
+                    return;
+                }
+                this._send_receiver_otp(manifest, match.name);
+            },
+        }];
+    }
+
+    _receiver_label(receivers, values) {
+        if (!(receivers || []).length) return (values.receiver_name || "").trim();
+        return (values.receiver || "").trim();
+    }
+
+    _send_receiver_otp(manifest, receiver) {
+        frappe.dom.freeze(__("Sending OTP…"));
+        this._call_promise(API + "request_delivery_otp", { manifest, receiver })
+            .then((info) => {
+                frappe.dom.unfreeze();
+                const to = [].concat(info?.masked_emails || [], info?.masked_mobiles || []);
+                frappe.show_alert({
+                    message: to.length ? __("OTP sent to {0}", [to.join(", ")])
+                        : __("OTP generated, but no contact was reachable — ask the receiver."),
+                    indicator: to.length ? "green" : "orange",
+                });
+            })
+            .catch(() => {
+                frappe.dom.unfreeze();
+                frappe.show_alert({ message: __("Could not send the OTP"), indicator: "red" });
+            });
+    }
+
+    _open_leg_deliver_dialog(manifest, stock_entry, trip, in_trip_view, otp_info, receivers) {
         let recipients_html;
         if ((otp_info.masked_emails || []).length || (otp_info.masked_mobiles || []).length) {
             const parts = [];
@@ -2422,23 +2486,25 @@ class DeliveryApp {
                             fieldname: "scanned_qr", fieldtype: "Data", options: "Barcode",
                             label: __("Scan Manifest QR"), reqd: 1,
                         },
-                        {
-                            fieldname: "receiver_name", fieldtype: "Data",
-                            label: __("Receiver Name"), reqd: 1,
-                        },
+                        ...this._receiver_fields(manifest, receivers),
                         {
                             fieldname: "otp", fieldtype: "Data",
                             label: __("Delivery OTP"), reqd: 1,
-                            description: __("Ask the receiver for the OTP just sent to them."),
+                            description: __("Ask the receiver for the OTP sent to them."),
                         },
                     ],
                     primary_action_label: __("Confirm & Deliver"),
                     primary_action: (values) => {
+                        const receiver_name = this._receiver_label(receivers, values);
+                        if (!receiver_name) {
+                            frappe.msgprint(__("Name who is taking the delivery."));
+                            return;
+                        }
                         d.hide();
                         this._submit_leg_deliver(manifest, stock_entry, trip, in_trip_view, {
                             delivery_photo: values.delivery_photo,
                             scanned_qr: values.scanned_qr,
-                            receiver_name: values.receiver_name,
+                            receiver_name,
                             otp: values.otp,
                             lat: gps.lat, lng: gps.lng, gps_accuracy_m: gps.accuracy,
                         });

@@ -57,6 +57,39 @@ def _has_manifest_shipment_priority_field() -> bool:
     return frappe.db.has_column("CH Transfer Manifest", "shipment_priority")
 
 
+def _attach_extra_destinations(rows) -> None:
+    """Name every warehouse a manifest actually drops at, not just the first.
+
+    A manifest can carry Stock Entries to several different destinations —
+    each leg is delivered, geofenced and signed for against its own
+    to_warehouse (driver_complete_delivery_row). The header carries a single
+    destination_warehouse, so a 3-stop manifest read as though it were going
+    to one store, and whoever planned the trip could not see the other two.
+    """
+    names = [r.name for r in rows or []]
+    if not names:
+        return
+    per_manifest = {}
+    for row in frappe.db.sql(
+        """
+        SELECT parent, to_warehouse
+          FROM `tabCH Transfer Manifest Item`
+         WHERE parent IN %(names)s AND IFNULL(to_warehouse, '') != ''
+         ORDER BY idx
+        """,
+        {"names": tuple(names)},
+        as_dict=True,
+    ):
+        per_manifest.setdefault(row.parent, [])
+        if row.to_warehouse not in per_manifest[row.parent]:
+            per_manifest[row.parent].append(row.to_warehouse)
+    for row in rows:
+        destinations = per_manifest.get(row.name) or []
+        if row.get("destination_warehouse") and row.destination_warehouse not in destinations:
+            destinations.insert(0, row.destination_warehouse)
+        row["destinations"] = destinations
+
+
 def _has_manifest_box_count_field() -> bool:
     return frappe.db.has_column("CH Transfer Manifest", "box_count")
 
@@ -235,7 +268,8 @@ def _seed_stops_from_manifests(trip_doc, manifests) -> None:
     hub_candidates = []
     hub_sides = []  # (store, warehouse, stop_type) per manifest's hub side
     for manifest_name in manifests:
-        target = _manifest_target_for_trip(trip_doc, manifest_name)
+        targets = _manifest_targets_for_trip(trip_doc, manifest_name)
+        target = targets[0]
         mf = frappe.db.get_value(
             "CH Transfer Manifest", manifest_name,
             ["source_store", "source_warehouse", "destination_store", "destination_warehouse"],
@@ -249,22 +283,23 @@ def _seed_stops_from_manifests(trip_doc, manifests) -> None:
         hub_candidates.append(hub_wh)
         hub_sides.append((hub_store, hub_wh, hub_stop_type))
 
-        target_store = target.get("store")
-        target_wh = target.get("warehouse")
-        if not target_wh and target_store:
-            target_wh = frappe.db.get_value("CH Store", target_store, "warehouse")
-        key = target_store or target_wh
-        if not key or key in seen_targets:
-            continue
-        seen_targets.add(key)
-        seq += 1
-        trip_doc.append("stops", {
-            "sequence": seq,
-            "warehouse": target_wh,
-            "store": target_store,
-            "stop_type": target.get("stop_type") or "Drop",
-            "status": "Pending",
-        })
+        for leg in targets:
+            target_store = leg.get("store")
+            target_wh = leg.get("warehouse")
+            if not target_wh and target_store:
+                target_wh = frappe.db.get_value("CH Store", target_store, "warehouse")
+            key = target_store or target_wh
+            if not key or key in seen_targets:
+                continue
+            seen_targets.add(key)
+            seq += 1
+            trip_doc.append("stops", {
+                "sequence": seq,
+                "warehouse": target_wh,
+                "store": target_store,
+                "stop_type": leg.get("stop_type") or "Drop",
+                "status": "Pending",
+            })
 
     for hub_store, hub_wh, hub_stop_type in hub_sides:
         if not hub_wh and hub_store:
@@ -520,11 +555,17 @@ def unassigned_drivers_query(doctype, txt, searchfield, start, page_len, filters
     start = max(cint(start), 0)
     page_len = min(max(cint(page_len) or 20, 1), 100)
 
-    busy_drivers = frappe.get_all(
-        "CH Logistics Trip",
-        filters={"status": ["in", ("Assigned", "Started")]},
-        pluck="driver",
-    )
+    # A Courier or Others trip is Assigned with no driver of ours, so this
+    # list now contains nulls. Left in, `name NOT IN (NULL, …)` is NULL for
+    # every row in SQL and the picker came back empty — every driver looked
+    # busy the moment one courier trip was assigned.
+    busy_drivers = [
+        driver for driver in frappe.get_all(
+            "CH Logistics Trip",
+            filters={"status": ["in", ("Assigned", "Started")]},
+            pluck="driver",
+        ) if driver
+    ]
 
     driver_filters = {"status": "Active"}
     if busy_drivers:
@@ -1133,6 +1174,45 @@ def attach_manifests(trip, manifests):
     return True
 
 
+def _manifest_targets_for_trip(trip_doc, manifest_name: str) -> list:
+    """Every stop a manifest needs on this trip, not just the header's one.
+
+    A manifest can carry Stock Entries to several warehouses — each leg is
+    delivered against its own to_warehouse — so a three-destination manifest
+    needs three Drop stops. Deriving them from the header alone gave the
+    driver one stop and left the other two shipments with nowhere to be
+    delivered (TM-2026-00003 on TRIP-2026-00007: Perungudi had a stop,
+    Pallavaram and Velachery did not).
+    """
+    primary = _manifest_target_for_trip(trip_doc, manifest_name)
+    leg_field = "from_warehouse" if primary.get("stop_type") == "Pickup" else "to_warehouse"
+    legs = frappe.db.sql_list(
+        f"""
+        SELECT DISTINCT `{leg_field}` FROM `tabCH Transfer Manifest Item`
+         WHERE parent = %(manifest)s AND IFNULL(`{leg_field}`, '') != ''
+         ORDER BY idx
+        """,
+        {"manifest": manifest_name},
+    )
+    targets, seen = [], set()
+    for warehouse in ([primary.get("warehouse")] + legs):
+        if not warehouse or warehouse in seen:
+            continue
+        seen.add(warehouse)
+        targets.append({
+            # The store is only known for the header's own warehouse; the
+            # others are resolved the way the rest of the app resolves them.
+            # The header names its store sometimes and only its warehouse at
+            # others, so every stop resolves the store the same way.
+            "store": (primary.get("store") if warehouse == primary.get("warehouse")
+                      and primary.get("store")
+                      else frappe.db.get_value("CH Store", {"warehouse": warehouse}, "name")),
+            "warehouse": warehouse,
+            "stop_type": primary.get("stop_type") or "Drop",
+        })
+    return targets or [primary]
+
+
 def _manifest_target_for_trip(trip_doc, manifest_name: str) -> dict:
     mf_fields = ["source_store", "source_warehouse", "destination_store", "destination_warehouse"]
     if _has_manifest_direction_field():
@@ -1209,8 +1289,34 @@ def _shift_sequences_for_insert(trip_doc, insert_seq: int) -> None:
             s.sequence = cint(s.get("sequence") or 0) + 1
 
 
+def _append_stop_if_missing(trip_doc, target) -> None:
+    """Add a stop for this destination unless the trip already visits it."""
+    warehouse = target.get("warehouse")
+    store = target.get("store")
+    if not warehouse and store:
+        warehouse = frappe.db.get_value("CH Store", store, "warehouse")
+    if not warehouse:
+        return
+    for stop in trip_doc.get("stops") or []:
+        if stop.get("warehouse") == warehouse or (store and stop.get("store") == store):
+            return
+    sequences = [cint(s.get("sequence") or 0) for s in (trip_doc.get("stops") or [])]
+    trip_doc.append("stops", {
+        "sequence": (max(sequences) if sequences else 0) + 1,
+        "warehouse": warehouse,
+        "store": store,
+        "stop_type": target.get("stop_type") or "Drop",
+        "status": "Pending",
+    })
+
+
 def _ensure_dynamic_stop_for_manifest(trip_doc, manifest_name: str):
-    target = _manifest_target_for_trip(trip_doc, manifest_name)
+    # A manifest with several destinations needs a stop for each; the first
+    # is the one this call reports back, the rest are added behind it.
+    targets = _manifest_targets_for_trip(trip_doc, manifest_name)
+    for extra in targets[1:]:
+        _append_stop_if_missing(trip_doc, extra)
+    target = targets[0]
     target_store = target.get("store")
     target_wh = target.get("warehouse")
     if not target_wh and target_store:
@@ -2536,6 +2642,8 @@ def ops_unassigned_manifests(direction=None, hub=None, limit=100):
         params,
         as_dict=True,
     )
+
+    _attach_extra_destinations(rows)
 
     # box_count on the manifest itself only reflects manifest-level
     # re-packing (CH Transfer Manifest.packages) — a separate, rarely-used

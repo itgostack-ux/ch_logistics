@@ -26,6 +26,30 @@ frappe.pages["logistics-control-tower"].refresh = function (wrapper) {
 	if (wrapper.lcc) wrapper.lcc.refresh();
 };
 
+// A manifest can carry legs to several stores, each delivered and signed for
+// at its own warehouse (driver_complete_delivery_row). The header names only
+// the first, so the rest are read from the rows and shown beside it —
+// otherwise a three-stop manifest looks like a one-stop one to whoever is
+// planning the trip.
+// Plain-text twin of lcc_destinations_html, for the overview tables. Every
+// drop is named in the order the manifest carries them, so the route reads as
+// the run the driver actually makes rather than a count of hidden stops.
+function lcc_destinations_text(r) {
+	const label = (wh) => (window.ch_wh_label ? ch_wh_label(wh) : wh);
+	const list = (r.destinations || []).filter(Boolean);
+	if (!list.length) return r.destination_store || r.destination_warehouse || "";
+	if (list.length === 1) return r.destination_store || label(list[0]);
+	return list.map(label).join(" → ");
+}
+
+function lcc_destinations_html(m) {
+	const label = (wh) => (window.ch_wh_label_html
+		? ch_wh_label_html(wh, "—") : frappe.utils.escape_html(wh || "—"));
+	const list = (m.destinations || []).filter(Boolean);
+	if (!list.length) return label(m.destination_warehouse);
+	return list.map(label).join(" → ");
+}
+
 class LogisticsCommandCenter {
 	constructor(page, wrapper) {
 		this.page = page;
@@ -590,7 +614,8 @@ class LogisticsCommandCenter {
 		const ml = { "Assigned": __("Pickup Pending"), "In Transit": __("Delivery Pending") };
 		const rows = items.map((r) => {
 			const dmg = r.damage_reported ? `<span class="lcc-damage-flag"><i class="fa fa-exclamation-triangle"></i> Damage</span>` : "";
-			const route = [r.source_store || r.source_warehouse, r.destination_store || r.destination_warehouse].filter(Boolean).join(" → ");
+			const route = [r.source_store || r.source_warehouse, lcc_destinations_text(r)]
+				.filter(Boolean).join(" → ");
 			const over = r.estimated_delivery_date && new Date(r.estimated_delivery_date) < new Date()
 				&& !["Delivered","Closed"].includes(r.status)
 				? `<span class="lcc-badge lcc-badge-red" style="margin-left:4px">OVERDUE</span>` : "";
@@ -648,7 +673,8 @@ class LogisticsCommandCenter {
 		const $p = $ov.find('[data-panel="overdue"]');
 		if (!items.length) { $p.html(`<div class="lcc-empty"><i class="fa fa-check-circle"></i> ${__("No overdue manifests — all on track!")}</div>`); return; }
 		const rows = items.map((r) => {
-			const route = [r.source_store || r.source_warehouse, r.destination_store || r.destination_warehouse].filter(Boolean).join(" → ");
+			const route = [r.source_store || r.source_warehouse, lcc_destinations_text(r)]
+				.filter(Boolean).join(" → ");
 			const days = parseInt(r.days_overdue) || 0;
 			const sev = days >= 5 ? "lcc-badge-red" : days >= 2 ? "lcc-badge-orange" : "lcc-badge-yellow";
 			return `<tr data-name="${r.name}">
@@ -1470,7 +1496,7 @@ class LogisticsCommandCenter {
 			<td><span class="indicator-pill ${color}">${status}</span></td>
 			<td>${frappe.utils.escape_html(m.direction || "—")}</td>
 			<td><span class="lcc-prio lcc-prio-${(m.shipment_priority || "Normal").toLowerCase()}">${m.shipment_priority || "Normal"}</span></td>
-			<td>${window.ch_wh_label_html ? ch_wh_label_html(m.source_warehouse, "—") : frappe.utils.escape_html(m.source_warehouse || "—")} → ${window.ch_wh_label_html ? ch_wh_label_html(m.destination_warehouse, "—") : frappe.utils.escape_html(m.destination_warehouse || "—")}</td>
+			<td>${window.ch_wh_label_html ? ch_wh_label_html(m.source_warehouse, "—") : frappe.utils.escape_html(m.source_warehouse || "—")} → ${lcc_destinations_html(m)}</td>
 			<td class="tr">${m.total_qty || 0}</td>
 			<td class="tr">${m.box_count || 0}</td>
 			<td>${frappe.datetime.str_to_user(m.creation)}</td>
@@ -2166,9 +2192,16 @@ class LogisticsCommandCenter {
 					<span class="lcc-muted">${m.status || ""} · ${m.total_qty || 0}q</span>
 					${can_detach ? `<button class="btn btn-xs btn-default lcc-side-detach" data-name="${m.name}"><i class="fa fa-unlink"></i></button>` : ""}
 				</div>`).join("");
+			// A drop reads as the leg it is — hub → store — so a trip with
+			// three drops off one hub is legible at a glance instead of
+			// three bare store names the reader has to pair up themselves.
+			const from_hub = (s.stop_type || "").includes("Drop") && t.hub_warehouse
+				&& s.warehouse !== t.hub_warehouse
+				? `${window.ch_wh_label_html ? ch_wh_label_html(t.hub_warehouse, "") : frappe.utils.escape_html(t.hub_warehouse)} → `
+				: "";
 			return `<div class="lcc-side-stop">
 				<div class="lcc-side-stop-head">
-					<b>#${s.sequence}</b> ${window.ch_wh_label_html ? ch_wh_label_html(s.warehouse, "") : frappe.utils.escape_html(s.warehouse || "")}
+					<b>#${s.sequence}</b> ${from_hub}${window.ch_wh_label_html ? ch_wh_label_html(s.warehouse, "") : frappe.utils.escape_html(s.warehouse || "")}
 					<span class="lcc-sev lcc-sev-${(s.status || "").toLowerCase().replace(/ /g,"-")}">${s.status}</span>
 				</div>
 				<div class="lcc-side-stop-meta">${s.stop_type || ""} · ETA ${s.eta ? frappe.datetime.str_to_user(s.eta) : "—"}</div>

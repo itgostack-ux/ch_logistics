@@ -1104,7 +1104,18 @@ def _collect_warehouse_contacts(warehouse: str | None) -> tuple[list[str], list[
     return _uniq_keep_order(emails), _uniq_keep_order(mobiles)
 
 
-def _send_delivery_otp(doc, plaintext_otp=None) -> dict:
+def _receiver_contacts(receiver) -> tuple:
+    """(users, emails, mobiles) for the POS Executive taking the delivery."""
+    if not receiver or not frappe.db.exists("POS Executive", receiver):
+        return [], [], []
+    user = frappe.db.get_value("POS Executive", receiver, "user")
+    if not user:
+        return [], [], []
+    email, mobile = frappe.db.get_value("User", user, ["email", "mobile_no"]) or (None, None)
+    return ([user], [email] if email else [], [mobile] if mobile else [])
+
+
+def _send_delivery_otp(doc, plaintext_otp=None, receiver=None) -> dict:
     """Send delivery OTP to the connected destination warehouse + store contacts.
 
     Recipient order (highest priority first):
@@ -1144,10 +1155,20 @@ def _send_delivery_otp(doc, plaintext_otp=None) -> dict:
 
     # Warehouse contacts go first — they're the canonical \"connected warehouse\" address
     # for this manifest and the user's explicit choice for delivery handoff.
-    email_recipients = _uniq_keep_order(warehouse_emails + manager_emails + profile_emails)
-    sms_recipients = _uniq_keep_order(
-        warehouse_mobiles + manager_mobiles + profile_mobiles + ([store_phone] if store_phone else [])
-    )
+    receiver_users, receiver_emails, receiver_mobiles = _receiver_contacts(receiver)
+    if receiver_users:
+        # Named receiver only: the driver said who is signing for it, and
+        # spraying the code across the whole store would let anybody else take
+        # the handover — which is the thing the OTP exists to stop.
+        manager_users = receiver_users
+        email_recipients = _uniq_keep_order(receiver_emails)
+        sms_recipients = _uniq_keep_order(receiver_mobiles)
+    else:
+        email_recipients = _uniq_keep_order(warehouse_emails + manager_emails + profile_emails)
+        sms_recipients = _uniq_keep_order(
+            warehouse_mobiles + manager_mobiles + profile_mobiles
+            + ([store_phone] if store_phone else [])
+        )
 
     if not manager_users and not email_recipients and not sms_recipients:
         frappe.log_error(
@@ -1317,13 +1338,70 @@ def _receiver_candidates(doc) -> list:
     return _uniq_keep_order([names[u] for u in users if u in names])
 
 
+@frappe.whitelist()
+def delivery_receivers(manifest, stock_entry=None) -> list:
+    """The people who may take delivery, at the store this leg is going to.
+
+    A driver hands the box to somebody who works there, and until now their
+    name was typed in free text — unverifiable, and no way to send that person
+    the OTP. POS Executive is the store's own roster, so it answers both: who
+    may sign for it, and where the code goes.
+
+    ``stock_entry`` names the leg being delivered. A manifest can carry legs to
+    three different stores, and each is received by that store's own people —
+    without it, all three legs offered the header store's roster and the driver
+    would have sent the code to somebody in the wrong shop.
+    """
+    doc = frappe.get_doc("CH Transfer Manifest", manifest)
+    doc.check_permission("read")
+    destination = None
+    if stock_entry:
+        destination = frappe.db.get_value(
+            "CH Transfer Manifest Item",
+            {"parent": manifest, "stock_entry": stock_entry},
+            "to_warehouse",
+        )
+    destination = destination or doc.destination_warehouse
+    # A manifest raised from a transfer often names only the warehouse it is
+    # going to, so the store is resolved from that — the same way the Request
+    # Fulfilment Hub resolves it.
+    store = (doc.destination_store if destination == doc.destination_warehouse else None) \
+        or frappe.db.get_value("CH Store", {"warehouse": destination}, "name")
+    if not store or not frappe.db.exists("DocType", "POS Executive"):
+        return []
+    out = []
+    for row in frappe.get_all(
+        "POS Executive",
+        filters={"store": store, "is_active": 1},
+        fields=["name", "executive_name", "user"],
+        order_by="executive_name",
+    ):
+        if row.user in ("Administrator", "Guest"):
+            # Administrator holds POS Executive rows on some stores; it is
+            # not a person who can take custody of a delivery. Same
+            # exclusion _receiver_candidates above already makes.
+            continue
+        email = mobile = None
+        if row.user:
+            email, mobile = frappe.db.get_value(
+                "User", row.user, ["email", "mobile_no"]) or (None, None)
+        out.append({
+            "name": row.name,
+            "executive_name": row.executive_name or row.user or row.name,
+            "user": row.user,
+            "has_email": bool(email),
+            "has_mobile": bool(mobile),
+        })
+    return out
+
+
 @frappe.whitelist(methods=["POST"])
 @rate_limit(
     limit=lambda: role_registry.get_int_setting("delivery_otp_attempts_per_minute", 10),
     seconds=60,
     methods=["POST"],
 )
-def request_delivery_otp(manifest) -> dict:
+def request_delivery_otp(manifest, receiver=None) -> dict:
     """Driver-side trigger: 'I'm at the destination, send me the OTP'.
 
     Wired to the **Complete Delivery** button on the driver app: tapping it
@@ -1352,7 +1430,7 @@ def request_delivery_otp(manifest) -> dict:
     plaintext_otp = doc._generate_delivery_otp(request_source="Driver App")
     doc.flags.ignore_validate_update_after_submit = True
     doc.save()
-    recipients = _send_delivery_otp(doc, plaintext_otp) or {}
+    recipients = _send_delivery_otp(doc, plaintext_otp, receiver=receiver) or {}
 
     # Mask emails so the UI can show "o***@warehouse.com" without leaking
     # full addresses to whoever happens to look over the driver's shoulder.
