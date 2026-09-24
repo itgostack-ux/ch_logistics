@@ -131,6 +131,15 @@ class TestReportScopeChLogistics(unittest.TestCase):
 
         cls.wh_in_scope = _get_or_create_warehouse("Tier4 Log A WH", cls.company)
         _get_or_create_ch_store(_TEST_STORE, cls.wh_in_scope, cls.company)
+        # The store decides the company, so the scope row has to agree with it.
+        # _get_or_create_ch_store keeps a store an earlier run left behind, and
+        # that store carries the company that was the default *then* -- which is
+        # not necessarily the default now. When the two drifted apart, CH User
+        # Scope rejected the row ("Scope Row Contradicts Itself") in
+        # setUpClass and the whole module errored out before one assertion ran.
+        # Reading the company back off the store makes the fixture agree with
+        # itself whatever the site default happens to be.
+        cls.company = frappe.db.get_value("CH Store", _TEST_STORE, "company") or cls.company
         _ensure_user(_TEST_USER)
         _make_scope(_TEST_USER, _TEST_STORE, cls.company)
         clear_scope_cache(_TEST_USER)
