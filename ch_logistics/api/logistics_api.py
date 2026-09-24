@@ -7,12 +7,13 @@ from __future__ import annotations
 
 import hmac
 import json
+import secrets
 import math
 
 import frappe
 from frappe import _
 from frappe.rate_limiter import rate_limit
-from frappe.utils import cint, flt, now_datetime
+from frappe.utils import cint, flt, get_datetime, getdate, now_datetime
 
 from ch_logistics import roles as role_registry
 from ch_logistics import scope_guard
@@ -111,6 +112,266 @@ def trip_set_manual_status(trip, status):
     doc.status = status
     doc.save()
     return {"name": doc.name, "status": doc.status}
+
+
+# A shipment already handed over, booked in or written off is nothing this
+# trip can deliver again.
+_MANIFEST_SETTLED = ("Delivered", "Received", "Partially Received",
+                     "Closed", "Cancelled", "Returned")
+
+
+def _load_manual_trip(trip, action: str):
+    """A courier or third-party trip the caller may move by hand."""
+    role_registry.require("ops_control", action)
+    doc = frappe.get_doc("CH Logistics Trip", trip)
+    if (doc.get("transport_mode") or "Own") == "Own":
+        frappe.throw(_("An Own trip moves through the driver app, not by hand."))
+    doc.check_permission("write")
+    return doc
+
+
+def _drop_stops(doc) -> list:
+    """The stops on this trip where goods are handed over.
+
+    A stop, not a manifest, is what a receiver signs for: one manifest can
+    drop legs at two different stores, and each store confirms its own.
+    """
+    # Membership is decided by the legs arriving here, not by the manifest's
+    # header destination: one manifest can carry a leg to Perungudi and
+    # another to Kelambakkam, and the header only names the first. Going by
+    # the header left the second store with nothing to confirm.
+    manifests = frappe.get_all(
+        "CH Transfer Manifest",
+        filters={"trip": doc.name, "docstatus": ("<", 2),
+                 "status": ("not in", _MANIFEST_SETTLED)},
+        fields=["name", "destination_store", "status"],
+    )
+    if not manifests:
+        return []
+    by_name = {m.name: m for m in manifests}
+    legs = frappe.get_all(
+        "CH Transfer Manifest Item",
+        filters={"parent": ("in", list(by_name)), "docstatus": ("<", 2)},
+        fields=["parent", "stock_entry", "to_warehouse", "total_qty"],
+    )
+    out = []
+    for stop in doc.stops or []:
+        here = [leg for leg in legs if leg.to_warehouse == stop.warehouse]
+        if not here:
+            continue
+        rows = [by_name[name] for name in dict.fromkeys(leg.parent for leg in here)]
+        out.append({"stop": stop, "rows": rows, "legs": here})
+    return out
+
+
+def _stop_store(stop, entry) -> str | None:
+    from ch_logistics.logistics.doctype.ch_transfer_manifest.ch_transfer_manifest import (
+        store_for_warehouse,
+    )
+
+    return (stop.store or store_for_warehouse(stop.warehouse)
+            or (entry["rows"][0].destination_store if entry["rows"] else None))
+
+
+def _stop_receivers(store) -> list:
+    """The store's own roster — whoever signs for the box gets the code."""
+    if not store or not frappe.db.exists("DocType", "POS Executive"):
+        return []
+    out = []
+    for row in frappe.get_all("POS Executive", filters={"store": store, "is_active": 1},
+                              fields=["name", "executive_name", "user"],
+                              order_by="executive_name"):
+        email = mobile = None
+        if row.user:
+            email, mobile = frappe.db.get_value(
+                "User", row.user, ["email", "mobile_no"]) or (None, None)
+        out.append({"name": row.name,
+                    "executive_name": row.executive_name or row.user or row.name,
+                    "has_email": bool(email), "has_mobile": bool(mobile)})
+    return out
+
+
+@frappe.whitelist(methods=["POST"])
+def trip_delivery_checklist(trip) -> dict:
+    """Every stop this trip still has to hand over, and who signs for it.
+
+    Ops records these deliveries by hand — the courier telephones — but each
+    receiving store still proves it got its own goods, exactly as it does
+    when a driver delivers.
+    """
+    doc = _load_manual_trip(trip, _("move logistics trips"))
+    stops = []
+    for entry in _drop_stops(doc):
+        stop = entry["stop"]
+        store = _stop_store(stop, entry)
+        stops.append({
+            "sequence": cint(stop.sequence),
+            "store": store,
+            "warehouse": stop.warehouse,
+            "stop_status": stop.status,
+            "delivered": stop.status == "Completed",
+            "manifests": [r.name for r in entry["rows"]],
+            "qty": sum(flt(leg.total_qty) for leg in entry["legs"]),
+            "receivers": _stop_receivers(store),
+        })
+    return {"trip": doc.name, "status": doc.status, "stops": stops,
+            "pending": [s["sequence"] for s in stops if not s["delivered"]]}
+
+
+@frappe.whitelist(methods=["POST"])
+def trip_request_stop_otp(trip, sequence, receiver=None) -> dict:
+    """One code for one stop, sent to the store standing at it.
+
+    Every manifest handed over at the stop shares the code, the way a courier
+    hands one receiver one number for the whole drop — and the way the driver
+    app's own consolidated stop works (request_stop_otp).
+    """
+    doc = _load_manual_trip(trip, _("move logistics trips"))
+    entry = next((e for e in _drop_stops(doc) if cint(e["stop"].sequence) == cint(sequence)), None)
+    if not entry or not entry["rows"]:
+        frappe.throw(_("Stop #{0} has nothing left to deliver.").format(sequence))
+    stop = entry["stop"]
+    store = _stop_store(stop, entry)
+
+    from ch_logistics.api.transfer_manifest_api import (
+        _send_delivery_otp, mask_email, mask_mobile,
+    )
+
+    plaintext = str(secrets.randbelow(900000) + 100000)
+    for row in entry["rows"]:
+        mf = frappe.get_doc("CH Transfer Manifest", row.name)
+        mf._generate_delivery_otp(request_source="Control Tower",
+                                  stop_sequence=cint(stop.sequence),
+                                  plaintext_otp=plaintext)
+        mf.flags.ignore_validate_update_after_submit = True
+        mf.save()
+
+    lead = frappe.get_doc("CH Transfer Manifest", entry["rows"][0].name)
+    recipients = _send_delivery_otp(lead, plaintext, receiver=receiver,
+                                    store=store, warehouse=stop.warehouse) or {}
+    emails = recipients.get("emails", [])
+    mobiles = recipients.get("mobiles", [])
+    return {
+        "trip": doc.name, "sequence": cint(stop.sequence), "store": store,
+        "receiver": receiver,
+        "masked_emails": [mask_email(e) for e in emails],
+        "masked_mobiles": [mask_mobile(m) for m in mobiles],
+        # A store with no address and no number on file cannot be sent a code
+        # at all — say so rather than let ops wait for one.
+        "reachable": bool(emails or mobiles),
+    }
+
+
+@frappe.whitelist(methods=["POST"])
+def trip_deliver_stop(trip, sequence, otp=None, delivered_at=None) -> dict:
+    """Hand one stop's goods over, against that store's code.
+
+    The trip itself only moves once every drop stop has been confirmed: a
+    delivery half the stores acknowledged is not a delivery.
+    """
+    doc = _load_manual_trip(trip, _("move logistics trips"))
+    entry = next((e for e in _drop_stops(doc) if cint(e["stop"].sequence) == cint(sequence)), None)
+    if not entry or not entry["rows"]:
+        frappe.throw(_("Stop #{0} has nothing left to deliver.").format(sequence))
+    stop = entry["stop"]
+    delivered = _delivery_stamp(delivered_at)
+
+    from ch_logistics.logistics.doctype.ch_logistics_otp_log.ch_logistics_otp_log import (
+        verify_manifest_otp,
+    )
+
+    verified = []
+    for row in entry["rows"]:
+        mf = frappe.get_doc("CH Transfer Manifest", row.name)
+        # Every stop proves itself. A manifest already confirmed at an earlier
+        # stop is not excused here: the store standing at THIS one reads out
+        # the code issued for it.
+        if not (mf.get("delivery_otp") or mf._delivery_otp_required()):
+            verified.append(mf)
+            continue
+        result = verify_manifest_otp(mf, otp)
+        if not result.get("valid"):
+            # A normal response, not an exception: an exception would roll the
+            # request back and the failed attempt would vanish from the audit
+            # trail (same reason complete_delivery returns rather than throws).
+            return {"ok": False, "trip": doc.name, "sequence": cint(stop.sequence),
+                    "message": result.get("message"),
+                    "attempts": cint(result.get("attempts"))}
+        mf.db_set({
+            "delivery_otp_verified": 1,
+            "delivery_otp": None,
+            "delivery_otp_verified_at": now_datetime(),
+            "delivery_otp_verified_by": frappe.session.user,
+            "delivery_datetime": delivered,
+        }, update_modified=False)
+        verified.append(mf)
+
+    stop.db_set({
+        "status": "Completed",
+        "ata": stop.get("ata") or delivered,
+        "delivery_scanned_at": delivered,
+        "delivery_scanned_by": frappe.session.user,
+    }, update_modified=False)
+    doc.add_comment("Comment", _("Stop #{0} ({1}) confirmed by {2}.").format(
+        stop.sequence, _stop_store(stop, entry) or stop.warehouse, frappe.session.user))
+
+    doc.reload()
+    outstanding = [e for e in _drop_stops(doc) if e["stop"].status != "Completed"]
+    if outstanding:
+        return {"ok": True, "trip": doc.name, "sequence": cint(stop.sequence),
+                "status": doc.status, "delivered_at": str(delivered),
+                "pending": [cint(e["stop"].sequence) for e in outstanding],
+                "state": trip_delivery_checklist(doc.name)}
+
+    # Every stop is in: moving the trip is what hands the shipments to their
+    # stores — see CHLogisticsTrip._settle_manifests_on_manual_delivery.
+    for mf in verified:
+        if not mf.get("delivery_datetime"):
+            mf.db_set("delivery_datetime", delivered, update_modified=False)
+    if not doc.get("actual_end"):
+        doc.actual_end = delivered
+    doc.status = "Delivered"
+    doc.save()
+    return {"ok": True, "trip": doc.name, "sequence": cint(stop.sequence),
+            "status": doc.status, "delivered_at": str(delivered), "pending": [],
+            "state": {"trip": doc.name, "status": doc.status, "stops": [], "pending": []}}
+
+
+def _delivery_stamp(delivered_at):
+    """The moment a hand-over is recorded.
+
+    The day it happened is what ops knows; the clock time is not something a
+    phone call records, so a bare date is stamped at the time it is entered —
+    the same way ERPNext fills posting_time behind a posting date. A delivery
+    is recorded after it happened, never before: backdating a courier's call
+    is normal, post-dating one is a guess.
+    """
+    now = now_datetime()
+    delivered = get_datetime(delivered_at) if delivered_at else now
+    if delivered_at and len(str(delivered_at).strip()) <= 10:
+        delivered = get_datetime(f"{str(delivered_at).strip()} {now.strftime('%H:%M:%S')}")
+    if getdate(delivered) > getdate(now):
+        frappe.throw(_("A delivery cannot be recorded in the future."),
+                     title=_("Delivery Date"))
+    return min(delivered, now)
+
+
+# The trip board draws six lanes; the status field has nine values, because a
+# courier trip ops moves by hand runs through Picked Up / Delivery Pending /
+# Delivered where a driver trip runs through Started / Completed. They are the
+# same three things to anyone reading the board: waiting, moving, done.
+_BOARD_LANES = ("Draft", "Assigned", "Started", "Completed", "Closed", "Cancelled")
+_BOARD_LANE = {
+    "Draft": "Draft",
+    "Assigned": "Assigned",
+    "Started": "Started",
+    "Picked Up": "Started",
+    "Delivery Pending": "Started",
+    "Completed": "Completed",
+    "Delivered": "Closed",
+    "Closed": "Closed",
+    "Cancelled": "Cancelled",
+}
 
 
 def _attach_photo_to_trip(doc, file_url) -> None:
@@ -2337,16 +2598,20 @@ def _trip_live_origin(trip_doc):
     return _warehouse_coords(trip_doc.get("hub_warehouse"))
 
 
+# A trip in any of these is still work in hand, whatever its planned date.
+_OPS_OPEN_TRIP_STATUSES = ("Draft", "Assigned", "Started", "Picked Up", "Delivery Pending")
+
+
 @frappe.whitelist()
 def ops_board(trip_date=None, include_days=1):
     """Trips for the day grouped by status, with light KPI summary.
 
-    In addition to date-windowed trips, always surface every Draft
-    trip (the dispatcher's backlog) regardless of trip_date.  Draft
-    trips with stale or missing planned dates are precisely the ones
-    that need scheduling — hiding them behind the date filter created
-    the bug where freshly Packed manifests attached to a stale-dated
-    Draft trip "vanished" from Operations.  Mirrors SAP TM Freight
+    In addition to date-windowed trips, always surface every trip that
+    is still open — Draft, Assigned, Started, Picked Up or Delivery
+    Pending — regardless of trip_date.  Open trips with stale or missing
+    planned dates are precisely the ones that need attention; hiding them
+    behind the date filter made the board look cleared each morning while
+    the goods were still moving.  Mirrors SAP TM Freight
     Order Cockpit / Oracle TM Transportation Cockpit behaviour where
     every un-dispatched freight order stays in the cockpit until it is
     either scheduled + assigned or cancelled.
@@ -2387,21 +2652,24 @@ def ops_board(trip_date=None, include_days=1):
         as_dict=True,
     )
 
-    # Backlog: Draft trips outside the date window (un-scheduled or
-    # carrying a stale planned date).  Returned regardless of the date
-    # filter so the dispatcher can schedule + assign drivers.  Cap
-    # separately so a huge backlog can't crowd out today's view.
+    # Backlog: every trip still in play outside the date window — not just
+    # the un-scheduled ones.  A trip that is still Draft, Assigned, Started,
+    # Picked Up or waiting on delivery is open work; hiding it because the
+    # clock passed midnight made the board look cleared each morning while
+    # the goods were still on the road.  Only finished trips (Delivered,
+    # Completed, Closed, Cancelled) fall out of view with the date window.
+    # Capped separately so a long backlog can't crowd out today's view.
     backlog_rows = frappe.db.sql(
         f"""
         SELECT {select_fields}
         FROM `tabCH Logistics Trip`
-        WHERE status = 'Draft'
+        WHERE status IN %(open_statuses)s
           AND (trip_date IS NULL OR trip_date NOT BETWEEN %(start)s AND %(end)s)
           AND {trip_scope}
-        ORDER BY creation DESC, name ASC
-        LIMIT 50
+        ORDER BY trip_date DESC, creation DESC, name ASC
+        LIMIT 200
         """,
-        query_params,
+        {**query_params, "open_statuses": _OPS_OPEN_TRIP_STATUSES},
         as_dict=True,
     )
 
@@ -2435,9 +2703,12 @@ def ops_board(trip_date=None, include_days=1):
         r["open_exceptions"] = cint(e and e.open_count)
         r["critical_exceptions"] = cint(e and e.sev_high)
 
-    buckets = {"Draft": [], "Assigned": [], "Started": [], "Completed": [], "Closed": [], "Cancelled": []}
+    buckets = {lane: [] for lane in _BOARD_LANES}
     for r in rows:
-        buckets.setdefault(r.status, []).append(r)
+        # An unknown status lands on the moving lane rather than in a bucket
+        # the board never draws — which is how courier trips used to vanish
+        # off it the moment ops marked them picked up.
+        buckets[_BOARD_LANE.get(r.status, "Started")].append(r)
 
     return {
         "trip_date": trip_date,
@@ -2458,8 +2729,10 @@ def ops_lifecycle_counts(trip_date=None, include_days=1):
 
     Each chip is a count of *real* docs currently in that stage; the
     front-end lets the dispatcher click a chip to filter the canvas.
-    Counts are scoped to the same date window the trip board uses so the
-    numbers stay consistent with what the dispatcher sees on the board.
+    Counts follow the same rule as the trip board: anything still open is
+    counted whatever its planned date, and only finished work (delivered,
+    closed) is scoped to the date window — so the strip and the board
+    underneath it always agree.
     """
     _require_ops()
     trip_date = trip_date or frappe.utils.today()
@@ -2509,21 +2782,33 @@ def ops_lifecycle_counts(trip_date=None, include_days=1):
         company_field="company",
         prefix="ops_lifecycle_trip",
     )
+    # Open trips count wherever their planned date sits, matching the board
+    # below them (ops_board keeps open work in view past midnight). Counting
+    # them strictly inside the window left the strip reading 0 while the
+    # board underneath showed the very same trips.
     trip_status_count = frappe.db.sql(
         f"""
         SELECT status, COUNT(*) AS cnt
         FROM `tabCH Logistics Trip`
-        WHERE trip_date BETWEEN %(start)s AND %(end)s
+        WHERE (trip_date BETWEEN %(start)s AND %(end)s
+               OR status IN %(open_statuses)s)
           AND {trip_scope}
         GROUP BY status
         """,
-        {"start": trip_date, "end": end_date, **trip_scope_params},
+        {"start": trip_date, "end": end_date,
+         "open_statuses": _OPS_OPEN_TRIP_STATUSES, **trip_scope_params},
         as_dict=True,
     )
-    by_status = {r.status: cint(r.cnt) for r in trip_status_count}
-    planned_trips = by_status.get("Draft", 0) + by_status.get("Assigned", 0)
-    in_transit_trips = by_status.get("Started", 0)
-    delivered_trips = by_status.get("Completed", 0) + by_status.get("Closed", 0)
+    # Counted by lane, not by raw status: a courier trip ops moved to Picked
+    # Up is in transit just as a driver trip at Started is, and counting only
+    # the driver words left the strip reading zero while the goods moved.
+    by_lane = {}
+    for row in trip_status_count:
+        lane = _BOARD_LANE.get(row.status, "Started")
+        by_lane[lane] = by_lane.get(lane, 0) + cint(row.cnt)
+    planned_trips = by_lane.get("Draft", 0) + by_lane.get("Assigned", 0)
+    in_transit_trips = by_lane.get("Started", 0)
+    delivered_trips = by_lane.get("Completed", 0) + by_lane.get("Closed", 0)
 
     # Also count manifests in transit / delivered today, because a trip can
     # carry multiple manifests and the dispatcher cares about shipment-level

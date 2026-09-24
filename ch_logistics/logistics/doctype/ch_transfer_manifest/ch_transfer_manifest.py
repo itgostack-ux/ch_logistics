@@ -75,6 +75,33 @@ class GeofenceError(frappe.ValidationError):
     """
 
 
+def store_for_warehouse(warehouse: str | None) -> str | None:
+    """The CH Store that operates a warehouse.
+
+    A manifest is addressed to a warehouse, but everyone who has to be told
+    about the shipment — the store's manager, the POS executive on the
+    counter — hangs off the store that owns it. Matched on the store's own
+    warehouse first; a group or parent warehouse only counts when exactly one
+    store uses it, since several stores can share one.
+    """
+    if not warehouse or not frappe.db.exists("DocType", "CH Store"):
+        return None
+    exact = frappe.db.get_value("CH Store", {"warehouse": warehouse}, "name")
+    if exact:
+        return exact
+    candidates = {warehouse}
+    parent = frappe.db.get_value("Warehouse", warehouse, "parent_warehouse")
+    if parent:
+        candidates.add(parent)
+    for field in ("warehouse_group", "warehouse"):
+        for candidate in candidates:
+            names = frappe.get_all("CH Store", filters={field: candidate},
+                                   pluck="name", limit=2)
+            if len(names) == 1:
+                return names[0]
+    return None
+
+
 class CHTransferManifest(Document):
 
     _SERVER_MANAGED_FIELDS = frozenset({
@@ -100,6 +127,7 @@ class CHTransferManifest(Document):
         if not self.status:
             self.status = "Draft"
         self._populate_transfer_details()
+        self._fill_stores_from_warehouses()
         self._seed_manifest_stops()
         self._compute_totals()
         self._validate_packing()
@@ -402,6 +430,21 @@ class CHTransferManifest(Document):
                 "<br>".join(row_errors),
                 title=_("Ch Transfer Manifest Error"),
             )
+
+    def _fill_stores_from_warehouses(self):
+        """Name the stores at each end when only the warehouses are known.
+
+        The warehouses are stamped from the Stock Entries, which carry no
+        store; without this the manifest knows where the goods go but not who
+        runs the place, and every contact the delivery OTP needs — store
+        manager, POS profile, store phone — hangs off the store.
+        """
+        for side in ("source", "destination"):
+            if self.get(f"{side}_store"):
+                continue
+            store = store_for_warehouse(self.get(f"{side}_warehouse"))
+            if store:
+                self.set(f"{side}_store", store)
 
     def _seed_manifest_stops(self):
         """Ensure a CH Transfer Manifest Stop exists for every from/to
