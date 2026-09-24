@@ -2300,10 +2300,169 @@ class LogisticsCommandCenter {
 		});
 		if (status !== "Delivered") return run();
 		// Delivered is the step that moves goods: it hands every shipment to
-		// the receiving store, and there is no way back from it.
-		frappe.confirm(
-			__("Mark {0} delivered? Each shipment goes to the store to scan in, and the trip cannot be moved back.", [trip]),
-			run);
+		// the receiving store, and there is no way back from it. Ops records
+		// it by hand because the courier telephones — but the store still
+		// proves it got the goods, exactly as it does for a driver delivery.
+		this._ops_deliver_dialog(trip);
+	}
+
+	// A stop is what a receiver signs for, so each one is confirmed on its
+	// own: its store reads out its own code. Stops are taken in order, and
+	// the trip only moves once the last one is in.
+	_ops_deliver_dialog(trip) {
+		frappe.call({ method: _LCC + "trip_delivery_checklist", args: { trip }, freeze: true })
+			.then((r) => {
+				const info = r.message;
+				if (!info) return;
+				this._ops_deliver_next_stop(trip, info);
+			});
+	}
+
+	_ops_deliver_next_stop(trip, info, dialog) {
+		const stop = (info.stops || []).find((s) => !s.delivered);
+		if (!stop) {
+			if (dialog) dialog.hide();
+			frappe.msgprint(__("Every stop on this trip has been confirmed."));
+			this._ops_load();
+			this._ops_open_trip(trip);
+			return;
+		}
+		if (dialog) dialog.hide();
+		this._ops_deliver_stop_form(trip, info, stop);
+	}
+
+	_ops_deliver_stop_form(trip, info, stop) {
+		const esc = frappe.utils.escape_html;
+		const who = stop.store || stop.warehouse || __("this stop");
+		const people = stop.receivers || [];
+
+		const fields = [{
+			fieldname: "stops_html", fieldtype: "HTML",
+			options: `<div class="lcc-side-sec">${__("Stops")}</div>
+				<div style="margin-bottom:10px">${(info.stops || []).map((s) => `
+					<div style="display:flex;justify-content:space-between;gap:10px;padding:4px 0;
+							border-bottom:1px solid var(--border-color)${
+								s.sequence === stop.sequence ? ";font-weight:600" : ""}">
+						<span>#${s.sequence} ${esc(s.store || s.warehouse || "")}
+							<span class="lcc-muted">${esc((s.manifests || []).join(", "))}</span></span>
+						<span class="lcc-muted">${s.delivered
+							? __("Confirmed")
+							: __("{0} unit(s)", [s.qty || 0])}</span>
+					</div>`).join("")}</div>`,
+		}];
+
+		// Whoever signs for the box is who the code should reach, so the
+		// store's own POS Executives are offered; with none on the roster it
+		// falls back to the store's contacts.
+		if (people.length) {
+			fields.push({
+				fieldname: "receiver", fieldtype: "Select",
+				label: __("Received by — {0}", [who]),
+				options: people.map((p) => ({
+					value: p.name,
+					label: p.has_email || p.has_mobile
+						? p.executive_name
+						: __("{0} (no contact on file)", [p.executive_name]),
+				})),
+				default: people.length === 1 ? people[0].name : "",
+			});
+		}
+		fields.push({
+			fieldname: "send_otp", fieldtype: "Button",
+			label: __("Send OTP to {0}", [who]),
+			click: () => this._ops_send_stop_otp(trip, stop, dialog),
+		});
+		fields.push({ fieldname: "otp_sent_html", fieldtype: "HTML" });
+		fields.push({
+			fieldname: "otp", fieldtype: "Data", label: __("OTP — {0}", [who]),
+			description: (stop.manifests || []).join(", "),
+		});
+		fields.push({
+			// The day, picked by hand. Ops knows which day the courier handed
+			// it over, never the minute, so no clock is asked for.
+			fieldname: "delivered_at", fieldtype: "Date", label: __("Delivery Date"),
+			default: frappe.datetime.get_today(), reqd: 1,
+			// A delivery is recorded after it happened: today and earlier can
+			// be entered, later cannot. A plain Date object — the option goes
+			// straight to the datepicker.
+			max_date: new Date(),
+			description: __("The day the courier handed it over. A future date cannot be entered."),
+		});
+
+		const dialog = new frappe.ui.Dialog({
+			title: __("Deliver Stop #{0} — {1}", [stop.sequence, who]),
+			size: "large",
+			fields,
+			primary_action_label: __("Confirm Stop #{0}", [stop.sequence]),
+			primary_action: (values) => {
+				const delivered_at = values.delivered_at;
+				if (delivered_at && delivered_at > frappe.datetime.get_today()) {
+					frappe.msgprint(__("A delivery cannot be recorded in the future."));
+					return;
+				}
+				const otp = (values.otp || "").trim();
+				if (!otp) {
+					frappe.msgprint(__("Enter the OTP {0} read out.", [who]));
+					return;
+				}
+				frappe.call({
+					method: _LCC + "trip_deliver_stop",
+					args: { trip, sequence: stop.sequence, otp, delivered_at },
+					freeze: true, freeze_message: __("Handing over..."),
+				}).then((r) => {
+					const out = r.message || {};
+					if (!out.ok) {
+						// The dialog stays open: only this stop's code is
+						// wrong, and the attempt is already on the audit log.
+						frappe.msgprint({
+							title: __("Not delivered"), indicator: "red",
+							message: esc(out.message || __("The OTP could not be confirmed.")),
+						});
+						return;
+					}
+					frappe.show_alert({
+						message: __("Stop #{0} — {1}", [stop.sequence, __("Delivered")]),
+						indicator: "green",
+					});
+					this._ops_load();
+					if ((out.pending || []).length) {
+						// Straight on to the next store, which gets its own
+						// code — one stop's OTP never covers another.
+						this._ops_deliver_next_stop(trip, out.state, dialog);
+						return;
+					}
+					dialog.hide();
+					frappe.show_alert({ message: __("Trip {0} — {1}", [trip, __("Delivered")]),
+						indicator: "green" });
+					this._ops_open_trip(trip);
+				});
+			},
+		});
+		dialog.show();
+		this._ops_send_stop_otp(trip, stop, dialog);
+	}
+
+	_ops_send_stop_otp(trip, stop, dialog) {
+		const esc = frappe.utils.escape_html;
+		frappe.call({
+			method: _LCC + "trip_request_stop_otp",
+			args: { trip, sequence: stop.sequence, receiver: dialog.get_value("receiver") || null },
+			freeze: true,
+		}).then((r) => {
+			const sent = r.message || {};
+			const field = dialog.fields_dict.otp_sent_html;
+			if (!field) return;
+			const to = (sent.masked_emails || []).concat(sent.masked_mobiles || []);
+			const who = esc(sent.store || stop.warehouse || "");
+			// A store nobody can reach cannot read out a code, so it is
+			// called out rather than left looking sent.
+			field.$wrapper.html(`<div style="margin-bottom:10px">${sent.reachable
+				? `<span class="lcc-muted">${who}: ${esc(to.join(", "))}${
+					sent.receiver ? ` (${esc(sent.receiver)})` : ""}</span>`
+				: `<span style="color:var(--red-600,#b91c1c)">${
+					__("{0}: no email or mobile on file — the store cannot receive a code.", [who])
+				}</span>`}</div>`);
+		});
 	}
 
 	_ops_trip_action(method, prefix = _LCC, extraArgs = {}) {

@@ -69,7 +69,7 @@
    "fieldtype": "Select",
    "in_list_view": 1,
    "label": "Requested From",
-   "options": "Driver Assignment\nDriver App\nManual Resend\nConsolidated Stop\nLegacy Backfill",
+   "options": "Driver Assignment\nDriver App\nManual Resend\nConsolidated Stop\nControl Tower\nLegacy Backfill",
    "read_only": 1,
    "reqd": 1
   },

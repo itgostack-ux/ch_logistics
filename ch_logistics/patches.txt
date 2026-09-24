@@ -18,3 +18,4 @@ ch_logistics.patches.v0_0_12.rotate_manifest_qr_tokens
 ch_logistics.patches.v0_0_13.protect_proof_credentials
 ch_logistics.patches.v0_0_14.backfill_transfer_manifest_routes
 ch_logistics.patches.v0_0_15.backfill_transfer_manifest_zone_routes
+ch_logistics.patches.v0_0_16.backfill_manifest_stores

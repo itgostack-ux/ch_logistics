@@ -1115,7 +1115,8 @@ def _receiver_contacts(receiver) -> tuple:
     return ([user], [email] if email else [], [mobile] if mobile else [])
 
 
-def _send_delivery_otp(doc, plaintext_otp=None, receiver=None) -> dict:
+def _send_delivery_otp(doc, plaintext_otp=None, receiver=None,
+                       store=None, warehouse=None) -> dict:
     """Send delivery OTP to the connected destination warehouse + store contacts.
 
     Recipient order (highest priority first):
@@ -1138,20 +1139,35 @@ def _send_delivery_otp(doc, plaintext_otp=None, receiver=None) -> dict:
     manager_emails = []
     manager_mobiles = []
 
-    if doc.destination_store:
+    # An older manifest may carry only the warehouse it is addressed to, and
+    # the manager, the POS executive and the store's own phone all hang off
+    # the store that runs it — so resolve it rather than tell nobody.
+    from ch_logistics.logistics.doctype.ch_transfer_manifest.ch_transfer_manifest import (
+        store_for_warehouse,
+    )
+
+    # A consolidated stop names the place the goods are actually being handed
+    # over, which is not always the manifest's header destination: one
+    # manifest can drop legs at two stores. The caller passes the stop's own
+    # store/warehouse so the code goes to the people standing there.
+    destination_warehouse = warehouse or doc.destination_warehouse
+    destination_store = store or doc.destination_store \
+        or store_for_warehouse(destination_warehouse)
+
+    if destination_store:
         try:
             manager_users, manager_emails, manager_mobiles = _collect_store_manager_contacts(
-                doc.destination_store
+                destination_store
             )
         except Exception:
             frappe.log_error(frappe.get_traceback(), "Manifest OTP — store managers lookup failed")
 
-    pos_profile = _resolve_destination_pos_profile(doc.destination_store)
+    pos_profile = _resolve_destination_pos_profile(destination_store)
     profile_emails, profile_mobiles = _collect_pos_profile_contacts(pos_profile)
 
-    warehouse_emails, warehouse_mobiles = _collect_warehouse_contacts(doc.destination_warehouse)
+    warehouse_emails, warehouse_mobiles = _collect_warehouse_contacts(destination_warehouse)
 
-    store_phone = frappe.db.get_value("CH Store", doc.destination_store, "contact_phone") if doc.destination_store else None
+    store_phone = frappe.db.get_value("CH Store", destination_store, "contact_phone") if destination_store else None
 
     # Warehouse contacts go first — they're the canonical \"connected warehouse\" address
     # for this manifest and the user's explicit choice for delivery handoff.
@@ -1336,6 +1352,26 @@ def delivery_receivers(manifest, stock_entry=None) -> list:
     return out
 
 
+# Masked so a UI can show "o***@warehouse.com" without leaking full addresses
+# to whoever happens to look over the shoulder of the person reading it.
+def mask_email(addr):
+    if not addr or "@" not in addr:
+        return addr
+    local, _, domain = addr.partition("@")
+    if len(local) <= 1:
+        return f"{local[:1]}***@{domain}"
+    return f"{local[:1]}***{local[-1:]}@{domain}"
+
+
+def mask_mobile(num):
+    if not num:
+        return num
+    text = str(num)
+    if len(text) <= 4:
+        return text
+    return text[:2] + "*" * (len(text) - 4) + text[-2:]
+
+
 @frappe.whitelist(methods=["POST"])
 @rate_limit(
     limit=lambda: role_registry.get_int_setting("delivery_otp_attempts_per_minute", 10),
@@ -1373,28 +1409,10 @@ def request_delivery_otp(manifest, receiver=None) -> dict:
     doc.save()
     recipients = _send_delivery_otp(doc, plaintext_otp, receiver=receiver) or {}
 
-    # Mask emails so the UI can show "o***@warehouse.com" without leaking
-    # full addresses to whoever happens to look over the driver's shoulder.
-    def _mask_email(addr):
-        if not addr or "@" not in addr:
-            return addr
-        local, _, domain = addr.partition("@")
-        if len(local) <= 1:
-            return f"{local[:1]}***@{domain}"
-        return f"{local[:1]}***{local[-1:]}@{domain}"
-
-    def _mask_mobile(num):
-        if not num:
-            return num
-        s = str(num)
-        if len(s) <= 4:
-            return s
-        return s[:2] + "*" * (len(s) - 4) + s[-2:]
-
     return {
         "message": _("OTP sent to the destination warehouse."),
-        "masked_emails": [_mask_email(e) for e in recipients.get("emails", [])],
-        "masked_mobiles": [_mask_mobile(m) for m in recipients.get("mobiles", [])],
+        "masked_emails": [mask_email(e) for e in recipients.get("emails", [])],
+        "masked_mobiles": [mask_mobile(m) for m in recipients.get("mobiles", [])],
         "email_count": len(recipients.get("emails", [])),
         "sms_count": len(recipients.get("mobiles", [])),
     }
