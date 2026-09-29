@@ -984,7 +984,8 @@ def get_stock_entry_box_labels(stock_entry) -> list:
 @frappe.whitelist(methods=["POST"])
 def driver_accept_manifest_row(trip, manifest, stock_entry, pickup_photo, scanned_qr,
                                lat, lng, gps_accuracy_m=None, geofence_override_reason=None,
-                               override_empty_stops=0, additional_scanned_qrs=None):
+                               override_empty_stops=0, additional_scanned_qrs=None,
+                               no_location_reason=None, pickup_photos=None):
     """Driver acceptance of ONE Stock Entry leg inside a multi-entry manifest —
     now WITH the same pickup evidence capture (QR scan, GPS, photo) that used
     to only happen later at the separate whole-manifest "Start Pickup" step,
@@ -1042,22 +1043,39 @@ def driver_accept_manifest_row(trip, manifest, stock_entry, pickup_photo, scanne
         lat_f, lng_f = mf._validate_geo_for(
             row.from_warehouse, row.from_warehouse, lat, lng, kind="pickup",
             accuracy_m=gps_accuracy_m, override_reason=geofence_override_reason,
+            no_location_reason=no_location_reason,
         )
 
         now = frappe.utils.now_datetime()
-        frappe.db.set_value(
-            "CH Transfer Manifest Item", row.name,
-            {
-                "driver_accepted_at": now,
-                "pickup_photo": pickup_photo,
-                "pickup_scanned_qr": "; ".join(s.strip() for s in all_scans if (s or "").strip()),
-                "pickup_lat": lat_f,
-                "pickup_lng": lng_f,
-                "pickup_gps_accuracy_m": gps_accuracy_m,
-                "pickup_captured_at": now,
-            },
-            update_modified=False,
-        )
+        capture = {
+            "driver_accepted_at": now,
+            "pickup_photo": pickup_photo,
+            "pickup_scanned_qr": "; ".join(s.strip() for s in all_scans if (s or "").strip()),
+            "pickup_captured_at": now,
+        }
+        # One photo could never show three boxes, a damaged corner and the
+        # shelf they came off. The whole list is kept here; pickup_photo
+        # above stays the first of them, so prints and every existing screen
+        # read the value they always did.
+        photos = frappe.parse_json(pickup_photos) if pickup_photos else []
+        photos = [str(u).strip() for u in (photos or []) if str(u or "").strip()]
+        if photos and frappe.get_meta("CH Transfer Manifest Item").has_field("pickup_photos"):
+            capture["pickup_photos"] = frappe.as_json(photos)
+            capture["pickup_photo"] = pickup_photo or photos[0]
+        # Only write coordinates when there are coordinates. These columns are
+        # Float, which Frappe creates NOT NULL, so a pickup taken under Allow
+        # Pickup Without Location cannot store None — it left the whole accept
+        # failing with "Column 'pickup_lat' cannot be null". The row keeps its
+        # zero default and the manifest's own comment says why nothing was
+        # captured; writing 0,0 as if it were a reading would be worse, since
+        # that is exactly the bogus-fix sentinel the validator rejects.
+        if lat_f is not None and lng_f is not None:
+            capture["pickup_lat"] = lat_f
+            capture["pickup_lng"] = lng_f
+        if gps_accuracy_m not in (None, ""):
+            capture["pickup_gps_accuracy_m"] = gps_accuracy_m
+        frappe.db.set_value("CH Transfer Manifest Item", row.name, capture,
+                            update_modified=False)
         row.driver_accepted_at = now
         mf.add_comment("Comment", _("Stock Entry {0} accepted (pickup captured) by driver {1}.").format(stock_entry, frappe.session.user))
 
@@ -1878,6 +1896,16 @@ def detach_manifest(manifest):
     trip_doc.flags.ignore_mandatory = True
     if trip_doc.status in ("Completed", "Closed", "Cancelled"):
         frappe.throw(_("Cannot detach manifest from a {0} trip").format(trip_doc.status))
+    # A started trip has left: the manifest is in the vehicle, and quietly
+    # unhooking it here would leave the paperwork saying one thing and the
+    # van another. Recall is the route that ends with the goods physically
+    # back before anything is reassigned.
+    if trip_doc.status == "Started":
+        frappe.throw(
+            _("Trip {0} has started — {1} is on the road. Use Abort &amp; Recall Trip "
+              "to bring it back, then re-dispatch it.").format(trip_doc.name, manifest),
+            title=_("Trip Already Started"),
+        )
     set_manifest_trip(manifest, None)
     if _has_manifest_stop_seq_field():
         # Int column is NOT NULL — writing None raises IntegrityError.
@@ -2902,7 +2930,10 @@ def ops_unassigned_manifests(direction=None, hub=None, limit=100):
     clauses = ["docstatus < 2", "status IN %(statuses)s", scope_clause]
     params = {
         "statuses": tuple(_OPS_ATTACHABLE_MANIFEST_STATUSES),
-        "limit": min(max(cint(limit) or 100, 1), 500),
+        # limit=0 means "everything": the Control Tower pages the list in the
+        # browser, and a server cap silently hid every manifest packed after
+        # the first hundred.
+        "limit": min(cint(limit), 5000) if cint(limit) > 0 else 1000000,
         **scope_params,
     }
     if _has_manifest_trip_field():

@@ -1162,3 +1162,23 @@
 	cursor: not-allowed;
 	pointer-events: none;
 }
+
+/* Paging under the Operations and Packed Order tables. Twenty rows a page:
+   the lists behind them are uncapped now, so the controls are what makes a
+   long backlog reachable instead of silently truncated. */
+.lcc-pager {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	gap: 12px;
+	padding: 10px 0 2px;
+}
+.lcc-pager .btn[disabled] { opacity: .45; }
+
+/* Inside a Kanban lane the pager has a narrow column to live in. */
+.lcc-ops-col .lcc-pager {
+	flex-wrap: wrap;
+	gap: 6px;
+	font-size: 11px;
+	padding: 8px 6px 10px;
+}

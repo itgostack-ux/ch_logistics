@@ -303,6 +303,14 @@ class DeliveryApp {
                 maybe_render();
             },
         });
+        // Site rules the capture flow needs before it can offer anything —
+        // currently only whether a phone with no usable GPS may still pick
+        // up. Read once per load; a failure leaves it off, which is the
+        // safe answer (location stays mandatory).
+        frappe.call({
+            method: API + "driver_app_settings",
+            callback: (r) => { this.app_settings = (r && r.message) || {}; },
+        });
     }
 
     _trip_pickups_remaining(trip) {
@@ -2162,7 +2170,7 @@ class DeliveryApp {
         // dialog instead of only silently captured on submit.
         frappe.dom.freeze(__("Capturing location…"));
         Promise.all([
-            this._capture_gps_promise(),
+            this._capture_gps_promise(true),
             this._call_promise(TRIP_API + "get_stock_entry_box_labels", { stock_entry }).catch(() => []),
         ])
             .then(([gps, box_labels]) => {
@@ -2183,10 +2191,7 @@ class DeliveryApp {
                             </div>`,
                         },
                         ...this._gps_display_fields(gps),
-                        {
-                            fieldname: "pickup_photo", fieldtype: "Attach Image",
-                            label: __("Photo of Goods"), reqd: 1,
-                        },
+                        ...this._photo_picker_fields(__("Photos of Goods")),
                         {
                             fieldname: "scanned_qr", fieldtype: "Data", options: "Barcode",
                             label: __("Scan Manifest QR"), reqd: 1,
@@ -2194,15 +2199,26 @@ class DeliveryApp {
                     ],
                     primary_action_label: __("Confirm & Accept"),
                     primary_action: (values) => {
+                        const photos = this._photo_picker_urls(d);
+                        if (!photos.length) {
+                            frappe.show_alert({
+                                message: __("Take at least one photo of the goods."),
+                                indicator: "red",
+                            });
+                            return;
+                        }
                         d.hide();
                         this._submit_leg_accept(manifest, stock_entry, trip, overrideEmptyStops, in_trip_view, {
-                            pickup_photo: values.pickup_photo,
+                            pickup_photo: photos[0],
+                            pickup_photos: JSON.stringify(photos),
                             scanned_qr: values.scanned_qr,
                             lat: gps.lat, lng: gps.lng, gps_accuracy_m: gps.accuracy,
+                            no_location_reason: gps.no_location_reason,
                         });
                     },
                 });
                 d.show();
+                this._bind_photo_picker(d);
             })
             .catch((err) => {
                 frappe.dom.unfreeze();
@@ -2236,10 +2252,7 @@ class DeliveryApp {
                     </div>`,
                 },
                 ...this._gps_display_fields(gps),
-                {
-                    fieldname: "pickup_photo", fieldtype: "Attach Image",
-                    label: __("Photo of Goods"), reqd: 1,
-                },
+                ...this._photo_picker_fields(__("Photos of Goods")),
                 {
                     fieldname: "scanned_qr", fieldtype: "Data", options: "Barcode",
                     label: __("Scan Box QR"),
@@ -2251,17 +2264,28 @@ class DeliveryApp {
             ],
             primary_action_label: __("Confirm & Accept"),
             primary_action: (values) => {
+                const photos = this._photo_picker_urls(d);
+                if (!photos.length) {
+                    frappe.show_alert({
+                        message: __("Take at least one photo of the goods."),
+                        indicator: "red",
+                    });
+                    return;
+                }
                 d.hide();
                 const all_scans = Array.from(scanned);
                 this._submit_leg_accept(manifest, stock_entry, trip, overrideEmptyStops, in_trip_view, {
-                    pickup_photo: values.pickup_photo,
+                    pickup_photo: photos[0],
+                    pickup_photos: JSON.stringify(photos),
                     scanned_qr: all_scans[0],
                     additional_scanned_qrs: JSON.stringify(all_scans.slice(1)),
                     lat: gps.lat, lng: gps.lng, gps_accuracy_m: gps.accuracy,
+                    no_location_reason: gps.no_location_reason,
                 });
             },
         });
         d.disable_primary_action();
+        this._bind_photo_picker(d);
 
         const register_scan = (value) => {
             value = (value || "").trim();
@@ -2322,10 +2346,12 @@ class DeliveryApp {
             manifest,
             stock_entry,
             pickup_photo: capture.pickup_photo,
+            pickup_photos: capture.pickup_photos,
             scanned_qr: capture.scanned_qr,
             lat: capture.lat,
             lng: capture.lng,
             gps_accuracy_m: capture.gps_accuracy_m,
+            no_location_reason: capture.no_location_reason,
             override_empty_stops: overrideEmptyStops ? 1 : 0,
             additional_scanned_qrs: capture.additional_scanned_qrs,
         }).then(() => {
@@ -2423,7 +2449,47 @@ class DeliveryApp {
         return (values.receiver || "").trim();
     }
 
+    // A code takes time to arrive by SMS or email. Tapping Send again while
+    // it is still in flight only invalidates the one the receiver is about
+    // to read out, so the button locks itself and shows the wait running
+    // down. The server holds the same rule (request_delivery_otp) — this
+    // just means the driver can see it rather than meeting a refusal.
+    _start_otp_cooldown(dialog, seconds) {
+        const field = dialog && dialog.fields_dict && dialog.fields_dict.send_otp;
+        if (!field) return;
+        const $btn = field.$input && field.$input.length ? field.$input : field.$wrapper.find("button");
+        if (!$btn || !$btn.length) return;
+        if (dialog.__ch_otp_timer) clearInterval(dialog.__ch_otp_timer);
+        let left = Math.max(parseInt(seconds, 10) || 0, 0);
+        if (!left) return;
+        const paint = () => {
+            const mm = Math.floor(left / 60);
+            const ss = String(left % 60).padStart(2, "0");
+            $btn.prop("disabled", true).text(__("Resend in {0}", [`${mm}:${ss}`]));
+        };
+        paint();
+        dialog.__ch_otp_timer = setInterval(() => {
+            left -= 1;
+            if (left <= 0) {
+                clearInterval(dialog.__ch_otp_timer);
+                dialog.__ch_otp_timer = null;
+                $btn.prop("disabled", false).text(__("Send OTP"));
+                return;
+            }
+            paint();
+        }, 1000);
+        // A dialog closed mid-countdown must not leave a timer ticking
+        // against a button that no longer exists.
+        const was = dialog.onhide;
+        dialog.onhide = () => {
+            if (dialog.__ch_otp_timer) clearInterval(dialog.__ch_otp_timer);
+            dialog.__ch_otp_timer = null;
+            if (typeof was === "function") was();
+        };
+    }
+
     _send_receiver_otp(manifest, receiver) {
+        const dialog = cur_dialog;
         frappe.dom.freeze(__("Sending OTP…"));
         this._call_promise(API + "request_delivery_otp", { manifest, receiver })
             .then((info) => {
@@ -2434,6 +2500,8 @@ class DeliveryApp {
                         : __("OTP generated, but no contact was reachable — ask the receiver."),
                     indicator: to.length ? "green" : "orange",
                 });
+                this._start_otp_cooldown(
+                    dialog, (info && info.resend_after_seconds) || 120);
             })
             .catch(() => {
                 frappe.dom.unfreeze();
@@ -2462,14 +2530,15 @@ class DeliveryApp {
 
         frappe.dom.freeze(__("Capturing location…"));
         Promise.all([
-            this._capture_gps_promise(),
+            this._capture_gps_promise(true),
             this._call_promise(TRIP_API + "get_stock_entry_box_labels", { stock_entry }).catch(() => []),
         ])
             .then(([gps, box_labels]) => {
                 frappe.dom.unfreeze();
                 box_labels = box_labels || [];
                 if (box_labels.length > 1) {
-                    this._open_leg_deliver_dialog_multibox(manifest, stock_entry, trip, in_trip_view, gps, box_labels, recipients_html);
+                    this._open_leg_deliver_dialog_multibox(manifest, stock_entry, trip,
+                        in_trip_view, gps, box_labels, recipients_html, receivers);
                     return;
                 }
                 const d = new frappe.ui.Dialog({
@@ -2478,10 +2547,7 @@ class DeliveryApp {
                     fields: [
                         { fieldname: "recipients_info", fieldtype: "HTML", options: recipients_html },
                         ...this._gps_display_fields(gps),
-                        {
-                            fieldname: "delivery_photo", fieldtype: "Attach Image",
-                            label: __("Photo of Delivery"), reqd: 1,
-                        },
+                        ...this._photo_picker_fields(__("Photos of Delivery")),
                         {
                             fieldname: "scanned_qr", fieldtype: "Data", options: "Barcode",
                             label: __("Scan Manifest QR"), reqd: 1,
@@ -2500,17 +2566,28 @@ class DeliveryApp {
                             frappe.msgprint(__("Name who is taking the delivery."));
                             return;
                         }
+                        const photos = this._photo_picker_urls(d);
+                        if (!photos.length) {
+                            frappe.show_alert({
+                                message: __("Take at least one photo of the delivery."),
+                                indicator: "red",
+                            });
+                            return;
+                        }
                         d.hide();
                         this._submit_leg_deliver(manifest, stock_entry, trip, in_trip_view, {
-                            delivery_photo: values.delivery_photo,
+                            delivery_photo: photos[0],
+                            delivery_photos: JSON.stringify(photos),
                             scanned_qr: values.scanned_qr,
                             receiver_name,
                             otp: values.otp,
                             lat: gps.lat, lng: gps.lng, gps_accuracy_m: gps.accuracy,
+                            no_location_reason: gps.no_location_reason,
                         });
                     },
                 });
                 d.show();
+                this._bind_photo_picker(d);
             })
             .catch((err) => {
                 frappe.dom.unfreeze();
@@ -2526,7 +2603,12 @@ class DeliveryApp {
      * carrying 3 boxes could scan just 1 (or the bare manifest QR) and mark
      * the whole shipment delivered with 2 boxes still on the truck.
      */
-    _open_leg_deliver_dialog_multibox(manifest, stock_entry, trip, in_trip_view, gps, box_labels, recipients_html) {
+    // `receivers` is the destination store's own roster. It used to stop at
+    // the single-box dialog: a shipment with more than one box dropped
+    // through to here and asked for a typed name instead, which is how a
+    // three-box delivery ended up with no list and no Send OTP button.
+    _open_leg_deliver_dialog_multibox(manifest, stock_entry, trip, in_trip_view, gps,
+                                      box_labels, recipients_html, receivers) {
         const scanned = new Set();
         const box_row_html = (label) => `
             <div class="da-box-scan-row" data-box="${frappe.utils.escape_html(label)}" style="display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid #eee;">
@@ -2545,10 +2627,7 @@ class DeliveryApp {
                     </div>`,
                 },
                 ...this._gps_display_fields(gps),
-                {
-                    fieldname: "delivery_photo", fieldtype: "Attach Image",
-                    label: __("Photo of Delivery"), reqd: 1,
-                },
+                ...this._photo_picker_fields(__("Photos of Delivery")),
                 {
                     fieldname: "scanned_qr", fieldtype: "Data", options: "Barcode",
                     label: __("Scan Box QR"),
@@ -2557,10 +2636,7 @@ class DeliveryApp {
                     fieldname: "box_list_html", fieldtype: "HTML",
                     options: `<div class="da-box-scan-list">${box_labels.map(box_row_html).join("")}</div>`,
                 },
-                {
-                    fieldname: "receiver_name", fieldtype: "Data",
-                    label: __("Receiver Name"), reqd: 1,
-                },
+                ...this._receiver_fields(manifest, receivers),
                 {
                     fieldname: "otp", fieldtype: "Data",
                     label: __("Delivery OTP"), reqd: 1,
@@ -2569,15 +2645,29 @@ class DeliveryApp {
             ],
             primary_action_label: __("Confirm & Deliver"),
             primary_action: (values) => {
+                const photos = this._photo_picker_urls(d);
+                if (!photos.length) {
+                    frappe.show_alert({
+                        message: __("Take at least one photo of the delivery."),
+                        indicator: "red",
+                    });
+                    return;
+                }
+                if (!this._receiver_label(receivers, values)) {
+                    frappe.msgprint(__("Name who is taking the delivery."));
+                    return;
+                }
                 d.hide();
                 const all_scans = Array.from(scanned);
                 this._submit_leg_deliver(manifest, stock_entry, trip, in_trip_view, {
-                    delivery_photo: values.delivery_photo,
+                    delivery_photo: photos[0],
+                    delivery_photos: JSON.stringify(photos),
                     scanned_qr: all_scans[0],
                     additional_scanned_qrs: JSON.stringify(all_scans.slice(1)),
-                    receiver_name: values.receiver_name,
+                    receiver_name: this._receiver_label(receivers, values),
                     otp: values.otp,
                     lat: gps.lat, lng: gps.lng, gps_accuracy_m: gps.accuracy,
+                    no_location_reason: gps.no_location_reason,
                 });
             },
         });
@@ -2629,6 +2719,7 @@ class DeliveryApp {
             });
         }
         d.show();
+        this._bind_photo_picker(d);
     }
 
     _submit_leg_deliver(manifest, stock_entry, trip, in_trip_view, capture) {
@@ -2637,6 +2728,7 @@ class DeliveryApp {
             manifest,
             stock_entry,
             delivery_photo: capture.delivery_photo,
+            delivery_photos: capture.delivery_photos,
             receiver_name: capture.receiver_name,
             scanned_qr: capture.scanned_qr,
             additional_scanned_qrs: capture.additional_scanned_qrs,
@@ -2644,6 +2736,7 @@ class DeliveryApp {
             lat: capture.lat,
             lng: capture.lng,
             gps_accuracy_m: capture.gps_accuracy_m,
+            no_location_reason: capture.no_location_reason,
         }).then(() => {
             frappe.dom.unfreeze();
             frappe.show_alert({ message: __("Shipment delivered"), indicator: "green" });
@@ -3587,6 +3680,68 @@ class DeliveryApp {
         });
     }
 
+    // ── Photos of the goods: several, not one ───────────────────────────
+    //
+    // One photo could never show three boxes, a damaged corner and the
+    // shelf they came off. Same shape the desk side already uses for
+    // request photos: the first URL stays in the single `pickup_photo`
+    // field every print and screen already reads, and the whole list rides
+    // alongside it as JSON.
+    _photo_picker_fields(label) {
+        return [
+            { fieldname: "photos_html", fieldtype: "HTML", label: label || __("Photos of Goods") },
+        ];
+    }
+
+    // The list lives on the dialog itself, not in a hidden field: a Dialog's
+    // set_value settles asynchronously, so a re-render fired straight after
+    // one read the value BEFORE the change — thumbnails lagged a photo
+    // behind and a removed photo came back.
+    _photo_picker_urls(dialog) {
+        return ((dialog && dialog.__ch_photos) || []).slice();
+    }
+
+    _bind_photo_picker(dialog) {
+        dialog.__ch_photos = dialog.__ch_photos || [];
+        const $w = dialog.fields_dict.photos_html.$wrapper;
+        const render = () => {
+            const urls = this._photo_picker_urls(dialog);
+            const thumbs = urls.map((url, i) => `
+                <div class="da-photo-thumb" style="position:relative;display:inline-block;margin:0 6px 6px 0">
+                    <img src="${frappe.utils.escape_html(url)}"
+                        style="width:62px;height:62px;object-fit:cover;border-radius:6px;border:1px solid #ddd">
+                    <button type="button" class="da-photo-drop btn btn-xs btn-danger" data-i="${i}"
+                        style="position:absolute;top:-6px;right:-6px;border-radius:50%;padding:0 5px;line-height:16px">×</button>
+                </div>`).join("");
+            $w.html(`
+                <button type="button" class="btn btn-sm btn-default da-photo-add" style="margin-bottom:8px">
+                    <i class="fa fa-camera"></i> ${__("Add Photos")}
+                </button>
+                <div class="da-photo-count text-muted" style="font-size:11px;margin-bottom:6px">${
+                    urls.length
+                        ? __("{0} photo(s) attached", [urls.length])
+                        : __("At least one photo of the goods is required.")
+                }</div>
+                <div>${thumbs}</div>`);
+            $w.find(".da-photo-add").on("click", () => {
+                new frappe.ui.FileUploader({
+                    allow_multiple: true,
+                    restrictions: { allowed_file_types: ["image/*"] },
+                    on_success: (file) => {
+                        if (file && file.file_url) dialog.__ch_photos.push(file.file_url);
+                        render();
+                    },
+                });
+            });
+            $w.find(".da-photo-drop").on("click", (e) => {
+                const i = parseInt($(e.currentTarget).attr("data-i"), 10);
+                dialog.__ch_photos.splice(i, 1);
+                render();
+            });
+        };
+        render();
+    }
+
     _gps_display_fields(gps) {
         // Visible, read-only confirmation of the GPS fix already captured
         // for this dialog — same "Latitude / Longitude / Open in Google
@@ -3596,6 +3751,17 @@ class DeliveryApp {
         // it until submit at all. Driver-visible confirmation matters here
         // more than it looks like it should — without it, "did this even
         // get my location" is not something the driver can tell.
+        // No fix, but the site let the driver through: say so plainly where
+        // the coordinates would have been, with the reason they gave, so the
+        // dialog never pretends a location was taken.
+        if (gps && gps.no_location_reason) {
+            return [{
+                fieldname: "gps_waived", fieldtype: "HTML",
+                options: `<div class="alert alert-warning" style="padding:8px 10px;border-radius:6px;margin-bottom:8px;">
+                    <b>${__("No location captured")}</b><br>${frappe.utils.escape_html(gps.no_location_reason)}
+                </div>`,
+            }];
+        }
         const lat_str = (gps && typeof gps.lat === "number") ? gps.lat.toFixed(6) : String((gps && gps.lat) || "");
         const lng_str = (gps && typeof gps.lng === "number") ? gps.lng.toFixed(6) : String((gps && gps.lng) || "");
         const maps_url = `https://maps.google.com/?q=${lat_str},${lng_str}`;
@@ -3613,32 +3779,120 @@ class DeliveryApp {
         ];
     }
 
+    // Why a device could not give a fix. Fixed list for the same reason
+    // every other reason on this app is fixed: "gps not working" and forty
+    // spellings of it cannot be counted, and this one is read later by
+    // whoever audits a pickup with no location on it.
+    _no_location_reasons() {
+        return [
+            "Phone Has No GPS",
+            "Location Permission Blocked on Device",
+            "GPS Not Getting a Signal Indoors",
+            "Device Battery Saver Blocking Location",
+            "Other",
+        ];
+    }
+
+    // The driver's way out when the device genuinely cannot produce a fix,
+    // and only when the site allows it (CH Logistics Settings -> Allow
+    // Pickup Without Location). Resolves with a gps object carrying no
+    // coordinates and the named reason; the server writes that reason onto
+    // the manifest so the gap is on the record rather than invisible.
+    _ask_no_location_reason() {
+        return new Promise((resolve, reject) => {
+            let chosen = null;
+            const d = new frappe.ui.Dialog({
+                title: __("No location available"),
+                fields: [
+                    {
+                        fieldtype: "HTML",
+                        options: `<div class="alert alert-warning" style="padding:8px 10px;border-radius:6px">${__(
+                            "This device could not give a location. You can still accept the shipment — "
+                            + "the photo and the box QR scan are still required, and this manifest will "
+                            + "record that no location was taken and why."
+                        )}</div>`,
+                    },
+                    {
+                        fieldtype: "Select", fieldname: "reason_code", label: __("Reason"),
+                        options: this._no_location_reasons().join("\n"), reqd: 1,
+                    },
+                    {
+                        fieldtype: "Small Text", fieldname: "reason_notes", label: __("Details"),
+                        mandatory_depends_on: "eval:doc.reason_code == 'Other'",
+                    },
+                ],
+                primary_action_label: __("Continue Without Location"),
+                primary_action: (vals) => {
+                    const cause = (vals.reason_code || "").trim();
+                    const notes = (vals.reason_notes || "").trim();
+                    if (!cause) return;
+                    if (cause === "Other" && !notes) {
+                        frappe.show_alert({
+                            message: __("Say what happened — 'Other' on its own tells nobody anything."),
+                            indicator: "red",
+                        });
+                        return;
+                    }
+                    // Recorded, then hidden — hiding is what settles the
+                    // promise below. Resolving here instead would race the
+                    // onhide handler, which fires first and rejected the
+                    // very choice the driver had just made.
+                    chosen = {
+                        lat: null, lng: null, accuracy: null,
+                        no_location_reason: notes ? `${cause} — ${notes}` : cause,
+                    };
+                    d.hide();
+                },
+            });
+            // Closing the dialog any other way — the ✕, Escape, the backdrop
+            // — is the driver saying they would rather go and fix the phone.
+            d.onhide = () => (chosen ? resolve(chosen) : reject(new Error("no-location declined")));
+            d.show();
+        });
+    }
+
     _capture_gps_promise() {
         // Self-contained GPS capture that rejects on denial/timeout so chained
         // ``frappe.dom.freeze`` calls in the combined-stop flows can always be
         // released. ``_capture_gps`` never invokes its callback on error
         // (it only shows a msgprint), which would leave the freeze overlay
         // stuck if we wrapped it directly.
+        // Where a failed capture goes: normally nowhere — location is proof
+        // of presence and the driver is told to turn it on. When the site
+        // allows it, the driver is asked WHY instead and the capture
+        // continues carrying that reason. Callers opt in with `may_waive`:
+        // the pickup and delivery flows do, the background pings do not —
+        // a ping with no location is simply not sent.
+        const give_up = (message, err, may_waive) => {
+            // The caller froze the screen with "Capturing location…" before
+            // awaiting this, and that overlay sits ON TOP of anything shown
+            // from here — which left the reason dialog visible but greyed
+            // out and untouchable. Drop the overlay first; the caller's own
+            // unfreeze in .then() is a no-op once the count is back to zero.
+            frappe.dom.unfreeze();
+            if (may_waive && cint((this.app_settings || {}).allow_pickup_without_location)) {
+                return this._ask_no_location_reason();
+            }
+            frappe.msgprint({ title: __("Location Required"), indicator: "red", message });
+            return Promise.reject(err);
+        };
+        const may_waive = arguments.length ? !!arguments[0] : false;
         return new Promise((resolve, reject) => {
             if (!navigator.geolocation) {
-                frappe.msgprint({
-                    title: __("Location Required"),
-                    indicator: "red",
-                    message: __("This device does not support geolocation. Pickup / delivery cannot be confirmed without driver location."),
-                });
-                reject(new Error("geolocation unsupported"));
+                give_up(
+                    __("This device does not support geolocation. Pickup / delivery cannot be confirmed without driver location."),
+                    new Error("geolocation unsupported"), may_waive
+                ).then(resolve, reject);
                 return;
             }
             navigator.geolocation.getCurrentPosition(
                 (pos) => resolve({ lat: pos.coords.latitude, lng: pos.coords.longitude, accuracy: pos.coords.accuracy }),
                 (err) => {
-                    frappe.msgprint({
-                        title: __("Location Required"),
-                        indicator: "red",
-                        message: __("Could not capture driver location ({0}). Enable Location on the device and retry.",
+                    give_up(
+                        __("Could not capture driver location ({0}). Enable Location on the device and retry.",
                             [(err && err.message) || __("permission denied")]),
-                    });
-                    reject(err || new Error("geolocation denied"));
+                        err || new Error("geolocation denied"), may_waive
+                    ).then(resolve, reject);
                 },
                 { enableHighAccuracy: true, timeout: 8000, maximumAge: 0 }
             );

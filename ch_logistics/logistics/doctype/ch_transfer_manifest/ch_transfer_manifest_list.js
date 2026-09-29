@@ -58,7 +58,13 @@ frappe.listview_settings["CH Transfer Manifest"] = {
 
 		const map = {
 			"Draft":             ["Draft",             "gray"],
-			"Packed":            ["Packed",            "blue"],
+			// The stored value stays "Packed" — filters, reports and the API
+			// all key off it — but it READS as "Manifest Created" here, the
+			// same as in the Logistics Control Tower. "Packed" already means
+			// something else one document down: on a Stock Entry it is the
+			// boxes being packed, while on a manifest it only means the
+			// paperwork exists and is waiting for a trip.
+			"Packed":            [__("Manifest Created"), "blue"],
 			"Assigned":          ["Assigned",          "purple"],
 			"Pickup Started":    ["Pickup Started",    "orange"],
 			"In Transit":        ["In Transit",        "orange"],
@@ -77,6 +83,8 @@ frappe.listview_settings["CH Transfer Manifest"] = {
 	// in the row. Keep them tight — one-liners with emphasis chips.
 	formatters: {
 		status(value) {
+			// Display only — see the indicator above for why.
+			const label = value === "Packed" ? __("Manifest Created") : value;
 			const pal = {
 				"Draft":              "gray",
 				"Packed":             "blue",
@@ -93,7 +101,7 @@ frappe.listview_settings["CH Transfer Manifest"] = {
 				"Cancelled":          "red",
 			};
 			const color = pal[value] || "gray";
-			return `<span class="indicator-pill no-margin ${color}">${frappe.utils.escape_html(value || "")}</span>`;
+			return `<span class="indicator-pill no-margin ${color}">${frappe.utils.escape_html(label || "")}</span>`;
 		},
 
 		shipment_priority(value) {

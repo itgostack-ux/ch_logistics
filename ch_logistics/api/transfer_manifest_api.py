@@ -15,7 +15,7 @@ from urllib.parse import quote, urlsplit
 import frappe
 from frappe import _
 from frappe.rate_limiter import rate_limit
-from frappe.utils import cint, flt
+from frappe.utils import cint, flt, get_datetime, now_datetime, time_diff_in_seconds
 
 # ── Role gating (Phase B — Outward / Inward governance) ─────────────────────
 # Stage → allowed-roles mapping lives in the central registry
@@ -326,7 +326,7 @@ def assign_driver(manifest, driver, courier_partner=None, vehicle_number=None,
 @frappe.whitelist(methods=["POST"])
 def start_pickup(manifest, pickup_photo, lat=None, lng=None, notes=None,
                  scanned_qr=None, gps_accuracy_m=None,
-                 geofence_override_reason=None) -> dict:
+                 geofence_override_reason=None, no_location_reason=None) -> dict:
     _require_stage_role("start_pickup")
     doc = frappe.get_doc("CH Transfer Manifest", manifest)
     doc.check_permission("write")
@@ -361,7 +361,8 @@ def start_pickup(manifest, pickup_photo, lat=None, lng=None, notes=None,
         )
     doc.start_pickup(pickup_photo=pickup_photo, lat=lat, lng=lng, notes=notes,
                      scanned_qr=scanned_qr, gps_accuracy_m=gps_accuracy_m,
-                     geofence_override_reason=geofence_override_reason)
+                     geofence_override_reason=geofence_override_reason,
+                     no_location_reason=no_location_reason)
     return {"status": doc.status}
 
 
@@ -486,7 +487,8 @@ def bulk_reject_other_assignments(accepted_manifest, rejection_reason,
 
 @frappe.whitelist(methods=["POST"])
 def mark_reached_destination(manifest, lat, lng, gps_accuracy_m=None,
-                             geofence_override_reason=None) -> dict:
+                             geofence_override_reason=None,
+                             no_location_reason=None) -> dict:
     """Driver \"Reached Location\" ping at the destination.
 
     Captures arrival GPS + timestamp on the manifest while keeping status
@@ -505,7 +507,8 @@ def mark_reached_destination(manifest, lat, lng, gps_accuracy_m=None,
     ds.assert_not_on_break(doc.driver)
     info = doc.mark_reached_destination(
         lat=lat, lng=lng, gps_accuracy_m=gps_accuracy_m,
-        geofence_override_reason=geofence_override_reason)
+        geofence_override_reason=geofence_override_reason,
+        no_location_reason=no_location_reason)
     return {
         "status": doc.status,
         "arrival_datetime": info.get("arrival_datetime"),
@@ -522,7 +525,7 @@ def mark_reached_destination(manifest, lat, lng, gps_accuracy_m=None,
 def complete_delivery(manifest, delivery_photo, receiver_name, otp=None,
                       lat=None, lng=None, scanned_qr=None,
                       seal_numbers=None, gps_accuracy_m=None,
-                      geofence_override_reason=None) -> dict:
+                      geofence_override_reason=None, no_location_reason=None) -> dict:
     _require_stage_role("complete_delivery")
     doc = frappe.get_doc("CH Transfer Manifest", manifest)
     doc.check_permission("write")
@@ -560,6 +563,7 @@ def complete_delivery(manifest, delivery_photo, receiver_name, otp=None,
             seal_numbers=seal_numbers,
             gps_accuracy_m=gps_accuracy_m,
             geofence_override_reason=geofence_override_reason,
+            no_location_reason=no_location_reason,
         )
     except DeliveryOTPError as exc:
         # Returning a normal response is deliberate: Frappe rolls the whole
@@ -590,7 +594,8 @@ def complete_delivery(manifest, delivery_photo, receiver_name, otp=None,
 def driver_complete_delivery_row(manifest, stock_entry, delivery_photo, receiver_name,
                                  scanned_qr, otp=None, lat=None, lng=None,
                                  gps_accuracy_m=None, geofence_override_reason=None,
-                                 additional_scanned_qrs=None) -> dict:
+                                 additional_scanned_qrs=None,
+                                 no_location_reason=None, delivery_photos=None) -> dict:
     """Driver completes delivery of ONE Stock Entry leg inside a multi-entry
     manifest — the delivery-side mirror of ``driver_accept_manifest_row``.
 
@@ -660,6 +665,7 @@ def driver_complete_delivery_row(manifest, stock_entry, delivery_photo, receiver
         lat_f, lng_f = mf._validate_geo_for(
             row.to_warehouse, row.to_warehouse, lat, lng, kind="delivery",
             accuracy_m=gps_accuracy_m, override_reason=geofence_override_reason,
+            no_location_reason=no_location_reason,
         )
 
         if mf.delivery_otp or mf._delivery_otp_required():
@@ -670,19 +676,31 @@ def driver_complete_delivery_row(manifest, stock_entry, delivery_photo, receiver
             mf.delivery_otp = None
 
         now = frappe.utils.now_datetime()
-        frappe.db.set_value(
-            "CH Transfer Manifest Item", row.name,
-            {
-                "delivery_photo": delivery_photo,
-                "delivery_scanned_qr": scanned_qr,
-                "delivery_receiver_name": receiver_name,
-                "delivery_lat": lat_f,
-                "delivery_lng": lng_f,
-                "delivery_gps_accuracy_m": gps_accuracy_m,
-                "delivery_captured_at": now,
-            },
-            update_modified=False,
-        )
+        capture = {
+            "delivery_photo": delivery_photo,
+            "delivery_scanned_qr": scanned_qr,
+            "delivery_receiver_name": receiver_name,
+            "delivery_captured_at": now,
+        }
+        # The whole set the driver took — the receiver with the boxes, the
+        # signed slip, the door number. delivery_photo above stays the first
+        # of them so prints and existing screens are unchanged.
+        photos = frappe.parse_json(delivery_photos) if delivery_photos else []
+        photos = [str(u).strip() for u in (photos or []) if str(u or "").strip()]
+        if photos and frappe.get_meta("CH Transfer Manifest Item").has_field("delivery_photos"):
+            capture["delivery_photos"] = frappe.as_json(photos)
+            capture["delivery_photo"] = delivery_photo or photos[0]
+        # Float columns are NOT NULL, and db.set_value writes raw SQL — see
+        # the pickup capture in logistics_api for the same guard. A delivery
+        # taken with no fix keeps the zero default; the manifest's comment
+        # is what records that nothing was captured and why.
+        if lat_f is not None and lng_f is not None:
+            capture["delivery_lat"] = lat_f
+            capture["delivery_lng"] = lng_f
+        if gps_accuracy_m not in (None, ""):
+            capture["delivery_gps_accuracy_m"] = gps_accuracy_m
+        frappe.db.set_value("CH Transfer Manifest Item", row.name, capture,
+                            update_modified=False)
         row.delivery_captured_at = now
         mf.add_comment("Comment", _("Stock Entry {0} delivered (evidence captured) by driver {1}.").format(stock_entry, frappe.session.user))
 
@@ -695,8 +713,9 @@ def driver_complete_delivery_row(manifest, stock_entry, delivery_photo, receiver
             # proven delivery, so the manifest as a whole genuinely is
             # delivered. Fires the exact same tail complete_delivery uses.
             mf.arrival_datetime = now
-            mf.arrival_lat = lat_f
-            mf.arrival_lng = lng_f
+            if lat_f is not None and lng_f is not None:
+                mf.arrival_lat = lat_f
+                mf.arrival_lng = lng_f
             mf._apply_delivery_complete_transition(delivery_photo, lat_f, lng_f, receiver_name)
     except DeliveryOTPError as exc:
         # Returning a normal response is deliberate: Frappe rolls the whole
@@ -1457,6 +1476,24 @@ def request_delivery_otp(manifest, receiver=None) -> dict:
     from ch_logistics.api.driver_resolver import assert_manifest_driver_access
 
     assert_manifest_driver_access(doc, scope_side="destination")
+    # A code takes time to arrive. Tapping Send again while it is still in
+    # flight only invalidates the one the receiver is about to read out, so
+    # each request has to wait out the window (CH Logistics Settings ->
+    # Delivery OTP Resend Wait). Enforced here, not only on the button,
+    # because reloading the app would otherwise clear the countdown.
+    wait_s = role_registry.get_int_setting("delivery_otp_resend_seconds", 120)
+    sent_at = doc.get("delivery_otp_sent_at")
+    if wait_s > 0 and sent_at:
+        elapsed = time_diff_in_seconds(now_datetime(), get_datetime(sent_at))
+        left = int(wait_s - elapsed)
+        if 0 < left <= wait_s:
+            frappe.throw(
+                _("An OTP was just sent. Wait {0} before asking for another — "
+                  "the one already on its way is still valid.").format(
+                    _("{0} min {1} sec").format(left // 60, left % 60) if left >= 60
+                    else _("{0} sec").format(left)),
+                title=_("Please Wait"),
+            )
     if doc.status != "In Transit":
         frappe.throw(
             _("OTP can only be requested while the manifest is In Transit (current: {0}).")
@@ -1477,6 +1514,9 @@ def request_delivery_otp(manifest, receiver=None) -> dict:
         # Who the driver can name as having taken custody. Same people the
         # code just went to; the field still accepts anyone else.
         "receiver_options": _receiver_candidates(doc),
+        # How long before another code may be asked for, so the app's button
+        # counts down the same window this endpoint will enforce.
+        "resend_after_seconds": wait_s,
     }
 
 
@@ -2154,3 +2194,174 @@ def receive_courier_webhook(courier_partner: str, payload: str = None) -> dict:
             except Exception:
                 pass
     return {"received": True, "matched": True, "manifest": manifest_name, "status": mapped_status}
+
+
+# ── Undoing a manifest that has not moved ───────────────────────────────────
+#
+# Cancelling a manifest used to mean one thing: reverse every Stock Entry back
+# to the source warehouse and leave the entries at Draft — "Cancel Manifest &
+# Return Stock", on the manifest form. That is the right answer when the
+# dispatch itself was wrong, and the wrong one when only the GROUPING was:
+# the boxes are packed, the stock is in transit, and all anybody wants is to
+# put those shipments back in the Packed pool for a different manifest.
+#
+# These two do that, and nothing else — no stock moves at all:
+#
+#   release_manifest          — undo the whole manifest
+#   remove_transfer_from_manifest — pull one shipment off it
+#
+# Both refuse the moment physical movement has started; from there the honest
+# paths are Initiate Recall (goods are out) or the form's own cancel (undo the
+# dispatch entirely).
+
+_MANIFEST_UNDOABLE = ("Draft", "Packed")
+#: Where an entry sits while it belongs to a manifest that has not left.
+_ENTRY_ON_MANIFEST = ("Ready For Pickup", "Assigned")
+
+
+def _assert_manifest_can_be_undone(doc) -> None:
+    # The trip is checked first on purpose: a manifest with a driver is
+    # always "Assigned", and telling someone their manifest has moved when a
+    # driver simply has it on their list sends them to the wrong button.
+    if doc.get("trip"):
+        frappe.throw(
+            _("Manifest {0} is on trip {1} with {2}. Detach it from the trip "
+              "first, then cancel it here.").format(
+                doc.name, doc.trip, doc.get("driver_name") or _("a driver")),
+            title=_("On a Trip"),
+        )
+    if doc.status not in _MANIFEST_UNDOABLE or doc.pickup_datetime:
+        frappe.throw(
+            _("Manifest {0} is {1} — pickup has started or it is already closed. "
+              "Use Initiate Recall to bring the goods back.").format(doc.name, doc.status),
+            title=_("Already Moving"),
+        )
+
+
+def _return_entry_to_packed(stock_entry: str, note: str) -> bool:
+    """Ungroup one Stock Entry: Ready For Pickup / Assigned -> Packed.
+
+    Status only. The goods stay exactly where the packing left them — in the
+    transit warehouse, in their boxes — which is what makes them available to
+    the next manifest without being packed again.
+    """
+    from ch_erp15.ch_erp15.custom.stock_entry import _authorize_custom_state_transition
+
+    doc = frappe.get_doc("Stock Entry", stock_entry)
+    if (doc.get("custom_status") or "") not in _ENTRY_ON_MANIFEST:
+        return False
+    doc.custom_status = "Packed"
+    # The manifest stamp has to go with the status. The Packed Orders queue
+    # lists entries by custom_transfer_manifest being empty — leaving the old
+    # manifest on the entry took it off that manifest and out of the queue at
+    # the same time, so it belonged to nothing and appeared nowhere.
+    if doc.meta.has_field("custom_transfer_manifest"):
+        doc.custom_transfer_manifest = None
+    _authorize_custom_state_transition(doc)
+    doc.flags.ignore_validate_update_after_submit = True
+    doc.save(ignore_permissions=True)
+    doc.add_comment("Comment", note)
+    return True
+
+
+@frappe.whitelist(methods=["POST"])
+def release_manifest(manifest: str, reason: str) -> dict:
+    """Cancel a manifest that has not moved; its shipments go back to Packed."""
+    reason = str(reason or "").strip()
+    if not reason:
+        frappe.throw(_("A reason is required to cancel a manifest."))
+    _require_stage_role("initiate_recall")
+    doc = frappe.get_doc("CH Transfer Manifest", manifest)
+    doc.check_permission("write")
+    scope_guard.assert_manifest_scope(doc.as_dict(), side="source")
+    _assert_manifest_can_be_undone(doc)
+
+    note = _("Manifest {0} cancelled by {1}: {2}").format(
+        doc.name, frappe.session.user, reason)
+    released = [row.stock_entry for row in doc.transfers
+                if row.stock_entry and _return_entry_to_packed(row.stock_entry, note)]
+
+    payload = {
+        "status": "Cancelled",
+        "cancellation_reason": reason,
+        "cancelled_by": frappe.session.user,
+        "cancelled_on": now_datetime(),
+    }
+    if cint(doc.get("ewaybill_count")) or doc.get("ewaybill_status") in ("Generated", "Partial"):
+        payload["ewaybill_status"] = "Cancelled"
+    frappe.db.set_value("CH Transfer Manifest", doc.name, payload)
+    doc.add_comment("Comment", _("{0} Shipments returned to Packed: {1}").format(
+        note, ", ".join(released) or _("none")))
+    return {
+        "manifest": doc.name,
+        "status": "Cancelled",
+        "released": released,
+        "message": _("Manifest cancelled. {0} shipment(s) are back in Packed Orders.").format(
+            len(released)),
+    }
+
+
+@frappe.whitelist(methods=["POST"])
+def remove_transfer_from_manifest(manifest: str, stock_entry: str, reason: str) -> dict:
+    """Pull one shipment off a manifest; it goes back to Packed on its own."""
+    reason = str(reason or "").strip()
+    if not reason:
+        frappe.throw(_("A reason is required to remove a shipment."))
+    _require_stage_role("initiate_recall")
+    doc = frappe.get_doc("CH Transfer Manifest", manifest)
+    doc.check_permission("write")
+    scope_guard.assert_manifest_scope(doc.as_dict(), side="source")
+    _assert_manifest_can_be_undone(doc)
+
+    row = next((r for r in doc.transfers if r.stock_entry == stock_entry), None)
+    if not row:
+        frappe.throw(_("{0} is not on manifest {1}.").format(stock_entry, doc.name))
+    if len(doc.transfers) == 1:
+        frappe.throw(
+            _("{0} is the only shipment on this manifest. Cancel the manifest "
+              "instead — it does the same thing and leaves no empty manifest "
+              "behind.").format(stock_entry),
+            title=_("Last Shipment"),
+        )
+
+    note = _("Removed from manifest {0} by {1}: {2}").format(
+        doc.name, frappe.session.user, reason)
+    # The transfers table is not allow_on_submit, so the row goes through SQL
+    # — the same way detach_manifest and the leg-rejection split do it.
+    frappe.db.sql("DELETE FROM `tabCH Transfer Manifest Item` WHERE name = %s", (row.name,))
+    remaining = [r for r in doc.transfers if r.name != row.name]
+    frappe.db.set_value(
+        "CH Transfer Manifest", doc.name,
+        {
+            "total_stock_entries": len(remaining),
+            "total_items": sum(cint(r.item_count) for r in remaining),
+            "total_qty": sum(flt(r.total_qty) for r in remaining),
+        },
+        update_modified=False,
+    )
+    returned = _return_entry_to_packed(stock_entry, note)
+    doc.add_comment("Comment", _("Shipment {0} removed: {1}").format(stock_entry, reason))
+    return {
+        "manifest": doc.name,
+        "stock_entry": stock_entry,
+        "returned_to_packed": returned,
+        "remaining": len(remaining),
+        "message": _("{0} is back in Packed Orders. {1} shipment(s) left on {2}.").format(
+            stock_entry, len(remaining), doc.name),
+    }
+
+
+@frappe.whitelist()
+def driver_app_settings() -> dict:
+    """The handful of site rules the driver app has to know up front.
+
+    Read once when the app loads. Today that is only whether a device with
+    no usable GPS may still pick up (CH Logistics Settings -> Allow Pickup
+    Without Location) — the app has to know before it can offer the driver
+    anything other than "enable location and retry".
+    """
+    return {
+        "allow_pickup_without_location": cint(
+            frappe.db.get_single_value("CH Logistics Settings", "allow_pickup_without_location")
+        ),
+    }

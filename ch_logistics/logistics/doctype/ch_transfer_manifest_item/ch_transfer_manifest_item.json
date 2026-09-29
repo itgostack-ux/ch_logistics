@@ -14,6 +14,7 @@
   "driver_accepted_at",
   "sec_break_pickup_capture",
   "pickup_photo",
+  "pickup_photos",
   "pickup_scanned_qr",
   "col_break_pickup_capture",
   "pickup_lat",
@@ -22,6 +23,7 @@
   "pickup_captured_at",
   "sec_break_delivery_capture",
   "delivery_photo",
+  "delivery_photos",
   "delivery_scanned_qr",
   "delivery_receiver_name",
   "col_break_delivery_capture",
@@ -75,18 +77,18 @@
    "read_only": 1
   },
   {
+   "description": "Sequence (idx) of the CH Transfer Manifest Stop in this same manifest's own Stops table that this transfer's drop leg belongs to. Set automatically when the manifest's stops are seeded. Stops are append-only (never reordered/removed) so this stays a stable reference.",
    "fieldname": "manifest_stop",
    "fieldtype": "Int",
    "label": "Manifest Stop",
-   "read_only": 1,
-   "description": "Sequence (idx) of the CH Transfer Manifest Stop in this same manifest's own Stops table that this transfer's drop leg belongs to. Set automatically when the manifest's stops are seeded. Stops are append-only (never reordered/removed) so this stays a stable reference."
+   "read_only": 1
   },
   {
+   "description": "Stamped when the driver accepts THIS Stock Entry's leg individually. Once every row on the manifest has this set, the manifest header's own driver_accepted_at is stamped too, keeping trip-start and pickup-candidate gating unchanged.",
    "fieldname": "driver_accepted_at",
    "fieldtype": "Datetime",
    "label": "Driver Accepted At",
-   "read_only": 1,
-   "description": "Stamped when the driver accepts THIS Stock Entry's leg individually. Once every row on the manifest has this set, the manifest header's own driver_accepted_at is stamped too, keeping trip-start and pickup-candidate gating unchanged."
+   "read_only": 1
   },
   {
    "fieldname": "sec_break_pickup_capture",
@@ -97,6 +99,14 @@
    "fieldname": "pickup_photo",
    "fieldtype": "Attach Image",
    "label": "Pickup Photo",
+   "read_only": 1
+  },
+  {
+   "description": "Every photo the driver took at pickup, as a JSON list of file URLs. pickup_photo above keeps the first one, so prints and existing screens read the same value they always did.",
+   "fieldname": "pickup_photos",
+   "fieldtype": "Small Text",
+   "label": "Pickup Photos",
+   "no_copy": 1,
    "read_only": 1
   },
   {
@@ -113,15 +123,15 @@
    "fieldname": "pickup_lat",
    "fieldtype": "Float",
    "label": "Pickup Latitude",
-   "read_only": 1,
-   "precision": "8"
+   "precision": "8",
+   "read_only": 1
   },
   {
    "fieldname": "pickup_lng",
    "fieldtype": "Float",
    "label": "Pickup Longitude",
-   "read_only": 1,
-   "precision": "8"
+   "precision": "8",
+   "read_only": 1
   },
   {
    "fieldname": "pickup_gps_accuracy_m",
@@ -130,11 +140,11 @@
    "read_only": 1
   },
   {
+   "description": "Stamped when this leg's own QR/GPS/photo pickup evidence was captured, at Accept Shipment time. Once every row on the manifest has this set, the manifest transitions to In Transit.",
    "fieldname": "pickup_captured_at",
    "fieldtype": "Datetime",
    "label": "Pickup Captured At",
-   "read_only": 1,
-   "description": "Stamped when this leg's own QR/GPS/photo pickup evidence was captured, at Accept Shipment time. Once every row on the manifest has this set, the manifest transitions to In Transit."
+   "read_only": 1
   },
   {
    "fieldname": "sec_break_delivery_capture",
@@ -145,6 +155,14 @@
    "fieldname": "delivery_photo",
    "fieldtype": "Attach Image",
    "label": "Delivery Photo",
+   "read_only": 1
+  },
+  {
+   "description": "Every photo the driver took at delivery, as a JSON list of file URLs. delivery_photo above keeps the first one, so prints and existing screens read the same value they always did.",
+   "fieldname": "delivery_photos",
+   "fieldtype": "Small Text",
+   "label": "Delivery Photos",
+   "no_copy": 1,
    "read_only": 1
   },
   {
@@ -167,15 +185,15 @@
    "fieldname": "delivery_lat",
    "fieldtype": "Float",
    "label": "Delivery Latitude",
-   "read_only": 1,
-   "precision": "8"
+   "precision": "8",
+   "read_only": 1
   },
   {
    "fieldname": "delivery_lng",
    "fieldtype": "Float",
    "label": "Delivery Longitude",
-   "read_only": 1,
-   "precision": "8"
+   "precision": "8",
+   "read_only": 1
   },
   {
    "fieldname": "delivery_gps_accuracy_m",
@@ -184,11 +202,11 @@
    "read_only": 1
   },
   {
+   "description": "Stamped when this leg's own QR/GPS/photo/receiver delivery evidence was captured, at Deliver time. Once every row on the manifest has this set, the manifest transitions to Delivered.",
    "fieldname": "delivery_captured_at",
    "fieldtype": "Datetime",
    "label": "Delivery Captured At",
-   "read_only": 1,
-   "description": "Stamped when this leg's own QR/GPS/photo/receiver delivery evidence was captured, at Deliver time. Once every row on the manifest has this set, the manifest transitions to Delivered."
+   "read_only": 1
   },
   {
    "fieldname": "sec_break_items",

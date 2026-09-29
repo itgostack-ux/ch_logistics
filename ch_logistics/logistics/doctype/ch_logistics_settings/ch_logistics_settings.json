@@ -20,6 +20,7 @@
   "delivery_otp_max_attempts",
   "enforce_geofence",
   "geofence_radius_m",
+  "allow_pickup_without_location",
   "performance_section",
   "eta_average_speed_kmh",
   "optimizer_max_stops",
@@ -48,6 +49,7 @@
   "driver_device_row_limit",
   "driver_location_requests_per_minute",
   "delivery_otp_attempts_per_minute",
+  "delivery_otp_resend_seconds",
   "public_tracking_requests_per_window",
   "public_tracking_window_seconds",
   "push_section",
@@ -113,7 +115,7 @@
   },
   {
    "default": "0",
-   "description": "When enabled, a CH Transfer Manifest cannot be submitted (Draft \u2192 Packed) until at least one packing photo has been attached. Complements the packing-slip check with visual evidence — matches SAP EWM Photo Documentation and Oracle SIM Pack Verification.",
+   "description": "When enabled, a CH Transfer Manifest cannot be submitted (Draft \u2192 Packed) until at least one packing photo has been attached. Complements the packing-slip check with visual evidence \u2014 matches SAP EWM Photo Documentation and Oracle SIM Pack Verification.",
    "fieldname": "require_packing_photo",
    "fieldtype": "Check",
    "label": "Require Packing Photo Before Dispatch"
@@ -163,18 +165,25 @@
    "non_negative": 1
   },
   {
+   "default": "1",
+   "description": "Block pickup/delivery when the driver's GPS is farther than the radius from the source/destination warehouse.",
    "fieldname": "enforce_geofence",
    "fieldtype": "Check",
-   "label": "Enforce Pickup/Delivery Geofence",
-   "default": "1",
-   "description": "Block pickup/delivery when the driver's GPS is farther than the radius from the source/destination warehouse."
+   "label": "Enforce Pickup/Delivery Geofence"
   },
   {
+   "default": "300",
+   "depends_on": "enforce_geofence",
    "fieldname": "geofence_radius_m",
    "fieldtype": "Int",
-   "label": "Geofence Radius (metres)",
-   "default": "300",
-   "depends_on": "enforce_geofence"
+   "label": "Geofence Radius (metres)"
+  },
+  {
+   "default": "0",
+   "description": "For drivers whose device cannot produce a GPS fix at all. When on, a failed capture at pickup, arrival or delivery offers a reason instead of blocking, and the manifest records that no location was taken, why, and by whom. The photo, the box QR scan, the receiver name and the delivery OTP all stay mandatory \u2014 those are the stronger proofs of presence anyway, since none of them can be produced away from the goods. (Fieldname says 'pickup' for history; it governs the whole journey.)",
+   "fieldname": "allow_pickup_without_location",
+   "fieldtype": "Check",
+   "label": "Allow Pickup / Delivery Without Location"
   },
   {
    "fieldname": "performance_section",
@@ -215,7 +224,7 @@
   },
   {
    "default": "300",
-   "description": "Fixed-window duration for per-token public tracking throttling (10–3600 seconds).",
+   "description": "Fixed-window duration for per-token public tracking throttling (10\u20133600 seconds).",
    "fieldname": "public_tracking_window_seconds",
    "fieldtype": "Int",
    "label": "Public Tracking Window (seconds)",
@@ -314,6 +323,13 @@
    "fieldtype": "Int",
    "label": "Delivery OTP Attempts Per Minute",
    "non_negative": 1
+  },
+  {
+   "default": "120",
+   "description": "How long a driver must wait before asking for another delivery OTP. A code takes time to arrive by SMS or email; tapping Send again immediately only invalidates the one already on its way to the receiver. The driver app counts this down on the button.",
+   "fieldname": "delivery_otp_resend_seconds",
+   "fieldtype": "Int",
+   "label": "Delivery OTP Resend Wait (seconds)"
   },
   {
    "default": "300",
@@ -504,7 +520,7 @@
    "read_only": 1
   },
   {
-   "description": "Role → function mapping for every logistics gate (manifest stage transitions, ops console, overrides, digests). Rows here OVERRIDE the shipped defaults for that function; leave a function unlisted to keep its default. Defaults are seeded on migrate and can be edited or deleted freely.",
+   "description": "Role \u2192 function mapping for every logistics gate (manifest stage transitions, ops console, overrides, digests). Rows here OVERRIDE the shipped defaults for that function; leave a function unlisted to keep its default. Defaults are seeded on migrate and can be edited or deleted freely.",
    "fieldname": "role_matrix",
    "fieldtype": "Table",
    "label": "Role Matrix",

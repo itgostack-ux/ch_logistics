@@ -95,8 +95,14 @@ function render_status_badge(frm) {
         "Recall Initiated": "red", "Returned": "gray",
         "Cancelled": "red",
     };
-    const display_label = frm.doc.status === "Draft" ? __("New") : __(frm.doc.status);
-    frm.page.set_indicator(frm.doc.status, colors[frm.doc.status] || "gray");
+    // Display only: the stored status is untouched, so filters, reports and
+    // the API keep working off "Packed". On the form it reads the way the
+    // list and the control tower read it — a submitted manifest is paperwork
+    // waiting for a trip, not boxes being packed (that is the Stock Entry's
+    // own "Packed", one document down).
+    const labels = { "Draft": __("New"), "Packed": __("Manifest Created") };
+    const display_label = labels[frm.doc.status] || __(frm.doc.status);
+    frm.page.set_indicator(display_label, colors[frm.doc.status] || "gray");
 
     if (frm.doc.driver_name) {
         frm.dashboard.set_headline(
@@ -148,6 +154,27 @@ function add_action_buttons(frm) {
             () => show_manifest_cancel_dialog(frm, api),
             __("Actions")
         );
+    }
+
+    // Undoing the GROUPING rather than the dispatch: the boxes stay packed
+    // and the stock stays in transit — the shipments simply go back to
+    // Packed Orders for a different manifest. "Cancel & Return Stock" above
+    // is the other answer, for when the dispatch itself was wrong.
+    const undoAllowed = ["Draft", "Packed"];
+    if (!frm.is_new() && undoAllowed.includes(frm.doc.status)
+        && !frm.doc.pickup_datetime && !frm.doc.trip) {
+        frm.add_custom_button(
+            __("Cancel Manifest"),
+            () => show_manifest_release_dialog(frm),
+            __("Actions")
+        );
+        if ((frm.doc.transfers || []).length > 1) {
+            frm.add_custom_button(
+                __("Remove Shipment"),
+                () => show_remove_shipment_dialog(frm),
+                __("Actions")
+            );
+        }
     }
 
     if (frm.doc.docstatus !== 1) return;
@@ -527,6 +554,143 @@ function capture_gps(callback) {
 }
 
 // ── Recall / Return Dialogs ──────────────────────────────────────────────────
+
+// ── Undoing the grouping (see the two buttons under Actions) ────────────
+// Shared wording with the Logistics Control Tower, which offers the same two
+// actions on its Unassigned Manifests list; both call the same endpoints.
+const CH_MF_API = "ch_logistics.api.transfer_manifest_api.";
+
+// Why a shipment comes off a manifest, and why a manifest is undone. Fixed
+// lists for the same reason CH Manifest Rejection and the trip cancellation
+// have them: free text came back as forty spellings of the same handful of
+// causes, and nobody could count how often a shipment was simply hung on the
+// wrong manifest. The same two lists are offered in the Logistics Control Tower.
+const CH_MF_REMOVE_REASONS = [
+	"Wrongly Attached to This Manifest",
+	"Wrong Destination",
+	"Goods Not Ready",
+	"Damaged Package",
+	"Moving to Another Trip",
+	"Dispatch Deferred",
+	"Other",
+];
+const CH_MF_CANCEL_REASONS = [
+	"Manifest Created by Mistake",
+	"Duplicate Manifest",
+	"Wrong Destination",
+	"Goods Not Ready",
+	"Re-packing Required",
+	"Dispatch Deferred",
+	"Other",
+];
+
+// The chosen cause with whatever was typed beside it, so the audit line on
+// the manifest and the Stock Entry reads as one sentence.
+function ch_mf_reason_text(values) {
+	const cause = (values.reason_code || "").trim();
+	const notes = (values.reason_notes || "").trim();
+	return notes ? `${cause} — ${notes}` : cause;
+}
+
+function ch_mf_reason_fields(options) {
+	return [
+		{
+			fieldtype: "Select", fieldname: "reason_code", label: __("Reason"),
+			options: options.join("\n"), reqd: 1,
+		},
+		{
+			fieldtype: "Small Text", fieldname: "reason_notes", label: __("Details"),
+			description: __("Anything the next person needs to know. Required when the reason is Other."),
+			mandatory_depends_on: "eval:doc.reason_code == 'Other'",
+		},
+	];
+}
+
+
+function show_manifest_release_dialog(frm) {
+    const d = new frappe.ui.Dialog({
+        title: __("Cancel manifest {0}", [frm.doc.name]),
+        fields: [
+            {
+                fieldtype: "HTML",
+                options: `<div class="alert alert-warning">${__(
+                    "Every shipment goes back to Packed Orders, ready to be put on a different manifest. "
+                    + "Nothing is unpacked and no stock moves — the goods stay in the transit warehouse. "
+                    + "To send them back to the source instead, use Cancel &amp; Return Stock."
+                )}</div>`,
+            },
+            ...ch_mf_reason_fields(CH_MF_CANCEL_REASONS),
+        ],
+        primary_action_label: __("Cancel Manifest"),
+        primary_action: (vals) => {
+            d.hide();
+            frappe.call({
+                method: CH_MF_API + "release_manifest",
+                args: { manifest: frm.doc.name, reason: ch_mf_reason_text(vals) },
+                freeze: true,
+                freeze_message: __("Returning shipments to Packed Orders…"),
+            }).then((r) => {
+                frappe.show_alert({
+                    message: (r && r.message && r.message.message) || __("Manifest cancelled"),
+                    indicator: "orange",
+                }, 6);
+                frm.reload_doc();
+            });
+        },
+    });
+    d.show();
+}
+
+function show_remove_shipment_dialog(frm) {
+    const esc = frappe.utils.escape_html;
+    const rows = frm.doc.transfers || [];
+    const d = new frappe.ui.Dialog({
+        title: __("Remove a shipment from {0}", [frm.doc.name]),
+        size: "large",
+        fields: [{ fieldtype: "HTML", fieldname: "list" }],
+    });
+    d.fields_dict.list.$wrapper.html(`
+        <p class="text-muted small">${__(
+            "The shipment comes off this manifest and goes back to Packed Orders on its own. "
+            + "The last one cannot be removed — cancel the manifest instead."
+        )}</p>
+        <table class="table table-bordered table-condensed">
+            <thead><tr><th>${__("Transfer")}</th><th>${__("Route")}</th>
+                <th class="text-right">${__("Qty")}</th><th></th></tr></thead>
+            <tbody>${rows.map((x) => `<tr>
+                <td><a href="/app/stock-entry/${encodeURIComponent(x.stock_entry)}" target="_blank">${esc(x.stock_entry || "")}</a></td>
+                <td class="text-muted small">${esc(x.from_warehouse || "—")} → ${esc(x.to_warehouse || "—")}</td>
+                <td class="text-right">${flt(x.total_qty) || 0}</td>
+                <td class="text-right"><button class="btn btn-xs btn-danger ch-mf-drop"
+                    data-se="${esc(x.stock_entry || "")}" ${rows.length < 2 ? "disabled" : ""}>
+                    ${__("Remove")}</button></td>
+            </tr>`).join("")}</tbody>
+        </table>`);
+    d.$wrapper.find(".ch-mf-drop").on("click", (e) => {
+        const stock_entry = $(e.currentTarget).data("se");
+        frappe.prompt(
+            ch_mf_reason_fields(CH_MF_REMOVE_REASONS),
+            (vals) => {
+                d.hide();
+                frappe.call({
+                    method: CH_MF_API + "remove_transfer_from_manifest",
+                    args: { manifest: frm.doc.name, stock_entry, reason: ch_mf_reason_text(vals) },
+                    freeze: true,
+                    freeze_message: __("Removing the shipment…"),
+                }).then((res) => {
+                    frappe.show_alert({
+                        message: (res && res.message && res.message.message) || __("Shipment removed"),
+                        indicator: "orange",
+                    }, 6);
+                    frm.reload_doc();
+                });
+            },
+            __("Remove {0}", [stock_entry]),
+            __("Remove")
+        );
+    });
+    d.show();
+}
 
 function show_manifest_cancel_dialog(frm, api) {
     const d = new frappe.ui.Dialog({

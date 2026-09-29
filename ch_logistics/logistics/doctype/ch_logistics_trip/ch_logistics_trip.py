@@ -1,9 +1,11 @@
+import re
 from collections import Counter
 
 import frappe
 from frappe import _
 from frappe.model.document import Document
-from frappe.utils import get_datetime, now_datetime
+from frappe.model.naming import make_autoname
+from frappe.utils import get_datetime, getdate, now_datetime, nowdate
 
 # Status machine -----------------------------------------------------------
 # Draft → Assigned → Started → Completed → Closed
@@ -51,6 +53,34 @@ _TRIP_VEHICLE_CONFLICT_STATUSES = {"Draft", "Assigned", "Started"}
 
 
 class CHLogisticsTrip(Document):
+    def autoname(self):
+        """Name a trip the way every other document here is named.
+
+        ``TRIP-2026-00128`` said nothing about whose trip it was, and it sat
+        beside GFTNMT26000381 and GFTNPO26000412 on the same screens. This
+        follows the house series instead: the company's abbreviation, TP for
+        trip, the two-digit year of the trip date, and a six-digit sequence
+        that restarts per company per year — GOFIX's first trip of 2026 is
+        GFTP26000001.
+
+        No state code, unlike the GST document series: a trip is internal
+        movement, not a registration-bound document.
+
+        Trips already named under the old series keep their names — a trip
+        is referenced by manifests, stop tokens, e-way bills and audit
+        comments, none of which would follow a rename. Frappe falls back to
+        the naming_series field if this returns without setting a name.
+        """
+        company = (self.company or "").strip()
+        if not company:
+            return
+        abbr = frappe.db.get_value("Company", company, "abbr") or ""
+        abbr = re.sub(r"[^A-Z0-9]", "", abbr.upper())[:2]
+        if not abbr:
+            return
+        year = getdate(self.trip_date or nowdate()).strftime("%y")
+        self.name = make_autoname(f"{abbr}TP{year}.######", doc=self)
+
     def validate(self):
         self._validate_stops()
         self._validate_planned_times()
@@ -533,6 +563,10 @@ class CHLogisticsTrip(Document):
                 frappe.throw(
                     _("Cannot transition Trip status from {0} to {1}").format(
                         previous.status, self.status))
+            # A courier trip never reaches "Started" — ops moves it by hand —
+            # but Picked Up means the same thing: the goods are now moving.
+            if self.status in ("Picked Up", "Delivery Pending", "Delivered"):
+                self._reject_trip_without_shipments()
             return
         if (
             previous.status == "Started"
@@ -546,7 +580,34 @@ class CHLogisticsTrip(Document):
                 _("Cannot transition Trip status from {0} to {1}").format(previous.status, self.status)
             )
         if self.status == "Started":
+            self._reject_trip_without_shipments()
             self._reject_stops_without_shipments()
+
+    def _reject_trip_without_shipments(self):
+        """A trip with no manifest on it cannot start.
+
+        Unlike an empty STOP — which is a planning wrinkle a dispatcher may
+        knowingly override — a trip carrying nothing at all is never a real
+        run: there is nothing to pick up, nothing to deliver, and the driver
+        is sent out empty. It also pollutes the board, where such trips sit in
+        Started forever because no delivery can ever complete them. No
+        override: attach a manifest, or leave the trip where it is.
+        """
+        attached = frappe.db.count(
+            "CH Transfer Manifest",
+            {"trip": self.name, "docstatus": ("<", 2),
+             "status": ("not in", ("Cancelled", "Returned"))},
+        )
+        if attached:
+            return
+        frappe.throw(
+            _(
+                "Trip {0} has no shipment attached. Attach at least one manifest "
+                "before starting it — a trip with nothing on it cannot be picked "
+                "up or delivered."
+            ).format(self.name),
+            title=_("Nothing To Carry"),
+        )
 
     def empty_stop_sequences(self) -> list[str]:
         """Sequence numbers of stops with zero attached shipments, or [] if

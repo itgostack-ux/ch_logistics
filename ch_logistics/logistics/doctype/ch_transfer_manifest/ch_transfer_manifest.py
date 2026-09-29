@@ -13,6 +13,7 @@ import secrets
 import frappe
 from frappe import _
 from frappe.model.document import Document
+from frappe.model.naming import make_autoname
 from frappe.utils import (
     add_to_date,
     cint,
@@ -103,6 +104,35 @@ def store_for_warehouse(warehouse: str | None) -> str | None:
 
 
 class CHTransferManifest(Document):
+
+    def autoname(self):
+        """Name a manifest the way every other document here is named.
+
+        ``TM-2026-00146`` said nothing about whose manifest it was, and it
+        sat beside GFTNMT26000381 and GFTP26000001 on the same screens. This
+        follows the house series: the company's abbreviation, MF for
+        manifest, the two-digit year of the manifest date, and a six-digit
+        sequence that restarts per company per year — GOFIX's first manifest
+        of 2026 is GFMF26000001.
+
+        No state code, unlike the GST document series: a manifest is a
+        packing and dispatch record, not a registration-bound document.
+
+        Manifests already named under the old series keep their names — a
+        manifest is referenced by trips, stock entries, e-way bills, QR
+        tokens and audit comments, none of which would follow a rename.
+        Frappe falls back to the naming_series field when this returns
+        without setting one.
+        """
+        company = (self.company or "").strip()
+        if not company:
+            return
+        abbr = frappe.db.get_value("Company", company, "abbr") or ""
+        abbr = re.sub(r"[^A-Z0-9]", "", abbr.upper())[:2]
+        if not abbr:
+            return
+        year = getdate(self.manifest_date or nowdate()).strftime("%y")
+        self.name = make_autoname(f"{abbr}MF{year}.######", doc=self)
 
     _SERVER_MANAGED_FIELDS = frozenset({
         "status", "trip", "driver", "driver_name", "driver_phone",
@@ -1071,7 +1101,8 @@ class CHTransferManifest(Document):
             )
 
     def start_pickup(self, pickup_photo, lat=None, lng=None, notes=None, scanned_qr=None,
-                     gps_accuracy_m=None, geofence_override_reason=None):
+                     gps_accuracy_m=None, geofence_override_reason=None,
+                     no_location_reason=None):
         lock_key = f"manifest_status_{frappe.scrub(self.name)}"
         lock_result = frappe.db.sql("SELECT GET_LOCK(%s, 10)", (lock_key,))[0][0]
         if not lock_result:
@@ -1090,7 +1121,8 @@ class CHTransferManifest(Document):
             # Mandatory driver GPS at pickup location (proof of presence).
             lat_f, lng_f = self._validate_geo(lat, lng, kind="pickup",
                                               accuracy_m=gps_accuracy_m,
-                                              override_reason=geofence_override_reason)
+                                              override_reason=geofence_override_reason,
+                                              no_location_reason=no_location_reason)
             self._apply_pickup_in_transit_transition(pickup_photo, lat_f, lng_f, notes)
         finally:
             frappe.db.sql("SELECT RELEASE_LOCK(%s)", (lock_key,))
@@ -1108,8 +1140,14 @@ class CHTransferManifest(Document):
         """
         self.pickup_photo = pickup_photo
         self.pickup_datetime = now_datetime()
-        self.pickup_lat = lat_f
-        self.pickup_lng = lng_f
+        # Same reason as the per-leg capture in logistics_api: these are Float
+        # columns and Frappe makes them NOT NULL, so a pickup taken with no
+        # location (Allow Pickup Without Location) leaves them at their zero
+        # default rather than trying to store None. The comment written by
+        # _validate_geo_for is what records that nothing was captured.
+        if lat_f is not None and lng_f is not None:
+            self.pickup_lat = lat_f
+            self.pickup_lng = lng_f
         self.pickup_notes = notes
         # Reset any prior arrival capture so a re-picked manifest forces a
         # fresh "Reached Location" tap before delivery can be completed.
@@ -1292,7 +1330,8 @@ class CHTransferManifest(Document):
             return token, True
         return token, False
 
-    def _validate_geo(self, lat, lng, kind: str, accuracy_m=None, override_reason=None):
+    def _validate_geo(self, lat, lng, kind: str, accuracy_m=None, override_reason=None,
+                      no_location_reason=None):
         """Mandatory driver-location proof for pickup/delivery, checked against
         the manifest header's own source/destination warehouse.
 
@@ -1303,9 +1342,11 @@ class CHTransferManifest(Document):
         place = (self.source_store or self.source_warehouse) if kind == "pickup" \
             else (self.destination_store or self.destination_warehouse)
         return self._validate_geo_for(target_wh, place, lat, lng, kind,
-                                      accuracy_m=accuracy_m, override_reason=override_reason)
+                                      accuracy_m=accuracy_m, override_reason=override_reason,
+                                      no_location_reason=no_location_reason)
 
-    def _validate_geo_for(self, target_wh, place, lat, lng, kind: str, accuracy_m=None, override_reason=None):
+    def _validate_geo_for(self, target_wh, place, lat, lng, kind: str, accuracy_m=None,
+                          override_reason=None, no_location_reason=None):
         """Mandatory driver-location proof for pickup/delivery at an EXPLICIT
         location — lets a caller check a single Stock Entry leg's own
         from/to warehouse instead of always the manifest header's one
@@ -1327,6 +1368,28 @@ class CHTransferManifest(Document):
         except (TypeError, ValueError):
             lat_f = lng_f = None
         if lat_f is None or lng_f is None:
+            # Some phones cannot produce a fix at all — no GPS hardware, a
+            # blocked permission the driver cannot change, or a browser that
+            # withholds geolocation. CH Logistics Settings -> Allow Pickup /
+            # Delivery Without Location opens one door for exactly that, at
+            # every leg of the journey: the driver names a reason and it is
+            # written onto the
+            # manifest, so the gap is visible in the audit trail instead of
+            # being an untraceable blank. Photo and box-QR scan are still
+            # mandatory — the scan is the stronger proof of presence anyway,
+            # since a box label cannot be scanned unless it is in the
+            # driver's hands.
+            if str(no_location_reason or "").strip() and cint(
+                frappe.db.get_single_value("CH Logistics Settings", "allow_pickup_without_location")
+            ):
+                self.add_comment(
+                    "Comment",
+                    _("No location captured at {0} for {1}: {2} — accepted by {3} "
+                      "under Allow Pickup Without Location.").format(
+                        label, place or target_wh or self.name,
+                        str(no_location_reason).strip()[:300], frappe.session.user),
+                )
+                return None, None
             frappe.throw(_("Driver location (latitude & longitude) is mandatory at {0}. "
                            "Enable location on the device and retry.").format(label),
                          title=_("Location Required"))
@@ -1696,7 +1759,8 @@ class CHTransferManifest(Document):
                              message=frappe.get_traceback())
 
     def mark_reached_destination(self, lat, lng, gps_accuracy_m=None,
-                                 geofence_override_reason=None):
+                                 geofence_override_reason=None,
+                                 no_location_reason=None):
         """Driver taps 'Reached Location' when they arrive at the receiver.
 
         Operationally this is the arrival-geofence ping used by every major
@@ -1726,7 +1790,8 @@ class CHTransferManifest(Document):
                              title=_("Schema Mismatch"))
             lat_f, lng_f = self._validate_geo(lat, lng, kind="arrival",
                                               accuracy_m=gps_accuracy_m,
-                                              override_reason=geofence_override_reason)
+                                              override_reason=geofence_override_reason,
+                                              no_location_reason=no_location_reason)
             self.arrival_datetime = now_datetime()
             self.arrival_lat = lat_f
             self.arrival_lng = lng_f
@@ -1811,7 +1876,8 @@ class CHTransferManifest(Document):
     def complete_delivery(self, delivery_photo, receiver_name, otp=None,
                           lat=None, lng=None, scanned_qr=None,
                           otp_preverified=False, seal_numbers=None,
-                          gps_accuracy_m=None, geofence_override_reason=None):
+                          gps_accuracy_m=None, geofence_override_reason=None,
+                          no_location_reason=None):
         lock_key = f"manifest_status_{frappe.scrub(self.name)}"
         lock_result = frappe.db.sql("SELECT GET_LOCK(%s, 10)", (lock_key,))[0][0]
         if not lock_result:
@@ -1844,7 +1910,8 @@ class CHTransferManifest(Document):
             # Mandatory driver GPS at the receiver's doorstep (proof of presence).
             lat_f, lng_f = self._validate_geo(lat, lng, kind="delivery",
                                               accuracy_m=gps_accuracy_m,
-                                              override_reason=geofence_override_reason)
+                                              override_reason=geofence_override_reason,
+                                              no_location_reason=no_location_reason)
             # OTP verification is auditable. The active digest remains hashed
             # at rest; the linked log retains generation, dispatch, attempts,
             # expiry and verifier evidence after this one-time digest is cleared.

@@ -329,3 +329,216 @@ def list_rejections(status: str | None = None, driver: str | None = None,
 			)
 		)
 	]
+
+
+# ── Review: what dispatch does with a driver's refusal ──────────────────────
+#
+# A rejection lands as "Pending Review" with the goods already reversed back
+# to the source warehouse and the Stock Entry resting at "Rejected" — see
+# CHTransferManifest.reject_manifest. Until now nothing could act on that
+# queue: the shipment simply stopped, off the driver's list and out of the
+# dispatch pool at the same time.
+#
+# There are two honest answers to a driver saying no, and both end with the
+# goods back in the transit warehouse where a packed shipment belongs:
+#
+#   approve — dispatch agrees. The shipment leaves this driver and goes back
+#             to Unassigned Manifests as Packed, ready for a different trip.
+#   ignore  — dispatch overrules. The same shipment returns to the same
+#             driver's Pickup Pending list, with the reviewer's note on it.
+#
+# Terminal review states reuse the rejection's own vocabulary, and both are
+# already excluded by the "an active rejection already exists" guard above,
+# so a resolved shipment can be rejected again later on its next attempt.
+
+REVIEW_APPROVED = "Reassigned"
+REVIEW_OVERRULED = "Closed"
+
+
+@frappe.whitelist()
+def rejection_inbox(company: str | None = None, limit: int = 200) -> list[dict]:
+	"""Driver rejections still waiting for a decision, newest first."""
+	from ch_logistics import roles as role_registry
+	from ch_logistics import scope_guard
+
+	role_registry.require("ops_view")
+	rows = frappe.get_all(
+		"CH Manifest Rejection",
+		filters={"docstatus": 1, "status": ("not in", [REVIEW_APPROVED, REVIEW_OVERRULED])},
+		fields=["name", "manifest", "trip", "driver", "rejection_reason", "remarks",
+				"proof_image_1", "proof_image_2", "rejected_on", "rejected_by", "status"],
+		order_by="rejected_on desc",
+		limit=min(max(cint(limit), 1), 500),
+	)
+	if not rows:
+		return []
+
+	manifests = {
+		row.name: row
+		for row in frappe.get_all(
+			"CH Transfer Manifest",
+			filters={"name": ("in", [r.manifest for r in rows if r.manifest] or ["__none__"])},
+			fields=["name", "status", "company", "source_store", "source_warehouse",
+					"destination_store", "destination_warehouse", "total_stock_entries",
+					"total_qty", "driver_name"],
+		)
+	}
+	out = []
+	for row in rows:
+		manifest = manifests.get(row.manifest)
+		if not manifest:
+			continue
+		if company and manifest.company != company:
+			continue
+		in_scope = scope_guard.is_in_scope(
+			store=manifest.source_store, warehouse=manifest.source_warehouse,
+			company=manifest.company,
+		) or scope_guard.is_in_scope(
+			store=manifest.destination_store, warehouse=manifest.destination_warehouse,
+			company=manifest.company,
+		)
+		if not in_scope:
+			continue
+		row.update({
+			"manifest_status": manifest.status,
+			"company": manifest.company,
+			"driver_name": manifest.driver_name,
+			"source": manifest.source_store or manifest.source_warehouse,
+			"destination": manifest.destination_store or manifest.destination_warehouse,
+			"shipments": manifest.total_stock_entries,
+			"qty": manifest.total_qty,
+			"stock_entries": frappe.get_all(
+				"CH Transfer Manifest Item",
+				filters={"parent": row.manifest}, pluck="stock_entry"),
+		})
+		out.append(row)
+	return out
+
+
+def _put_the_goods_back(manifest_doc, target_status: str, note: str) -> list[str]:
+	"""Move a rejected shipment's stock back into the transit warehouse.
+
+	The rejection reversed it to the source warehouse, so sending it out
+	again — to this driver or another one — is a real movement, not a status
+	flip. Mirrors what set_pending_qty does at Stock Outward: restore each
+	line's pending qty, move it to transit, then rest at the status the
+	manifest is about to take.
+	"""
+	from ch_erp15.ch_erp15.custom.stock_entry import (
+		_authorize_custom_state_transition,
+		insert_transit_entry,
+	)
+
+	moved = []
+	for row in manifest_doc.transfers:
+		if not row.stock_entry:
+			continue
+		doc = frappe.get_doc("Stock Entry", row.stock_entry)
+		if (doc.custom_status or "") != "Rejected":
+			continue
+		for item in doc.items:
+			item.custom_pending_qty = item.custom_quantity
+			if not item.custom_original_serials:
+				item.custom_original_serials = item.serial_no
+			# The reversal wipes the packing counters along with the stock
+			# movement, but nothing was physically unpacked — the driver
+			# simply refused to take the boxes. Putting them back is what
+			# makes the line "Ready For Pickup" true again; a Stock Entry at
+			# that status with a zero receive qty is refused outright by
+			# ch_erp15's own validation, and rightly so.
+			item.custom_receive_qty = item.custom_quantity
+			if not item.custom_scanned_serials:
+				item.custom_scanned_serials = item.custom_original_serials or item.serial_no
+		_authorize_custom_state_transition(doc, force=True)
+		doc.flags.ignore_validate_update_after_submit = True
+		doc.save(ignore_permissions=True)
+		doc.reload()
+		insert_transit_entry(doc)
+		doc.custom_status = target_status
+		doc.custom_logistics_status = "Pending Pickup"
+		_authorize_custom_state_transition(doc, force=True)
+		doc.flags.ignore_validate_update_after_submit = True
+		doc.save(ignore_permissions=True)
+		doc.add_comment("Comment", note)
+		moved.append(doc.name)
+	return moved
+
+
+def _review(rejection: str, notes: str | None, approve: bool) -> dict:
+	from ch_logistics import roles as role_registry
+
+	role_registry.require("ops_control", _("review driver rejections"))
+	notes = str(notes or "").strip()[:1000]
+	doc = frappe.get_doc("CH Manifest Rejection", rejection)
+	if doc.docstatus != 1:
+		frappe.throw(_("Only a submitted rejection can be reviewed."))
+	if doc.status in (REVIEW_APPROVED, REVIEW_OVERRULED):
+		frappe.throw(_("This rejection has already been dealt with ({0}).").format(doc.status))
+
+	frappe.db.sql(
+		"SELECT name FROM `tabCH Transfer Manifest` WHERE name = %s FOR UPDATE",
+		(doc.manifest,),
+	)
+	manifest = frappe.get_doc("CH Transfer Manifest", doc.manifest)
+	if manifest.status != "Rejected":
+		frappe.throw(
+			_("Manifest {0} is {1}, not Rejected — nothing to send back.").format(
+				manifest.name, manifest.status),
+		)
+
+	who = frappe.session.user
+	if approve:
+		note = _("Rejection accepted by {0}: back to the dispatch pool. {1}").format(who, notes)
+		moved = _put_the_goods_back(manifest, "Ready For Pickup", note)
+		payload = {
+			"status": "Packed",
+			"trip": None,
+			"driver": None,
+			"driver_name": None,
+			"driver_phone": None,
+		}
+		if manifest.meta.has_field("stop_sequence"):
+			payload["stop_sequence"] = 0
+		frappe.db.set_value("CH Transfer Manifest", manifest.name, payload)
+		review_status, action = REVIEW_APPROVED, _("Approved — returned to Packed")
+	else:
+		note = _("Rejection overruled by {0}: back to {1}. {2}").format(
+			who, manifest.driver_name or manifest.driver or _("the driver"), notes)
+		moved = _put_the_goods_back(manifest, "Assigned", note)
+		frappe.db.set_value("CH Transfer Manifest", manifest.name, {"status": "Assigned"})
+		review_status, action = REVIEW_OVERRULED, _("Ignored — returned to the driver")
+
+	manifest.reload()
+	manifest.add_comment("Comment", note)
+	try:
+		manifest._sync_driver_state_after_action()
+	except Exception:
+		frappe.log_error(title=f"driver state sync failed after review of {rejection}",
+						 message=frappe.get_traceback())
+
+	doc.db_set({
+		"status": review_status,
+		"resolution_action": f"{action}. {notes}".strip(),
+		"resolved_on": frappe.utils.now_datetime(),
+	}, update_modified=False)
+	doc.add_comment("Comment", note)
+	return {
+		"ok": True,
+		"rejection": doc.name,
+		"manifest": manifest.name,
+		"manifest_status": manifest.status,
+		"stock_entries": moved,
+		"review_status": review_status,
+	}
+
+
+@frappe.whitelist(methods=["POST"])
+def rejection_approve(rejection: str, notes: str | None = None) -> dict:
+	"""Dispatch agrees with the driver: the shipment goes back to the pool."""
+	return _review(rejection, notes, approve=True)
+
+
+@frappe.whitelist(methods=["POST"])
+def rejection_ignore(rejection: str, notes: str | None = None) -> dict:
+	"""Dispatch overrules the driver: the shipment goes back to their list."""
+	return _review(rejection, notes, approve=False)

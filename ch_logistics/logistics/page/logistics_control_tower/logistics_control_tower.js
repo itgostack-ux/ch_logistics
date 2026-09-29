@@ -11,7 +11,85 @@
  */
 
 const _LCC = "ch_logistics.api.logistics_api.";
+
+// Why a trip is called off before it leaves. Typed reasons came back as
+// "driver", "not needed", "wrongly attached" and forty other spellings of
+// the same handful of causes, which is unreadable as a set — nobody could
+// say how often a trip dies because a manifest was hung on the wrong one.
+// Same shape as CH Manifest Rejection's own reason list: a fixed list
+// ending in Other, with the details typed beside it.
+const LCC_TRIP_CANCEL_REASONS = [
+    "Manifest Wrongly Attached",
+    "Trip Created by Mistake",
+    "Duplicate Trip",
+    "Driver Unavailable",
+    "Vehicle Unavailable / Breakdown",
+    "Consignment Not Ready",
+    "Wrong Route / Wrong Hub",
+    "Destination Store Closed",
+    "Rescheduled to Another Day",
+    "Merged into Another Trip",
+    "Other",
+];
+
+// What is written to the trip's cancellation_reason: the chosen cause, with
+// whatever was typed beside it, so the audit line reads as one sentence.
+function lcc_trip_cancel_reason(values) {
+    const cause = (values.reason_code || "").trim();
+    const notes = (values.reason_notes || "").trim();
+    if (!cause) return "";
+    return notes ? `${cause} — ${notes}` : cause;
+}
 const _OPT = "ch_logistics.api.optimizer.";
+const _REJ = "ch_logistics.api.rejection_api.";
+const _TMA = "ch_logistics.api.transfer_manifest_api.";
+
+// Why a shipment comes off a manifest, and why a manifest is undone. Fixed
+// lists for the same reason CH Manifest Rejection and the trip cancellation
+// have them: free text came back as forty spellings of the same handful of
+// causes, and nobody could count how often a shipment was simply hung on the
+// wrong manifest. The same two lists are offered in the CH Transfer Manifest form.
+const CH_MF_REMOVE_REASONS = [
+	"Wrongly Attached to This Manifest",
+	"Wrong Destination",
+	"Goods Not Ready",
+	"Damaged Package",
+	"Moving to Another Trip",
+	"Dispatch Deferred",
+	"Other",
+];
+const CH_MF_CANCEL_REASONS = [
+	"Manifest Created by Mistake",
+	"Duplicate Manifest",
+	"Wrong Destination",
+	"Goods Not Ready",
+	"Re-packing Required",
+	"Dispatch Deferred",
+	"Other",
+];
+
+// The chosen cause with whatever was typed beside it, so the audit line on
+// the manifest and the Stock Entry reads as one sentence.
+function ch_mf_reason_text(values) {
+	const cause = (values.reason_code || "").trim();
+	const notes = (values.reason_notes || "").trim();
+	return notes ? `${cause} — ${notes}` : cause;
+}
+
+function ch_mf_reason_fields(options) {
+	return [
+		{
+			fieldtype: "Select", fieldname: "reason_code", label: __("Reason"),
+			options: options.join("\n"), reqd: 1,
+		},
+		{
+			fieldtype: "Small Text", fieldname: "reason_notes", label: __("Details"),
+			description: __("Anything the next person needs to know. Required when the reason is Other."),
+			mandatory_depends_on: "eval:doc.reason_code == 'Other'",
+		},
+	];
+}
+
 
 frappe.pages["logistics-control-tower"].on_page_load = function (wrapper) {
 	const page = frappe.ui.make_app_page({
@@ -66,9 +144,10 @@ class LogisticsCommandCenter {
 		this.bottom_tab = "manifests";
 		this.board = { buckets: {}, totals: {} };
 		this.unassigned = [];
-		this.exceptions = [];
 		this.drivers = [];
 		this.recalls = [];
+		// Driver refusals waiting for a decision — see rejection_api.
+		this.rejections = [];
 		this.selected_manifests = new Set();
 		this.active_trip = null;
 		this._leaflet_loading = null;
@@ -710,7 +789,7 @@ class LogisticsCommandCenter {
 		this.dp_state = { start: 0, page_length: 10, sort_field: "creation", sort_order: "desc" };
 		const hint = status === "Draft"
 			? __("Showing Material Transfers still in Draft — not yet packed. Click a column heading to sort.")
-			: __("Showing Material Transfers Pending With Goods — not yet packed. Click a column heading to sort.");
+			: __("Showing Material Transfers at Stock Outward — not yet packed. Click a column heading to sort.");
 		$("#lcc-content").html(`
 			<div class="lcc-pack" id="lcc-draft-pending">
 				<div class="lcc-ops-bar">
@@ -809,7 +888,7 @@ class LogisticsCommandCenter {
 		const $b = $("#lcc-dp-body");
 		const $p = $("#lcc-dp-pagination");
 		if (!(this.draft_pending_queue || []).length) {
-			$b.html(`<div class="lcc-empty"><i class="fa fa-check-circle"></i> ${__("No Draft or Pending With Goods Stock Entries.")}</div>`);
+			$b.html(`<div class="lcc-empty"><i class="fa fa-check-circle"></i> ${__("No Draft or Stock Outward Transfer Requests.")}</div>`);
 			$p.html("");
 			return;
 		}
@@ -919,6 +998,9 @@ class LogisticsCommandCenter {
 						<button class="btn btn-xs btn-primary lcc-pack-create-manifest-btn" disabled>
 							<i class="fa fa-plus"></i> ${__("Create Manifest")}
 						</button>
+						<input type="search" class="form-control input-xs lcc-pack-search"
+							style="width:220px;display:inline-block;margin-left:8px"
+							placeholder="${__("Search order, store or warehouse…")}">
 					</div>
 					<span class="lcc-muted lcc-ops-bar-hint">
 						<i class="fa fa-info-circle"></i>
@@ -933,6 +1015,14 @@ class LogisticsCommandCenter {
 		if (!this._pack_events_bound) {
 			const $r = this.$root;
 			$r.on("click", ".lcc-pack-refresh-btn",         () => this._pack_load());
+			$r.on("input", ".lcc-pack-search", frappe.utils.debounce((e) => {
+				this.pack_search = e.target.value || "";
+				this._pages = this._pages || {};
+				this._pages["packed"] = 1;
+				// Only #lcc-pack-body is redrawn — the box lives in the bar
+				// above it, so the cursor stays where the typing left it.
+				this._pack_render();
+			}, 200));
 			$r.on("click", ".lcc-pack-create-manifest-btn", () => this._pack_create_manifest());
 			$r.on("change", ".lcc-pack-select-all", (e) => {
 				$r.find(".lcc-pack-row-check").prop("checked", e.currentTarget.checked);
@@ -960,13 +1050,33 @@ class LogisticsCommandCenter {
 		}
 	}
 
+	// What the search box matches: the order id first, since that is what
+	// somebody reads off a box, plus both warehouses — by their raw names
+	// AND by the store labels the table actually shows, so typing what is
+	// on screen finds the row.
+	_pack_matches(se, needle) {
+		if (!needle) return true;
+		const label = (wh) => (window.ch_wh_label ? ch_wh_label(wh) : wh);
+		return [se.name, se.from_warehouse, se.to_warehouse,
+			label(se.from_warehouse), label(se.to_warehouse)]
+			.some((v) => String(v || "").toLowerCase().includes(needle));
+	}
+
 	_pack_render() {
 		const $b = $("#lcc-pack-body");
 		if (!(this.pack_queue || []).length) {
 			$b.html(`<div class="lcc-empty"><i class="fa fa-check-circle"></i> ${__("No fully Packed Stock Entries waiting to be grouped into a manifest.")}</div>`);
 			return;
 		}
-		const rows = this.pack_queue.map((se) => {
+		const needle = String(this.pack_search || "").trim().toLowerCase();
+		const queue = this.pack_queue.filter((se) => this._pack_matches(se, needle));
+		if (!queue.length) {
+			$b.html(`<div class="lcc-empty"><i class="fa fa-search"></i> ${
+				__("No packed order matches “{0}”.", [frappe.utils.escape_html(needle)])}</div>`);
+			return;
+		}
+		const page = this._page_slice("packed", queue);
+		const rows = page.rows.map((se) => {
 			const nm = frappe.utils.escape_html(se.name);
 			const total_qty = Number(se.total_qty || 0);
 			const box_count = Number(se.box_count || 0);
@@ -1024,7 +1134,9 @@ class LogisticsCommandCenter {
 				</tr></thead>
 				<tbody>${rows}</tbody>
 			</table></div>
+			${this._pager_html("packed", page, queue.length)}
 		`);
+		this._bind_pager($b, "packed", () => this._pack_render());
 		this._pack_update_create_btn();
 	}
 
@@ -1165,9 +1277,9 @@ class LogisticsCommandCenter {
 						<i class="fa fa-undo"></i> ${__("Recalls")}
 						<span class="lcc-tab-badge lcc-tab-badge-warn" id="lcc-cnt-rec">0</span>
 					</button>
-					<button class="lcc-tab" data-tab="exceptions">
-						<i class="fa fa-exclamation-triangle"></i> ${__("Exception Inbox")}
-						<span class="lcc-tab-badge lcc-tab-badge-warn" id="lcc-cnt-exc">0</span>
+					<button class="lcc-tab" data-tab="rejections">
+						<i class="fa fa-ban"></i> ${__("Rejected")}
+						<span class="lcc-tab-badge lcc-tab-badge-warn" id="lcc-cnt-rej">0</span>
 					</button>
 					<button class="lcc-tab" data-tab="drivers">
 						<i class="fa fa-id-card"></i> ${__("Drivers")}
@@ -1205,7 +1317,18 @@ class LogisticsCommandCenter {
 			if (el && el.scrollIntoView) el.scrollIntoView({ behavior: "smooth", block: "start" });
 		});
 		$r.on("click",  ".lcc-new-trip-from-sel", () => this._ops_new_trip_from_selection());
-		$r.on("click",  ".lcc-bundle-print-qr",   () => this._ops_bundle_print_qr());
+		$r.on("click",  ".lcc-mf-cancel", (e) => {
+			e.preventDefault(); e.stopPropagation();
+			this._ops_cancel_manifest($(e.currentTarget).data("name"));
+		});
+		$r.on("click",  ".lcc-mf-shipments", (e) => {
+			e.preventDefault(); e.stopPropagation();
+			this._ops_manifest_shipments($(e.currentTarget).data("name"));
+		});
+		$r.on("click",  ".lcc-rej-approve", (e) =>
+			this._ops_review_rejection($(e.currentTarget).data("name"), true));
+		$r.on("click",  ".lcc-rej-ignore", (e) =>
+			this._ops_review_rejection($(e.currentTarget).data("name"), false));
 
 		$r.on("click", ".lcc-ops-tabs .lcc-tab", (e) => {
 			this.bottom_tab = $(e.currentTarget).data("tab");
@@ -1241,11 +1364,9 @@ class LogisticsCommandCenter {
 			this._ops_update_attach();
 		});
 		$r.on("click",  ".lcc-attach-btn",    () => this._ops_attach());
-		$r.on("click",  ".lcc-exc-resolve",   (e) => this._ops_resolve_exc($(e.currentTarget).data("trip"), $(e.currentTarget).data("row")));
 		$r.on("click",  "#lcc-side-assign",   () => this._ops_assign_driver());
 		$r.on("click",  "#lcc-side-start",    () => this._ops_start_trip());
 		$r.on("click",  "#lcc-side-complete", () => this._ops_trip_action("trip_complete"));
-		$r.on("click",  "#lcc-side-complete-override", () => this._ops_trip_action("trip_complete", _LCC, { override_exceptions: 1 }));
 		$r.on("click",  "#lcc-side-resequence", () => this._ops_trip_action("resequence_trip", _OPT));
 		$r.on("click",  "#lcc-side-close-trip",()=> this._ops_trip_action("trip_close"));
 		$r.on("click",  "#lcc-side-cancel",   () => this._ops_trip_action("trip_unassign"));
@@ -1271,20 +1392,23 @@ class LogisticsCommandCenter {
 		const args_board = { trip_date: this.trip_date, include_days: this.include_days };
 		if (co) args_board.company = co;
 
-		const [b, u, x, d, rc, lc] = await Promise.all([
+		// The exception inbox was dropped from this console, and with it the
+		// query behind it: a trip's own exceptions still show on its side
+		// panel, read from the board payload it already carries.
+		const [b, u, d, rc, lc, rj] = await Promise.all([
 			frappe.call({ method: _LCC + "ops_board",              args: args_board }),
-			frappe.call({ method: _LCC + "ops_unassigned_manifests", args: { limit: 100 } }),
-			frappe.call({ method: _LCC + "ops_exception_inbox",     args: { resolution_status: "Open", limit: 100 } }),
+			frappe.call({ method: _LCC + "ops_unassigned_manifests", args: { limit: 0 } }),
 			frappe.call({ method: _LCC + "ops_drivers_available" }),
 			frappe.call({ method: _LCC + "ops_recall_inbox",        args: { limit: 100 } }),
 			frappe.call({ method: _LCC + "ops_lifecycle_counts",    args: args_board }),
+			frappe.call({ method: _REJ + "rejection_inbox",         args: co ? { company: co } : {} }),
 		]);
 
 		this.board      = b.message || { buckets: {}, totals: {} };
 		this.unassigned = u.message || [];
-		this.exceptions = x.message || [];
 		this.drivers    = d.message || [];
 		this.recalls    = rc.message || [];
+		this.rejections = rj.message || [];
 		this.lifecycle  = lc.message || { stages: [] };
 		this.selected_manifests.clear();
 
@@ -1416,14 +1540,21 @@ class LogisticsCommandCenter {
 			const focus = this._ops_board_focus;
 			const dim = focus && !focus.includes(status) ? " is-dim" : "";
 			const hi  = focus &&  focus.includes(status) ? " is-focus" : "";
+			// A lane with 78 trips on it made the board a scrolling wall, so
+			// each lane pages like the tables do — the count in the header is
+			// still the whole lane.
+			const key = `board:${status}`;
+			const page = this._page_slice(key, trips);
 			const $col = $(`
 				<div class="lcc-ops-col${dim}${hi}">
 					<div class="lcc-ops-col-head lcc-ops-s-${status.toLowerCase().replace(/ /g,"-")}">
 						${__(status)} <span class="lcc-ops-col-cnt">${trips.length}</span>
 					</div>
 					<div class="lcc-ops-col-body"></div>
+					${this._pager_html(key, page, trips.length)}
 				</div>`).appendTo($board);
-			trips.forEach((t) => $col.find(".lcc-ops-col-body").append(this._trip_card(t)));
+			page.rows.forEach((t) => $col.find(".lcc-ops-col-body").append(this._trip_card(t)));
+			this._bind_pager($col, key, () => this._ops_render_board());
 		});
 	}
 
@@ -1449,18 +1580,59 @@ class LogisticsCommandCenter {
 	/* ── Bottom tabs ──────────────────────────────────────────── */
 
 	_ops_render_bottom() {
-		const exc_cnt = this.exceptions.length;
 		const rec_cnt = (this.recalls || []).length;
+		const rej_cnt = (this.rejections || []).length;
 		$("#lcc-cnt-mf").text(this.unassigned.length);
-		$("#lcc-cnt-exc").text(exc_cnt).toggleClass("has-items", exc_cnt > 0);
 		$("#lcc-cnt-rec").text(rec_cnt).toggleClass("has-items", rec_cnt > 0);
+		$("#lcc-cnt-rej").text(rej_cnt).toggleClass("has-items", rej_cnt > 0);
 		$("#lcc-cnt-drv").text(this.drivers.length);
 
 		const $b = $("#lcc-ops-bottom").empty();
 		if (this.bottom_tab === "manifests")  return this._ops_render_manifests($b);
 		if (this.bottom_tab === "recalls")    return this._ops_render_recalls($b);
-		if (this.bottom_tab === "exceptions") return this._ops_render_exceptions($b);
+		if (this.bottom_tab === "rejections") return this._ops_render_rejections($b);
 		if (this.bottom_tab === "drivers")    return this._ops_render_drivers($b);
+	}
+
+	// ── Paging ────────────────────────────────────────────────────
+	// Twenty rows at a time. The lists these serve have no server cap any
+	// more, so without paging a dispatcher scrolled past hundreds of rows —
+	// and with a cap, anything packed after it simply never appeared.
+	// Twenty rows suit a full-width table; a Kanban lane is a narrow column,
+	// so ten cards is as much as fits without scrolling the board.
+	_page_size(key) { return String(key).startsWith("board:") ? 10 : 20; }
+
+	_page_slice(key, list) {
+		this._pages = this._pages || {};
+		const size = this._page_size(key);
+		const pages = Math.max(Math.ceil(list.length / size), 1);
+		const page = Math.min(Math.max(this._pages[key] || 1, 1), pages);
+		this._pages[key] = page;
+		return { page, pages, size, rows: list.slice((page - 1) * size, page * size) };
+	}
+
+	_pager_html(key, info, total) {
+		if (total <= info.size) return "";
+		const from = (info.page - 1) * info.size + 1;
+		const to = Math.min(info.page * info.size, total);
+		return `<div class="lcc-pager" data-pager="${key}">
+			<button class="btn btn-xs btn-default lcc-page-prev" ${info.page <= 1 ? "disabled" : ""}>
+				<i class="fa fa-chevron-left"></i> ${__("Previous")}</button>
+			<span class="lcc-muted">${__("{0}–{1} of {2}", [from, to, total])}
+				&nbsp;·&nbsp; ${__("Page {0} of {1}", [info.page, info.pages])}</span>
+			<button class="btn btn-xs btn-default lcc-page-next" ${info.page >= info.pages ? "disabled" : ""}>
+				${__("Next")} <i class="fa fa-chevron-right"></i></button>
+		</div>`;
+	}
+
+	_bind_pager($scope, key, rerender) {
+		$scope.off("click.lccpager").on("click.lccpager", `[data-pager="${key}"] .lcc-page-prev`, () => {
+			this._pages[key] = Math.max((this._pages[key] || 1) - 1, 1);
+			rerender();
+		}).on("click.lccpager", `[data-pager="${key}"] .lcc-page-next`, () => {
+			this._pages[key] = (this._pages[key] || 1) + 1;
+			rerender();
+		});
 	}
 
 	_ops_render_manifests($b) {
@@ -1486,7 +1658,8 @@ class LogisticsCommandCenter {
 		// Entry side, and re-using it here for a submitted manifest was
 		// confusing the two.
 		const STATUS_LABEL = { "Packed": __("Manifest Created") };
-		const rows = list.map((m) => {
+		const page = this._page_slice("manifests", list);
+		const rows = page.rows.map((m) => {
 			const color = STATUS_COLOR[m.status] || "gray";
 			const status = frappe.utils.escape_html(STATUS_LABEL[m.status] || m.status || "—");
 			const nm = encodeURIComponent(m.name);
@@ -1500,6 +1673,12 @@ class LogisticsCommandCenter {
 			<td class="tr">${m.total_qty || 0}</td>
 			<td class="tr">${m.box_count || 0}</td>
 			<td>${frappe.datetime.str_to_user(m.creation)}</td>
+			<td class="text-right" style="white-space:nowrap">
+				<button class="btn btn-xs btn-default lcc-mf-shipments" data-name="${frappe.utils.escape_html(m.name)}">
+					${__("Shipments")}</button>
+				<button class="btn btn-xs btn-danger lcc-mf-cancel" data-name="${frappe.utils.escape_html(m.name)}">
+					${__("Cancel")}</button>
+			</td>
 		</tr>`;
 		}).join("");
 
@@ -1510,10 +1689,6 @@ class LogisticsCommandCenter {
 				</button>
 				<button class="btn btn-sm btn-default lcc-new-trip-from-sel" disabled>
 					<i class="fa fa-plus"></i> ${__("Create Trip from Selected")}
-				</button>
-				<button class="btn btn-sm btn-warning lcc-bundle-print-qr" disabled
-					title="${__("Group selected manifests into one trip per destination and print the consolidated pickup QR — driver scans once per drop.")}">
-					<i class="fa fa-qrcode"></i> ${__("Bundle & Print Pickup QR")}
 				</button>
 				<span class="lcc-ops-bar-spacer"></span>
 				<span class="lcc-muted lcc-ops-bar-hint">${__("Only submitted (Packed) manifests are listed — submit Draft manifests to see them here. Open a manifest to print its box label, transfer receipt, or e-Way Bill before dispatch.")}</span>
@@ -1526,9 +1701,12 @@ class LogisticsCommandCenter {
 					<th>${__("Dir")}</th><th>${__("Priority")}</th>
 					<th>${__("Route")}</th><th class="tr">${__("Qty")}</th>
 					<th class="tr">${__("Boxes")}</th><th>${__("Created")}</th>
+					<th class="text-right">${__("Actions")}</th>
 				</tr></thead>
 				<tbody>${rows}</tbody>
-			</table></div>`);
+			</table></div>
+			${this._pager_html("manifests", page, list.length)}`);
+		this._bind_pager($b, "manifests", () => this._ops_render_manifests($b));
 	}
 
 	/* ── Manifest drill-down ──────────────────────────────────────
@@ -1739,6 +1917,205 @@ class LogisticsCommandCenter {
 	 * dispatcher click "Confirm Return" once the goods physically arrive
 	 * back at the source warehouse (which reverses the Stock Entries).
 	 */
+	// ── Undoing a manifest from here as well as from its own form ───────
+	//
+	// The same two actions the CH Transfer Manifest form offers under
+	// Actions, on the same endpoints — dispatch works from this list, so
+	// making them come here to find a manifest and then open it was the
+	// long way round. Both undo the GROUPING only: the boxes stay packed,
+	// the stock stays in transit, and the shipments return to Packed Orders.
+	_ops_cancel_manifest(manifest) {
+		const d = new frappe.ui.Dialog({
+			title: __("Cancel manifest {0}", [manifest]),
+			fields: [
+				{
+					fieldtype: "HTML",
+					options: `<div class="alert alert-warning">${__(
+						"Every shipment on this manifest goes back to Packed Orders, ready to be put on a different one. "
+						+ "Nothing is unpacked and no stock moves — the goods stay in the transit warehouse. "
+						+ "To send the goods back to the source instead, open the manifest and use Cancel &amp; Return Stock."
+					)}</div>`,
+				},
+				...ch_mf_reason_fields(CH_MF_CANCEL_REASONS),
+			],
+			primary_action_label: __("Cancel Manifest"),
+			primary_action: (vals) => {
+				d.hide();
+				frappe.call({
+					method: _TMA + "release_manifest",
+					args: { manifest, reason: ch_mf_reason_text(vals) },
+					freeze: true,
+					freeze_message: __("Returning shipments to Packed Orders…"),
+				}).then((r) => {
+					frappe.show_alert({
+						message: (r && r.message && r.message.message) || __("Manifest cancelled"),
+						indicator: "orange",
+					}, 6);
+					this._ops_load();
+				});
+			},
+		});
+		d.show();
+	}
+
+	_ops_manifest_shipments(manifest) {
+		frappe.call({
+			method: "frappe.client.get_list",
+			args: {
+				doctype: "CH Transfer Manifest Item",
+				filters: { parent: manifest },
+				fields: ["name", "stock_entry", "from_warehouse", "to_warehouse", "total_qty"],
+				parent: "CH Transfer Manifest",
+				limit_page_length: 0,
+			},
+		}).then((r) => {
+			const rows = (r && r.message) || [];
+			const esc = frappe.utils.escape_html;
+			const d = new frappe.ui.Dialog({
+				title: __("Shipments on {0}", [manifest]),
+				size: "large",
+				fields: [{ fieldtype: "HTML", fieldname: "list" }],
+			});
+			d.fields_dict.list.$wrapper.html(`
+				<p class="text-muted small">${__(
+					"Removing a shipment takes it off this manifest and puts it back in Packed Orders. "
+					+ "The last shipment cannot be removed — cancel the manifest instead."
+				)}</p>
+				<table class="table table-bordered table-condensed">
+					<thead><tr><th>${__("Transfer")}</th><th>${__("Route")}</th>
+						<th class="text-right">${__("Qty")}</th><th></th></tr></thead>
+					<tbody>${rows.map((x) => `<tr>
+						<td><a href="/app/stock-entry/${encodeURIComponent(x.stock_entry)}" target="_blank">${esc(x.stock_entry)}</a></td>
+						<td class="text-muted small">${esc(x.from_warehouse || "—")} → ${esc(x.to_warehouse || "—")}</td>
+						<td class="text-right">${flt(x.total_qty) || 0}</td>
+						<td class="text-right"><button class="btn btn-xs btn-danger ch-mf-drop"
+							data-se="${esc(x.stock_entry)}" ${rows.length < 2 ? "disabled" : ""}>
+							${__("Remove")}</button></td>
+					</tr>`).join("")}</tbody>
+				</table>`);
+			d.$wrapper.find(".ch-mf-drop").on("click", (e) => {
+				const stock_entry = $(e.currentTarget).data("se");
+				frappe.prompt(
+					ch_mf_reason_fields(CH_MF_REMOVE_REASONS),
+					(vals) => {
+						d.hide();
+						frappe.call({
+							method: _TMA + "remove_transfer_from_manifest",
+							args: { manifest, stock_entry, reason: ch_mf_reason_text(vals) },
+							freeze: true,
+							freeze_message: __("Removing the shipment…"),
+						}).then((res) => {
+							frappe.show_alert({
+								message: (res && res.message && res.message.message) || __("Shipment removed"),
+								indicator: "orange",
+							}, 6);
+							this._ops_load();
+						});
+					},
+					__("Remove {0}", [stock_entry]),
+					__("Remove")
+				);
+			});
+			d.show();
+		});
+	}
+
+	// ── Rejected: a driver said no, and somebody has to answer ──────────
+	//
+	// The goods are already back at the source warehouse by the time a row
+	// lands here (the rejection reverses the transit movement), so both
+	// answers move stock again — see rejection_api._put_the_goods_back.
+	_ops_render_rejections($b) {
+		const rows = this.rejections || [];
+		if (!rows.length) {
+			$b.html(`<div class="lcc-empty"><i class="fa fa-check-circle"></i> ${
+				__("No shipments refused. A driver's rejection waits here until you accept it or send it back to them.")}</div>`);
+			return;
+		}
+		const esc = frappe.utils.escape_html;
+		const body = rows.map((r) => {
+			const photos = [r.proof_image_1, r.proof_image_2].filter(Boolean).map((src) =>
+				`<a href="${esc(src)}" target="_blank" title="${__("Open proof photo")}">
+					<img src="${esc(src)}" style="width:38px;height:38px;object-fit:cover;border-radius:4px;
+						border:1px solid var(--lcc-border);margin-right:4px"></a>`).join("");
+			return `<tr>
+				<td><a href="/app/ch-transfer-manifest/${encodeURIComponent(r.manifest)}" target="_blank">${esc(r.manifest)}</a>
+					<div class="lcc-muted">${esc(r.source || "—")} → ${esc(r.destination || "—")}</div></td>
+				<td>${esc(r.driver_name || r.driver || "—")}
+					${r.trip ? `<div class="lcc-muted"><i class="fa fa-truck"></i> ${esc(r.trip)}</div>` : ""}</td>
+				<td><span class="lcc-pill lcc-sev-high">${esc(r.rejection_reason || "—")}</span>
+					${r.remarks ? `<div class="lcc-muted">${esc(r.remarks)}</div>` : ""}</td>
+				<td>${photos || `<span class="text-muted">—</span>`}</td>
+				<td class="lcc-muted">${r.rejected_on ? frappe.datetime.str_to_user(r.rejected_on) : "—"}</td>
+				<td class="text-right">
+					<button class="btn btn-xs btn-success lcc-rej-approve" data-name="${esc(r.name)}">
+						<i class="fa fa-check"></i> ${__("Approve")}</button>
+					<button class="btn btn-xs btn-default lcc-rej-ignore" data-name="${esc(r.name)}">
+						<i class="fa fa-undo"></i> ${__("Ignore")}</button>
+				</td>
+			</tr>`;
+		}).join("");
+		$b.html(`
+			<div class="lcc-ops-bar">
+				<span class="lcc-muted">${__(
+					"A driver refused these shipments and the goods went back to the source warehouse. "
+					+ "Approve sends the shipment back to Unassigned Manifests as Packed for a different trip; "
+					+ "Ignore puts it back on the same driver's list. Either way the stock moves into transit again.")}</span>
+			</div>
+			<div class="lcc-table-wrap"><table class="lcc-table">
+				<thead><tr>
+					<th>${__("Manifest")}</th>
+					<th>${__("Driver")}</th>
+					<th>${__("Reason")}</th>
+					<th>${__("Proof")}</th>
+					<th>${__("Rejected")}</th>
+					<th class="text-right">${__("Decision")}</th>
+				</tr></thead>
+				<tbody>${body}</tbody>
+			</table></div>`);
+	}
+
+	_ops_review_rejection(rejection, approve) {
+		const d = new frappe.ui.Dialog({
+			title: approve ? __("Approve rejection") : __("Send it back to the driver"),
+			fields: [
+				{
+					fieldtype: "HTML",
+					options: `<div class="alert alert-${approve ? "warning" : "info"}">${
+						approve
+							? __("The shipment goes back to Unassigned Manifests as Packed, with the driver and trip cleared, and its stock moves into the transit warehouse again — ready to go out on a different trip.")
+							: __("The same shipment goes back to this driver's Pickup Pending list with your note on it, and its stock moves into the transit warehouse again.")
+					}</div>`,
+				},
+				{
+					fieldtype: "Small Text", fieldname: "notes",
+					label: approve ? __("Note for the record") : __("What the driver should know"),
+					reqd: approve ? 0 : 1,
+				},
+			],
+			primary_action_label: approve ? __("Approve") : __("Send back"),
+			primary_action: (vals) => {
+				d.hide();
+				frappe.dom.freeze(__("Moving the stock…"));
+				frappe.call({
+					method: _REJ + (approve ? "rejection_approve" : "rejection_ignore"),
+					args: { rejection, notes: vals.notes },
+				}).then((r) => {
+					frappe.dom.unfreeze();
+					const out = (r && r.message) || {};
+					frappe.show_alert({
+						message: approve
+							? __("{0} is back in Unassigned Manifests", [out.manifest || ""])
+							: __("{0} is back on the driver's list", [out.manifest || ""]),
+						indicator: approve ? "orange" : "blue",
+					}, 6);
+					this._ops_load();
+				}).catch(() => frappe.dom.unfreeze());
+			},
+		});
+		d.show();
+	}
+
 	_ops_render_recalls($b) {
 		if (!(this.recalls || []).length) {
 			$b.html(`<div class="lcc-empty"><i class="fa fa-check-circle"></i> ${__("No open recalls. Recalled manifests appear here until physical return is confirmed at the source warehouse.")}</div>`);
@@ -1798,36 +2175,6 @@ class LogisticsCommandCenter {
 			</table></div>`);
 	}
 
-	_ops_render_exceptions($b) {
-		if (!this.exceptions.length) {
-			$b.html(`<div class="lcc-empty"><i class="fa fa-check-circle"></i> ${__("No open exceptions.")}</div>`);
-			return;
-		}
-		const rows = this.exceptions.map((e) => `<tr>
-			<td><span class="lcc-sev lcc-sev-${(e.severity || "medium").toLowerCase()}">${e.severity || ""}</span></td>
-			<td>${frappe.utils.escape_html(e.exception_type || "")}</td>
-			<td>
-				<a href="#" class="lcc-trip-link" data-name="${e.trip}">${e.trip}</a>
-				<div class="lcc-muted">${frappe.utils.escape_html(e.driver_name || "")}</div>
-			</td>
-			<td>${e.stop_sequence || "—"}</td>
-			<td class="lcc-exc-remarks">${frappe.utils.escape_html(e.remarks || "")}</td>
-			<td>${frappe.datetime.str_to_user(e.occurred_at)}</td>
-			<td>
-				<button class="btn btn-xs btn-success lcc-exc-resolve"
-					data-trip="${e.trip}" data-row="${e.row_name}">${__("Resolve")}</button>
-			</td>
-		</tr>`).join("");
-
-		$b.html(`<div class="lcc-table-wrap"><table class="lcc-table">
-			<thead><tr>
-				<th>${__("Severity")}</th><th>${__("Type")}</th><th>${__("Trip / Driver")}</th>
-				<th>${__("Stop")}</th><th>${__("Remarks")}</th><th>${__("When")}</th><th></th>
-			</tr></thead>
-			<tbody>${rows}</tbody>
-		</table></div>`);
-	}
-
 	_ops_render_drivers($b) {
 		if (!this.drivers.length) {
 			$b.html(`<div class="lcc-empty">${__("No drivers found.")}</div>`);
@@ -1866,7 +2213,6 @@ class LogisticsCommandCenter {
 		// Bundling needs at least 2 manifests to be meaningful (one
 		// manifest already prints its own per-shipment QR via the
 		// per-row Print Box action).
-		this.$root.find(".lcc-bundle-print-qr").prop("disabled", n < 2);
 	}
 
 	/* ── Per-row print helpers (Operations → Manifests) ─────────
@@ -2140,11 +2486,15 @@ class LogisticsCommandCenter {
 		const can_unassign = t.status === "Assigned";
 		const can_cancel   = ["Draft", "Assigned"].includes(t.status);
 		const can_recall_trip = t.status === "Started";
-		const can_detach = ["Draft", "Assigned", "Started"].includes(t.status);
+		// Not once the trip has started: the driver is on the road with that
+		// manifest in the vehicle, so taking it off the trip in the console
+		// would leave the paperwork saying one thing and the van another.
+		// From Started onwards the honest route is Abort & Recall, which
+		// keeps the trip open until the goods are physically back.
+		const can_detach = ["Draft", "Assigned"].includes(t.status);
 		const can_resequence = ["Assigned", "Started"].includes(t.status);
 		// Server-resolved capability (CH Logistics Settings → Role Matrix);
 		// cosmetic only — trip_close re-checks head_override server-side.
-		const can_complete_override = can_complete && !!(this._capabilities || {}).head_override;
 
 		// Group by stop_roles (location-derived by the backend's
 		// stop_roles.annotate — matches each manifest to a stop by actual
@@ -2244,7 +2594,6 @@ class LogisticsCommandCenter {
 				${can_start    ? `<button class="btn btn-sm btn-warning" id="lcc-side-start" disabled title="${__("Starting a trip from here is currently disabled")}"><i class="fa fa-play"></i> ${__("Start")}</button>` : ""}
 				${can_resequence ? `<button class="btn btn-sm btn-default" id="lcc-side-resequence"><i class="fa fa-random"></i> ${__("Re-sequence")}</button>` : ""}
 				${can_complete ? `<button class="btn btn-sm btn-success" id="lcc-side-complete" disabled title="${__("Completing a trip from here is currently disabled")}"><i class="fa fa-check"></i> ${__("Complete")}</button>` : ""}
-				${can_complete_override ? `<button class="btn btn-sm btn-danger" id="lcc-side-complete-override"><i class="fa fa-shield"></i> ${__("Complete (Override Exceptions)")}</button>` : ""}
 				${can_close    ? `<button class="btn btn-sm btn-primary" id="lcc-side-close-trip"><i class="fa fa-archive"></i> ${__("Close")}</button>` : ""}
 				${can_unassign ? `<button class="btn btn-sm btn-default" id="lcc-side-cancel"><i class="fa fa-user-times"></i> ${__("Unassign")}</button>` : ""}
 				${can_cancel ? `<button class="btn btn-sm btn-danger" id="lcc-side-cancel-trip"><i class="fa fa-ban"></i> ${__("Cancel Trip")}</button>` : ""}
@@ -2508,13 +2857,28 @@ class LogisticsCommandCenter {
 			title: __("Cancel Trip {0}", [trip]),
 			fields: [
 				{ fieldtype: "HTML", options: `<div class="alert alert-warning">${__("This pre-departure cancellation will cancel the trip, release the driver, and release every attached manifest back to Packed / Unassigned Manifests so it can be re-attached to a different trip — the manifests themselves are NOT cancelled and their stock is not reversed. If physical pickup has started, the server will require Abort & Recall instead.")}</div>` },
-				{ fieldtype: "Small Text", fieldname: "reason", label: __("Reason"), reqd: 1 },
+				{
+					fieldtype: "Select", fieldname: "reason_code", label: __("Reason"),
+					options: LCC_TRIP_CANCEL_REASONS.join("\n"), reqd: 1,
+				},
+				{
+					fieldtype: "Small Text", fieldname: "reason_notes", label: __("Details"),
+					description: __("Anything the next person needs to know. Required when the reason is Other."),
+					mandatory_depends_on: "eval:doc.reason_code == 'Other'",
+				},
 			],
 			primary_action_label: __("Cancel Trip"),
 			primary_action: (vals) => {
-				const reason = (vals.reason || "").trim();
-				if (!reason) {
+				const reason = lcc_trip_cancel_reason(vals);
+				if (!vals.reason_code) {
 					frappe.show_alert({ message: __("A reason is required."), indicator: "red" });
+					return;
+				}
+				if (vals.reason_code === "Other" && !(vals.reason_notes || "").trim()) {
+					frappe.show_alert({
+						message: __("Say what happened — 'Other' on its own tells the next person nothing."),
+						indicator: "red",
+					});
 					return;
 				}
 				d.hide();
@@ -2636,11 +3000,6 @@ class LogisticsCommandCenter {
 			},
 		});
 		d.show();
-	}
-
-	_ops_resolve_exc(trip, row_name) {
-		frappe.call({ method: _LCC + "exception_resolve", args: { trip, row_name, resolution_status: "Resolved" } })
-			.then(() => { frappe.show_alert({ message: __("Exception resolved"), indicator: "green" }); this._ops_load(); });
 	}
 
 	/* ── Map ──────────────────────────────────────────────────── */
@@ -2852,138 +3211,6 @@ class LogisticsCommandCenter {
 	 *      packing team can hit Ctrl+P once and get the consolidated
 	 *      pickup sheet.
 	 */
-	async _ops_bundle_print_qr() {
-		const selected = Array.from(this.selected_manifests || []);
-		if (selected.length < 2) {
-			frappe.show_alert({ message: __("Select at least 2 manifests to bundle."), indicator: "orange" }, 5);
-			return;
-		}
-		const co = this.filters?.fields?.company?.get_value() || frappe.defaults.get_user_default("Company");
-		// A bundle = one pickup QR + one delivery QR. That only makes
-		// sense when every selected manifest shares (a) the same source
-		// warehouse — the one physical pickup point — AND (b) the same
-		// destination store/warehouse — the one physical drop point.
-		// Mixed sources break the pickup label; mixed destinations break
-		// the delivery label.
-		const rows  = (this.unassigned || []).filter((m) => selected.includes(m.name));
-		const _key  = (r) => r.destination_store || r.destination_warehouse || "";
-		const sources = new Set(rows.map((r) => r.source_warehouse).filter(Boolean));
-		const dests   = new Set(rows.map(_key).filter(Boolean));
-		if (sources.size > 1) {
-			frappe.msgprint({
-				title: __("Cannot bundle"),
-				message: __("Selected manifests are picked up from {0} different warehouses. A single pickup QR only works for one pickup location.", [sources.size]),
-				indicator: "red",
-			});
-			return;
-		}
-		if (dests.size > 1) {
-			const list = Array.from(dests).map(frappe.utils.escape_html).join(", ");
-			frappe.msgprint({
-				title: __("Cannot bundle"),
-				message: __("Selected manifests are dropping at {0} different destinations ({1}). To share one pickup &amp; delivery QR, all manifests in a bundle must go to the <b>same destination store</b>.", [dests.size, list]),
-				indicator: "red",
-			});
-			return;
-		}
-		if (sources.size === 0) {
-			frappe.show_alert({ message: __("Selected manifests have no source warehouse set."), indicator: "red" }, 7);
-			return;
-		}
-		if (dests.size === 0) {
-			frappe.show_alert({ message: __("Selected manifests have no destination store set."), indicator: "red" }, 7);
-			return;
-		}
-		const source_warehouse = sources.values().next().value;
-
-		frappe.dom.freeze(__("Bundling manifests and minting pickup QR…"));
-		try {
-			const club = await frappe.call({
-				method: "ch_logistics.api.logistics_api.club_transfers_into_trip",
-				args: {
-					source_warehouse,
-					manifests: selected,
-					trip_date: this.trip_date || frappe.datetime.get_today(),
-					company:   co,
-					enforce_single_destination: 1,
-				},
-			});
-			const res = (club && club.message) || {};
-			const trip = res.trip;
-			const stops = res.stops || [];
-			if (!trip || !stops.length) {
-				frappe.dom.unfreeze();
-				frappe.msgprint({ title: __("Bundle Failed"), message: __("Server did not return a trip."), indicator: "red" });
-				return;
-			}
-
-			// Pull every stop's printable label in parallel.
-			const labels = await Promise.all(stops.map((s) =>
-				frappe.call({
-					method: "ch_logistics.api.logistics_api.get_stop_label",
-					args: { trip, sequence: s.sequence, kind: "pickup" },
-				}).then((r) => r.message)
-			));
-
-			frappe.dom.unfreeze();
-
-			// Render in a print-ready dialog. One page-break per stop so
-			// hitting Print produces a sheet per drop.
-			const sheets = labels.map((lb, i) => `
-				<div class="lcc-bundle-sheet" style="page-break-after:${i < labels.length - 1 ? "always" : "auto"};">
-					${(lb && lb.html) || `<div class="lcc-empty">${__("Label render failed for stop {0}", [stops[i].sequence])}</div>`}
-				</div>
-			`).join("");
-
-			const d = new frappe.ui.Dialog({
-				title: __("Pickup QR — Trip {0}", [trip]),
-				size: "large",
-				fields: [{
-					fieldname: "html", fieldtype: "HTML",
-					options: `
-						<div class="lcc-bundle-summary alert alert-success" style="padding:8px 12px;margin-bottom:10px">
-							<i class="fa fa-check-circle"></i>
-							${__("Created trip <b>{0}</b> with <b>{1}</b> destination stop(s) covering <b>{2}</b> manifest(s). Each stop has one consolidated pickup QR — driver scans once per drop.", [trip, stops.length, selected.length])}
-						</div>
-						<div class="lcc-bundle-sheets">${sheets}</div>
-					`,
-				}],
-				primary_action_label: __("Print"),
-				primary_action: () => {
-					// Frappe-style print: open the rendered HTML in a new
-					// window so the browser print dialog scopes to JUST
-					// the labels (not the desk chrome).
-					const w = window.open("", "_blank", "width=480,height=720");
-					w.document.write(`
-						<html><head><title>${frappe.utils.escape_html(trip)} — ${__("Pickup QR")}</title>
-						<style>
-							body { font-family: Arial, sans-serif; margin: 0; padding: 16px; background:#fff; }
-							.lcc-bundle-sheet { margin: 0 auto 24px auto; }
-							@media print { .lcc-bundle-sheet { page-break-after: always; } .lcc-bundle-sheet:last-child { page-break-after: auto; } }
-						</style>
-						</head><body>${sheets}<script>window.onload=()=>setTimeout(()=>window.print(),200);</script></body></html>
-					`);
-					w.document.close();
-				},
-				secondary_action_label: __("Open Trip"),
-				secondary_action: () => {
-					d.hide();
-					frappe.set_route("Form", "CH Logistics Trip", trip);
-				},
-			});
-			d.show();
-
-			// Refresh the panel so the bundled manifests disappear from
-			// the unassigned list (they now have a trip).
-			this.selected_manifests.clear();
-			this._ops_load();
-		} catch (err) {
-			frappe.dom.unfreeze();
-			const msg = (err && err.message) || __("Unknown error");
-			frappe.msgprint({ title: __("Bundle Failed"), message: msg, indicator: "red" });
-		}
-	}
-
 	_dlg_auto_plan() {
 		const d = new frappe.ui.Dialog({
 			title: __("Auto-plan Trips"),

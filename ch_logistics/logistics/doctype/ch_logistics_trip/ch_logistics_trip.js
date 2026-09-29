@@ -2,6 +2,32 @@
 // Adds action buttons to drive the status state machine since the
 // status field is read-only (controlled server-side via _enforce_status_transition).
 
+// Why a trip is called off before it leaves. The same fixed list the
+// control tower offers (logistics_control_tower.js) — free text came back
+// as forty spellings of the same handful of causes, so nobody could say how
+// often a trip dies because a manifest was hung on the wrong one.
+const CH_TRIP_CANCEL_REASONS = [
+	"Manifest Wrongly Attached",
+	"Trip Created by Mistake",
+	"Duplicate Trip",
+	"Driver Unavailable",
+	"Vehicle Unavailable / Breakdown",
+	"Consignment Not Ready",
+	"Wrong Route / Wrong Hub",
+	"Destination Store Closed",
+	"Rescheduled to Another Day",
+	"Merged into Another Trip",
+	"Other",
+];
+
+// The cause with whatever was typed beside it, so the trip's own
+// cancellation_reason reads as one sentence.
+function ch_trip_cancel_reason(values) {
+	const cause = (values.reason_code || "").trim();
+	const notes = (values.reason_notes || "").trim();
+	return notes ? `${cause} — ${notes}` : cause;
+}
+
 frappe.ui.form.on("CH Logistics Trip", {
 	refresh(frm) {
 		// Company is auto-filled and locked read-only by the app-wide
@@ -166,11 +192,21 @@ frappe.ui.form.on("CH Logistics Trip", {
 		if (["Draft", "Assigned"].includes(status)) {
 			frm.add_custom_button(__("Cancel Trip"), () => {
 				frappe.prompt(
-					[{ fieldtype: "Small Text", fieldname: "reason", label: __("Reason"), reqd: 1 }],
+					[
+						{
+							fieldtype: "Select", fieldname: "reason_code", label: __("Reason"),
+							options: CH_TRIP_CANCEL_REASONS.join("\n"), reqd: 1,
+						},
+						{
+							fieldtype: "Small Text", fieldname: "reason_notes", label: __("Details"),
+							description: __("Anything the next person needs to know. Required when the reason is Other."),
+							mandatory_depends_on: "eval:doc.reason_code == 'Other'",
+						},
+					],
 					(vals) => {
 						frappe.xcall("ch_logistics.api.logistics_api.trip_cancel", {
 							trip: frm.doc.name,
-							reason: vals.reason,
+							reason: ch_trip_cancel_reason(vals),
 						}).then(() => frm.reload_doc());
 					},
 					__("Cancel Trip"),
