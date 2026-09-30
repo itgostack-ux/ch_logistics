@@ -4716,6 +4716,19 @@ def get_manifest_stock_entries_bulk(manifests):
         )
     }
 
+    # The challans these shipments travel under — the document the driver is
+    # actually carrying. A transfer sent in batches raises one per dispatch,
+    # so a shipment can name several.
+    challans = {}
+    if se_names and frappe.db.exists("DocType", "CH Delivery Challan"):
+        for c in frappe.get_all(
+            "CH Delivery Challan",
+            filters={"stock_entry": ["in", se_names]},
+            fields=["name", "stock_entry"],
+            order_by="creation asc", limit_page_length=0,
+        ):
+            challans.setdefault(c.stock_entry, []).append(c.name)
+
     out = {name: [] for name in allowed}
     for row in manifest_items:
         if not row.stock_entry:
@@ -4729,6 +4742,7 @@ def get_manifest_stock_entries_bulk(manifests):
             "to_warehouse": row.to_warehouse,
             "posting_date": se.posting_date if se else None,
             "status": se.custom_status if se else None,
+            "delivery_challans": challans.get(row.stock_entry, []),
         })
     return out
 

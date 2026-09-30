@@ -1000,7 +1000,7 @@ class LogisticsCommandCenter {
 						</button>
 						<input type="search" class="form-control input-xs lcc-pack-search"
 							style="width:220px;display:inline-block;margin-left:8px"
-							placeholder="${__("Search order, store or warehouse…")}">
+							placeholder="${__("Search challan, order, store or warehouse…")}">
 					</div>
 					<span class="lcc-muted lcc-ops-bar-hint">
 						<i class="fa fa-info-circle"></i>
@@ -1050,14 +1050,16 @@ class LogisticsCommandCenter {
 		}
 	}
 
-	// What the search box matches: the order id first, since that is what
-	// somebody reads off a box, plus both warehouses — by their raw names
-	// AND by the store labels the table actually shows, so typing what is
-	// on screen finds the row.
+	// What the search box matches: the challan ids the table now shows and
+	// the transfer id behind them — the challan is what travels with the
+	// goods, but the transfer id is still what somebody may have written
+	// down — plus both warehouses, by their raw names AND by the store
+	// labels on screen, so typing what is displayed finds the row.
 	_pack_matches(se, needle) {
 		if (!needle) return true;
 		const label = (wh) => (window.ch_wh_label ? ch_wh_label(wh) : wh);
-		return [se.name, se.from_warehouse, se.to_warehouse,
+		return [se.name, ...(se.delivery_challans || []),
+			se.from_warehouse, se.to_warehouse,
 			label(se.from_warehouse), label(se.to_warehouse)]
 			.some((v) => String(v || "").toLowerCase().includes(needle));
 	}
@@ -1104,9 +1106,25 @@ class LogisticsCommandCenter {
 			const status = se.custom_status || "";
 			const status_color = status_colors[status] || "gray";
 			const since = se.custom_status_since || se.creation;
+			// The challan is the document that travels with the carton, so
+			// that is the number the loader is holding when they look at
+			// this screen — the column is headed "Order ID" because that is
+			// what they call it, not because it is the Stock Entry name. A
+			// transfer sent in batches carries one challan per dispatch; the
+			// first is shown with a count beside it and the full list sits in
+			// the tooltip, along with the transfer id this row selects on.
+			const challans = (se.delivery_challans || []).filter(Boolean);
+			const challan_cell = challans.length
+				? `${frappe.utils.escape_html(challans[0])}${
+					challans.length > 1
+						? ` <span class="text-muted">+${challans.length - 1}</span>` : ""}`
+				: `<span class="text-muted">${__("Not raised")}</span>`;
+			const challan_title = frappe.utils.escape_html(
+				(challans.length ? challans.join(", ") : __("No delivery challan"))
+				+ ` · ${se.name}`);
 			return `<tr>
 				<td><input type="checkbox" class="lcc-pack-row-check" data-name="${nm}"></td>
-				<td>${nm}</td>
+				<td title="${challan_title}">${challan_cell}</td>
 				<td>${since ? frappe.datetime.str_to_user(since) : "—"}</td>
 				<td><span class="indicator-pill ${status_color}"><span>${frappe.utils.escape_html(__(status))}</span></span></td>
 				<td>${window.ch_wh_label_html ? ch_wh_label_html(se.from_warehouse, "—") : frappe.utils.escape_html(se.from_warehouse || "—")}</td>
@@ -1122,7 +1140,7 @@ class LogisticsCommandCenter {
 			<div class="lcc-table-wrap"><table class="lcc-table lcc-pack-table">
 				<thead><tr>
 					<th style="width:32px"><input type="checkbox" class="lcc-pack-select-all"></th>
-					<th>${__("Order Id")}</th>
+					<th>${__("Order ID")}</th>
 					<th>${__("Date")}</th>
 					<th>${__("Status")}</th>
 					<th>${__("Source Warehouse")}</th>
@@ -1759,6 +1777,24 @@ class LogisticsCommandCenter {
 		const esc = frappe.utils.escape_html;
 		const loc = (wh) => window.ch_wh_label_html ? ch_wh_label_html(wh, "—") : esc(wh || "—");
 		const date = (val) => val ? frappe.datetime.str_to_user(val) : "—";
+		// The challan is what physically travels with the carton, so it is
+		// the number to check a box against and the one this table leads
+		// with. Clicking it opens what is inside, the way the transfer id
+		// used to — a transfer sent in batches raises one challan per
+		// dispatch, and every one of them opens the same shipment.
+		//
+		// A shipment with no challan still has to be openable, so it falls
+		// back to naming its transfer rather than leaving a dead row.
+		const challan = (se) => {
+			const list = (se.delivery_challans || []).filter(Boolean);
+			const open = (label) =>
+				`<a href="#" class="lcc-se-open" data-se="${esc(se.stock_entry)}">${esc(label)}</a>`;
+			if (!list.length) {
+				return `${open(se.stock_entry)} <span class="text-muted small">${
+					__("challan not raised")}</span>`;
+			}
+			return list.map(open).join("<br>");
+		};
 
 		$wrap().html(`<div class="lcc-loading"><i class="fa fa-spinner fa-spin"></i> ${__("Loading…")}</div>`);
 		d.show();
@@ -1769,13 +1805,11 @@ class LogisticsCommandCenter {
 		const render_stock_entries = () => {
 			d.set_title(__("Manifest {0}", [name]));
 			if (!se_rows.length) {
-				$wrap().html(`<div class="lcc-empty">${__("No Stock Entries found for this manifest.")}</div>`);
+				$wrap().html(`<div class="lcc-empty">${__("No shipments found on this manifest.")}</div>`);
 				return;
 			}
 			const body = se_rows.map((se) => `<tr>
-					<td>
-						<a href="#" class="lcc-se-open" data-se="${esc(se.stock_entry)}">${esc(se.stock_entry)}</a>
-					</td>
+					<td>${challan(se)}</td>
 					<td class="tr">${se.qty != null ? se.qty : "—"}</td>
 					<td>${date(se.posting_date)}</td>
 					<td>${loc(se.from_warehouse)}</td>
@@ -1785,7 +1819,7 @@ class LogisticsCommandCenter {
 			$wrap().html(`
 				<div class="lcc-table-wrap"><table class="lcc-table">
 					<thead><tr>
-						<th>${__("Stock Entry")}</th>
+						<th>${__("Delivery Challan")}</th>
 						<th class="tr">${__("Qty")}</th>
 						<th>${__("Date")}</th>
 						<th>${__("From")}</th>
@@ -1797,13 +1831,15 @@ class LogisticsCommandCenter {
 		};
 
 		const render_items = (se) => {
-			d.set_title(__("{0} — Items", [se.stock_entry]));
+			const clicked = (se.delivery_challans || []).filter(Boolean).join(", ")
+				|| se.stock_entry;
+			d.set_title(__("{0} — Items", [clicked]));
 			const rows = item_rows.filter((r) => r.stock_entry === se.stock_entry);
 			const back = `<div class="lcc-back" style="margin-bottom:8px">
-				<a href="#" class="lcc-back-to-se"><i class="fa fa-arrow-left"></i> ${__("Back to Stock Entries")}</a>
+				<a href="#" class="lcc-back-to-se"><i class="fa fa-arrow-left"></i> ${__("Back to Shipments")}</a>
 			</div>`;
 			if (!rows.length) {
-				$wrap().html(`${back}<div class="lcc-empty">${__("No item detail found for this Stock Entry.")}</div>`);
+				$wrap().html(`${back}<div class="lcc-empty">${__("No item detail found for this shipment.")}</div>`);
 				return;
 			}
 			const body = rows.map((row) => `<tr>
