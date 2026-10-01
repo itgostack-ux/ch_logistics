@@ -1028,7 +1028,14 @@ class LogisticsCommandCenter {
 				$r.find(".lcc-pack-row-check").prop("checked", e.currentTarget.checked);
 				this._pack_update_create_btn();
 			});
-			$r.on("change", ".lcc-pack-row-check", () => this._pack_update_create_btn());
+			$r.on("change", ".lcc-pack-row-check", (e) => {
+				// A transfer's challan rows go onto a manifest together.
+				const name = $(e.currentTarget).data("name");
+				$r.find(".lcc-pack-row-check")
+					.filter((_, el) => $(el).data("name") === name)
+					.prop("checked", e.currentTarget.checked);
+				this._pack_update_create_btn();
+			});
 			this._pack_events_bound = true;
 		}
 		this._pack_load();
@@ -1110,30 +1117,37 @@ class LogisticsCommandCenter {
 			// that is the number the loader is holding when they look at
 			// this screen — the column is headed "Order ID" because that is
 			// what they call it, not because it is the Stock Entry name. A
-			// transfer sent in batches carries one challan per dispatch; the
-			// first is shown with a count beside it and the full list sits in
-			// the tooltip, along with the transfer id this row selects on.
-			const challans = (se.delivery_challans || []).filter(Boolean);
-			const challan_cell = challans.length
-				? `${frappe.utils.escape_html(challans[0])}${
-					challans.length > 1
-						? ` <span class="text-muted">+${challans.length - 1}</span>` : ""}`
-				: `<span class="text-muted">${__("Not raised")}</span>`;
-			const challan_title = frappe.utils.escape_html(
-				(challans.length ? challans.join(", ") : __("No delivery challan"))
-				+ ` · ${se.name}`);
-			return `<tr>
+			// transfer sent in batches carries one challan per dispatch, and
+			// each is a full row of its own with its own qty. Status,
+			// warehouses, boxes, weight and age belong to the transfer (boxes
+			// don't record which dispatch they hold), so each row repeats
+			// them. A manifest takes the whole Stock Entry, so ticking one of
+			// a transfer's rows ticks its siblings too (see the row-check
+			// handler) and the manifest gets the transfer once.
+			const challans = (se.delivery_challan_rows || []).filter((c) => c && c.name);
+			const lines = challans.length
+				? challans.map((c) => ({
+					cell: frappe.utils.escape_html(c.name),
+					title: frappe.utils.escape_html(`${c.name} · ${se.name}`),
+					qty: Number(c.qty || 0),
+				}))
+				: [{
+					cell: `<span class="text-muted">${__("Not raised")}</span>`,
+					title: frappe.utils.escape_html(`${__("No delivery challan")} · ${se.name}`),
+					qty: total_qty,
+				}];
+			return lines.map((line) => `<tr>
 				<td><input type="checkbox" class="lcc-pack-row-check" data-name="${nm}"></td>
-				<td title="${challan_title}">${challan_cell}</td>
+				<td title="${line.title}">${line.cell}</td>
 				<td>${since ? frappe.datetime.str_to_user(since) : "—"}</td>
 				<td><span class="indicator-pill ${status_color}"><span>${frappe.utils.escape_html(__(status))}</span></span></td>
 				<td>${window.ch_wh_label_html ? ch_wh_label_html(se.from_warehouse, "—") : frappe.utils.escape_html(se.from_warehouse || "—")}</td>
 				<td>${window.ch_wh_label_html ? ch_wh_label_html(se.to_warehouse, "—") : frappe.utils.escape_html(se.to_warehouse || "—")}</td>
-				<td class="tr">${total_qty}</td>
+				<td class="tr">${line.qty}</td>
 				<td class="tr">${box_count}</td>
 				<td class="tr">${weight ? weight.toFixed(1) + " kg" : "—"}</td>
 				<td><span class="lcc-sev ${age_cls}">${age}</span></td>
-			</tr>`;
+			</tr>`).join("");
 		}).join("");
 
 		$b.html(`
@@ -1185,7 +1199,8 @@ class LogisticsCommandCenter {
 	 */
 	_pack_create_manifest() {
 		const $r = this.$root;
-		const names = $r.find(".lcc-pack-row-check:checked").map((_, el) => $(el).data("name")).get();
+		const names = [...new Set(
+			$r.find(".lcc-pack-row-check:checked").map((_, el) => $(el).data("name")).get())];
 		if (!names.length) {
 			frappe.msgprint(__("Tick at least one Stock Entry."));
 			return;

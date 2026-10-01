@@ -1114,8 +1114,7 @@
 }
 .lcc-pack-bundle-tip .fa { color: #c2410c; margin-right: 6px; }
 .lcc-pack-body { margin-top: 8px; }
-.lcc-pack-table th, .lcc-pack-table td { vertical-align: middle; }
-.lcc-pack-prog-wrap {
+.lcc-pack-table th, .lcc-pack-table td { vertical-align: middle; }.lcc-pack-prog-wrap {
 	width: 100%;
 	height: 6px;
 	background: #f1f5f9;

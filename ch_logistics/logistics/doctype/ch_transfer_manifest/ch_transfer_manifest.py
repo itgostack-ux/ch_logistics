@@ -1189,9 +1189,20 @@ class CHTransferManifest(Document):
         stock_entries = {row.stock_entry for row in (self.transfers or []) if row.stock_entry}
         if scanned in stock_entries:
             return True
-        # Box label form: strip a trailing "-B<digits>" and compare what's left.
+        # Legacy box label form: strip a trailing "-B<digits>" and compare
+        # what's left.
         base = re.sub(r"-B\d+$", "", scanned)
-        return base in stock_entries
+        if base in stock_entries:
+            return True
+        # Current box labels are "{delivery_challan}-B<digits>", which the
+        # strip above can't map back to a Stock Entry — match them against
+        # the labels actually stored on this manifest's own boxes instead.
+        if not stock_entries:
+            return False
+        return bool(frappe.db.exists(
+            "CH Stock Entry Package",
+            {"parent": ["in", list(stock_entries)], "package_label": scanned},
+        ))
 
     def _validate_pickup_qr(self, scanned_qr):
         """Enforce the mandatory pickup scan (Ekart/Delhivery: every shipment is
