@@ -1199,10 +1199,31 @@ class CHTransferManifest(Document):
         # the labels actually stored on this manifest's own boxes instead.
         if not stock_entries:
             return False
-        return bool(frappe.db.exists(
+        if frappe.db.exists(
             "CH Stock Entry Package",
             {"parent": ["in", list(stock_entries)], "package_label": scanned},
-        ))
+        ):
+            return True
+        # The Delivery Challan number itself: it is the ID the driver app
+        # shows for the shipment and the number on the paperwork, so it is
+        # what a driver without a box label in hand reads off or scans.
+        # Checked without regard to case, as a typed code would be.
+        wanted = {scanned.lower(), base.lower()}
+        for name in stock_entries:
+            if name.lower() in wanted:
+                return True
+        labels = frappe.get_all(
+            "CH Stock Entry Package", filters={"parent": ["in", list(stock_entries)]},
+            pluck="package_label")
+        if scanned.lower() in {(l or "").strip().lower() for l in labels if l}:
+            return True
+        if frappe.db.exists("DocType", "CH Delivery Challan"):
+            challans = frappe.get_all(
+                "CH Delivery Challan", filters={"stock_entry": ["in", list(stock_entries)]},
+                pluck="name")
+            if wanted & {c.lower() for c in challans}:
+                return True
+        return False
 
     def _validate_pickup_qr(self, scanned_qr):
         """Enforce the mandatory pickup scan (Ekart/Delhivery: every shipment is

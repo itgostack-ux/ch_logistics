@@ -3896,9 +3896,29 @@ def _stop_scan_matches(scanned, expected_token, manifest_names) -> bool:
         filters={"parent": ("in", names), "parenttype": "CH Transfer Manifest"},
         fields=["package_label"],
     )
-    return lowered in {
-        (l.package_label or "").strip().lower() for l in lpns if l.package_label
-    }
+    if lowered in {(l.package_label or "").strip().lower() for l in lpns if l.package_label}:
+        return True
+    # 5. A box of one of those manifests' own shipments — the label on the
+    #    carton itself ("{delivery challan}-B01") — or the shipment's number.
+    #    That label is what the driver is actually holding at the stop.
+    shipments = frappe.get_all(
+        "CH Transfer Manifest Item", filters={"parent": ("in", names)}, pluck="stock_entry")
+    shipments = [n for n in shipments if n]
+    if not shipments:
+        return False
+    if lowered in {n.lower() for n in shipments}:
+        return True
+    boxes = frappe.get_all(
+        "CH Stock Entry Package", filters={"parent": ("in", shipments)}, pluck="package_label")
+    if lowered in {(b or "").strip().lower() for b in boxes if b}:
+        return True
+    # The Delivery Challan number of one of those shipments — the ID the
+    # driver app shows and the number on the paperwork.
+    if not frappe.db.exists("DocType", "CH Delivery Challan"):
+        return False
+    challans = frappe.get_all(
+        "CH Delivery Challan", filters={"stock_entry": ("in", shipments)}, pluck="name")
+    return lowered in {c.lower() for c in challans}
 
 
 @frappe.whitelist(methods=["POST"])

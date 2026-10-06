@@ -461,6 +461,27 @@ class DeliveryApp {
         return out;
     }
 
+    // The number a shipment is known by on the road: its Delivery Challan —
+    // what is printed on the paperwork and on the box label. The Transfer
+    // Request behind it is not shown; a shipment with no challan yet falls
+    // back to it so the card is never blank.
+    _order_id_html(row) {
+        const esc = frappe.utils.escape_html;
+        return esc((row && row.delivery_challan) || (row && row.stock_entry) || "");
+    }
+
+    // The same, as plain text for a dialog title, from the transfer alone.
+    _order_id(stock_entry) {
+        for (const m of this.manifests || []) {
+            for (const row of m.transfers || []) {
+                if (row.stock_entry === stock_entry && row.delivery_challan) {
+                    return row.delivery_challan;
+                }
+            }
+        }
+        return stock_entry;
+    }
+
     _render_leg_deliver_card(m, row, trip) {
         // One small card per Stock Entry leg on an In Transit manifest —
         // its own from->to, its own Deliver button (own OTP/QR/GPS/photo
@@ -494,7 +515,7 @@ class DeliveryApp {
                     ${to_label}
                 </div>
                 <div class="text-muted" style="font-size:11px;padding:0 8px 6px;">
-                    <i class="fa fa-file-text-o"></i> ${se}
+                    <i class="fa fa-file-text-o"></i> ${this._order_id_html(row)}
                     <span class="text-muted" style="margin-left:8px;"><i class="fa fa-truck"></i> ${frappe.utils.escape_html(m.name)}</span>
                 </div>
                 <div class="da-stop-actions">${actions}</div>
@@ -781,7 +802,7 @@ class DeliveryApp {
         let items_html = "";
         for (let t of d.transfer_items_detail || []) {
             items_html += `<div class="da-se-group">
-                <div class="da-se-name">${frappe.utils.escape_html(t.stock_entry)}</div>
+                <div class="da-se-name">${this._order_id_html(t)}</div>
                 <div class="da-se-route">${window.ch_wh_label_html ? ch_wh_label_html(t.from_warehouse, "") : frappe.utils.escape_html(t.from_warehouse || "")} → ${window.ch_wh_label_html ? ch_wh_label_html(t.to_warehouse, "") : frappe.utils.escape_html(t.to_warehouse || "")}</div>`;
             for (let item of t.items || []) {
                 items_html += `<div class="da-item-row">
@@ -2181,7 +2202,7 @@ class DeliveryApp {
                     return;
                 }
                 const d = new frappe.ui.Dialog({
-                    title: __("Accept & Pick Up — {0}", [stock_entry]),
+                    title: __("Accept & Pick Up — {0}", [this._order_id(stock_entry)]),
                     size: "small",
                     fields: [
                         {
@@ -2242,7 +2263,7 @@ class DeliveryApp {
                 <span style="font-family:monospace">${frappe.utils.escape_html(label)}</span>
             </div>`;
         const d = new frappe.ui.Dialog({
-            title: __("Accept & Pick Up — {0}", [stock_entry]),
+            title: __("Accept & Pick Up — {0}", [this._order_id(stock_entry)]),
             size: "small",
             fields: [
                 {
@@ -2523,9 +2544,10 @@ class DeliveryApp {
                 <strong>${__("OTP sent")}.</strong> ${parts.join(" • ")}
             </div>`;
         } else {
-            recipients_html = `<div class="alert alert-warning" style="padding:8px 10px;border-radius:6px;margin-bottom:8px;">
-                ${__("OTP regenerated, but no receiver contact is configured. Ask the receiver directly.")}
-            </div>`;
+            // Nothing has been sent when the dialog opens — the code goes out
+            // when the driver picks the receiver and taps Send OTP — so there
+            // is nothing to report here.
+            recipients_html = "";
         }
 
         frappe.dom.freeze(__("Capturing location…"));
@@ -2542,7 +2564,7 @@ class DeliveryApp {
                     return;
                 }
                 const d = new frappe.ui.Dialog({
-                    title: __("Deliver — {0}", [stock_entry]),
+                    title: __("Deliver — {0}", [this._order_id(stock_entry)]),
                     size: "small",
                     fields: [
                         { fieldname: "recipients_info", fieldtype: "HTML", options: recipients_html },
@@ -2616,7 +2638,7 @@ class DeliveryApp {
                 <span style="font-family:monospace">${frappe.utils.escape_html(label)}</span>
             </div>`;
         const d = new frappe.ui.Dialog({
-            title: __("Deliver — {0}", [stock_entry]),
+            title: __("Deliver — {0}", [this._order_id(stock_entry)]),
             size: "small",
             fields: [
                 { fieldname: "recipients_info", fieldtype: "HTML", options: recipients_html },
@@ -2931,7 +2953,7 @@ class DeliveryApp {
                     ${to_label}
                 </div>
                 <div class="text-muted" style="font-size:11px;padding:0 8px 6px;">
-                    <i class="fa fa-file-text-o"></i> ${se}
+                    <i class="fa fa-file-text-o"></i> ${this._order_id_html(row)}
                     <span class="text-muted" style="margin-left:8px;"><i class="fa fa-truck"></i> ${frappe.utils.escape_html(m.name)}</span>
                 </div>
                 <div class="da-stop-actions">${actions}</div>

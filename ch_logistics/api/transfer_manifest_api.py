@@ -32,6 +32,19 @@ def _require_stage_role(stage: str) -> None:
 
 # ── Manifest CRUD ────────────────────────────────────────────────────────────
 
+def _challans_by_stock_entry(stock_entries) -> dict:
+    """{stock entry: [delivery challan, ...]} in the order they were raised."""
+    names = sorted({n for n in (stock_entries or []) if n})
+    out: dict[str, list] = {}
+    if not names or not frappe.db.exists("DocType", "CH Delivery Challan"):
+        return out
+    for c in frappe.get_all(
+            "CH Delivery Challan", filters={"stock_entry": ["in", names]},
+            fields=["name", "stock_entry"], order_by="creation asc", limit_page_length=0):
+        out.setdefault(c.stock_entry, []).append(c.name)
+    return out
+
+
 def _resolve_manifest_store(store, warehouse):
     """Resolve or validate a CH Store against its configured warehouse."""
     meta = frappe.get_meta("CH Store")
@@ -1889,8 +1902,12 @@ def get_driver_assignments() -> list:
                  "item_count", "total_qty", "driver_accepted_at", "delivery_captured_at"],
         order_by="parent asc, idx asc",
     )
+    # The Delivery Challan each shipment travels under: the number on the
+    # driver's paperwork and on the box label, so the app shows it too.
+    leg_challans = _challans_by_stock_entry([row["stock_entry"] for row in leg_rows])
     legs_by_manifest: dict[str, list] = {}
     for row in leg_rows:
+        row["delivery_challan"] = ", ".join(leg_challans.get(row["stock_entry"], []))
         legs_by_manifest.setdefault(row["parent"], []).append(row)
 
     # Forward/Reverse — the manifest's own Trip already carries this (shown
@@ -1987,9 +2004,11 @@ def get_manifest_detail(manifest) -> dict:
         stock_items.setdefault(item.parent, []).append(item)
 
     items = []
+    item_challans = _challans_by_stock_entry(stock_entry_names)
     for row in doc.transfers:
         items.append({
             "stock_entry": row.stock_entry,
+            "delivery_challan": ", ".join(item_challans.get(row.stock_entry, [])),
             "from_warehouse": row.from_warehouse,
             "to_warehouse": row.to_warehouse,
             "items": stock_items.get(row.stock_entry, []),
