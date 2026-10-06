@@ -2352,6 +2352,104 @@ def remove_transfer_from_manifest(manifest: str, stock_entry: str, reason: str) 
 
 
 @frappe.whitelist()
+def addable_transfers(manifest: str) -> list:
+    """Packed shipments that could still join this manifest: ready in Packed
+    Orders (fully packed, on no manifest), same company, and leaving from a
+    warehouse this manifest already picks up at — a driver collects them on
+    the same visit. One row per transfer, with its challan(s)."""
+    from ch_erp15.ch_erp15.custom.stock_entry import get_manifestable_stock_entries
+
+    doc = frappe.get_doc("CH Transfer Manifest", manifest)
+    doc.check_permission("read")
+    pickups = {s.warehouse for s in (doc.get("stops") or [])
+               if s.warehouse and s.stop_type in ("Pickup", "Pickup+Drop")}
+    pickups.add(doc.source_warehouse)
+    return [
+        row for row in get_manifestable_stock_entries(company=doc.company)
+        if row.get("ready") and row.get("from_warehouse") in pickups
+    ]
+
+
+@frappe.whitelist(methods=["POST"])
+def add_transfers_to_manifest(manifest: str, stock_entries) -> dict:
+    """Put more packed shipments on a manifest that has not left yet.
+
+    The counterpart of remove_transfer_from_manifest: the same window (no
+    trip, no pickup), and the same way of writing to a submitted manifest —
+    its transfers and stops tables are not allow_on_submit, so new rows are
+    inserted directly. Each shipment is checked exactly as Create Manifest
+    checks it (Packed, on no manifest, its challan Packed) and moves to Ready
+    For Pickup with it. A shipment going somewhere new adds that drop to the
+    manifest's stops, as it would have had it been ticked with the rest.
+    """
+    from ch_erp15.ch_erp15.custom.stock_entry import (
+        _authorize_stock_entry,
+        set_custom_status,
+    )
+
+    if isinstance(stock_entries, str):
+        stock_entries = frappe.parse_json(stock_entries)
+    names = [s.strip() for s in (stock_entries or []) if s and str(s).strip()]
+    if not names:
+        frappe.throw(_("Choose at least one shipment to add."))
+
+    doc = frappe.get_doc("CH Transfer Manifest", manifest)
+    doc.check_permission("write")
+    scope_guard.assert_manifest_scope(doc.as_dict(), side="source")
+    _assert_manifest_can_be_undone(doc)
+
+    allowed = {r["name"] for r in addable_transfers(manifest)}
+    for name in names:
+        se = _authorize_stock_entry(name, location="source")
+        if se.company != doc.company:
+            frappe.throw(_("{0} belongs to {1}, not {2}.").format(name, se.company, doc.company))
+        if name not in allowed:
+            frappe.throw(
+                _("{0} cannot join {1}: it must be fully Packed, on no other manifest, and "
+                  "leave from a warehouse this manifest picks up at.").format(name, doc.name),
+                title=_("Cannot Add Shipment"))
+
+    existing_stops = {s.name for s in (doc.get("stops") or [])}
+    existing_rows = {r.name for r in (doc.get("transfers") or [])}
+    for name in names:
+        doc.append("transfers", {"stock_entry": name})
+    # The manifest's own rules fill each new line and its drop stop.
+    doc._populate_transfer_details()
+    doc._seed_manifest_stops()
+
+    for stop in doc.get("stops") or []:
+        if stop.name in existing_stops:
+            stop.db_update()        # a pickup that is now also a drop
+        else:
+            stop.db_insert()
+    for row in doc.get("transfers") or []:
+        if row.name not in existing_rows:
+            row.db_insert()
+    frappe.db.set_value(
+        "CH Transfer Manifest", doc.name,
+        {
+            "total_stock_entries": len(doc.transfers),
+            "total_items": sum(cint(r.item_count) for r in doc.transfers),
+            "total_qty": sum(flt(r.total_qty) for r in doc.transfers),
+        },
+        update_modified=True,
+    )
+
+    for name in names:
+        frappe.db.set_value("Stock Entry", name, "custom_transfer_manifest", doc.name,
+                            update_modified=False)
+        set_custom_status(StockEntry=name, status="Ready For Pickup")
+    doc.add_comment("Comment", _("Shipments added by {0}: {1}").format(
+        frappe.session.user, ", ".join(names)))
+    return {
+        "manifest": doc.name,
+        "added": names,
+        "total": len(doc.transfers),
+        "message": _("{0} shipment(s) added to {1}.").format(len(names), doc.name),
+    }
+
+
+@frappe.whitelist()
 def driver_app_settings() -> dict:
     """The handful of site rules the driver app has to know up front.
 

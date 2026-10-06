@@ -1004,7 +1004,7 @@ class LogisticsCommandCenter {
 					</div>
 					<span class="lcc-muted lcc-ops-bar-hint">
 						<i class="fa fa-info-circle"></i>
-						${__("Showing fully Packed Stock Entries not yet on a manifest. Tick some and click Create Manifest to group them for dispatch.")}
+						${__("Showing packed delivery challans not yet on a manifest. Tick some and click Create Manifest to group them for dispatch — a transfer's challans go together, once every one of them is packed.")}
 					</span>
 				</div>
 				<div class="lcc-pack-body" id="lcc-pack-body">
@@ -1025,7 +1025,7 @@ class LogisticsCommandCenter {
 			}, 200));
 			$r.on("click", ".lcc-pack-create-manifest-btn", () => this._pack_create_manifest());
 			$r.on("change", ".lcc-pack-select-all", (e) => {
-				$r.find(".lcc-pack-row-check").prop("checked", e.currentTarget.checked);
+				$r.find(".lcc-pack-row-check:not(:disabled)").prop("checked", e.currentTarget.checked);
 				this._pack_update_create_btn();
 			});
 			$r.on("change", ".lcc-pack-row-check", (e) => {
@@ -1074,7 +1074,7 @@ class LogisticsCommandCenter {
 	_pack_render() {
 		const $b = $("#lcc-pack-body");
 		if (!(this.pack_queue || []).length) {
-			$b.html(`<div class="lcc-empty"><i class="fa fa-check-circle"></i> ${__("No fully Packed Stock Entries waiting to be grouped into a manifest.")}</div>`);
+			$b.html(`<div class="lcc-empty"><i class="fa fa-check-circle"></i> ${__("No packed delivery challans waiting to be grouped into a manifest.")}</div>`);
 			return;
 		}
 		const needle = String(this.pack_search || "").trim().toLowerCase();
@@ -1099,53 +1099,55 @@ class LogisticsCommandCenter {
 			}
 			const age = this._fmt_age(se.age_minutes, se.age_hours);
 
-			// Same status colors as the Stock Entry list view (stock_entry_list.js)
-			// — this queue is filtered to custom_status == "Packed" so it'll
-			// always render teal here, but kept as a real lookup rather than a
-			// hardcoded color so it stays correct if the filter ever loosens.
-			const status_colors = {
-				"Draft": "red", "Pending With Goods": "orange", "Partially Packed": "yellow",
-				"Packed": "teal", "Ready For Pickup": "teal", "Assigned": "blue",
-				"Ready For Receive": "cyan", "In Transit": "yellow", "Receive At Transit": "purple",
-				"Partially Transferred": "orange", "Transferred": "green", "Force Closed": "gray",
-				"Rejected": "red",
-			};
-			const status = se.custom_status || "";
-			const status_color = status_colors[status] || "gray";
 			const since = se.custom_status_since || se.creation;
-			// The challan is the document that travels with the carton, so
-			// that is the number the loader is holding when they look at
-			// this screen — the column is headed "Order ID" because that is
-			// what they call it, not because it is the Stock Entry name. A
-			// transfer sent in batches carries one challan per dispatch, and
-			// each is a full row of its own with its own qty. Status,
-			// warehouses, boxes, weight and age belong to the transfer (boxes
-			// don't record which dispatch they hold), so each row repeats
-			// them. A manifest takes the whole Stock Entry, so ticking one of
-			// a transfer's rows ticks its siblings too (see the row-check
-			// handler) and the manifest gets the transfer once.
+			// One row per delivery challan. The challan is the document that
+			// travels with the carton, so that is the number the loader is
+			// holding when they look at this screen — the column is headed
+			// "Order ID" because that is what they call it. A transfer sent in
+			// batches carries one challan per dispatch; each row has its own
+			// packing status, qty, boxes and weight (every box names the
+			// challan it was packed against).
+			//
+			// A transfer's challans leave on one manifest together, so ticking
+			// one ticks its siblings (see the row-check handler), and a
+			// transfer with a dispatch still being boxed is listed but cannot
+			// be ticked until that one is Packed too.
+			const ready = se.ready !== false;
+			const waiting = (se.waiting_for || []).map((n) => frappe.utils.escape_html(n)).join(", ");
 			const challans = (se.delivery_challan_rows || []).filter((c) => c && c.name);
+			// Boxes packed before they recorded their challan (older packing)
+			// only add up per transfer; show that total once, on the first row.
+			const boxes_per_challan = challans.some((c) => Number(c.box_count || 0));
 			const lines = challans.length
-				? challans.map((c) => ({
+				? challans.map((c, i) => ({
 					cell: frappe.utils.escape_html(c.name),
 					title: frappe.utils.escape_html(`${c.name} · ${se.name}`),
+					status: c.packing_status || "Not Packed",
 					qty: Number(c.qty || 0),
+					boxes: boxes_per_challan ? Number(c.box_count || 0) : (i === 0 ? box_count : 0),
+					weight: boxes_per_challan ? Number(c.weight_kg || 0) : (i === 0 ? weight : 0),
 				}))
 				: [{
 					cell: `<span class="text-muted">${__("Not raised")}</span>`,
 					title: frappe.utils.escape_html(`${__("No delivery challan")} · ${se.name}`),
+					status: se.custom_status || "Packed",
 					qty: total_qty,
+					boxes: box_count,
+					weight: weight,
 				}];
-			return lines.map((line) => `<tr>
-				<td><input type="checkbox" class="lcc-pack-row-check" data-name="${nm}"></td>
+			const pill = { "Packed": "green", "Partially Packed": "yellow", "Not Packed": "orange" };
+			return lines.map((line) => `<tr class="${ready ? "" : "text-muted"}">
+				<td><input type="checkbox" class="lcc-pack-row-check" data-name="${nm}"
+					${ready ? "" : `disabled title="${__("Waiting for {0} to be packed", [waiting])}"`}></td>
 				<td title="${line.title}">${line.cell}</td>
 				<td>${since ? frappe.datetime.str_to_user(since) : "—"}</td>
-				<td><span class="indicator-pill ${status_color}"><span>${frappe.utils.escape_html(__(status))}</span></span></td>
+				<td><span class="indicator-pill ${pill[line.status] || "gray"}"><span>${frappe.utils.escape_html(__(line.status))}</span></span>
+					${ready ? "" : `<div class="lcc-muted" style="font-size:11px;margin-top:2px">${__("Waiting for {0}", [waiting])}</div>`}</td>
 				<td>${window.ch_wh_label_html ? ch_wh_label_html(se.from_warehouse, "—") : frappe.utils.escape_html(se.from_warehouse || "—")}</td>
 				<td>${window.ch_wh_label_html ? ch_wh_label_html(se.to_warehouse, "—") : frappe.utils.escape_html(se.to_warehouse || "—")}</td>
 				<td class="tr">${line.qty}</td>
-				<td class="tr">${box_count}</td>
-				<td class="tr">${weight ? weight.toFixed(1) + " kg" : "—"}</td>
+				<td class="tr">${line.boxes}</td>
+				<td class="tr">${line.weight ? line.weight.toFixed(1) + " kg" : "—"}</td>
 				<td><span class="lcc-sev ${age_cls}">${age}</span></td>
 			</tr>`).join("");
 		}).join("");
@@ -1174,11 +1176,12 @@ class LogisticsCommandCenter {
 
 	_pack_update_create_btn() {
 		const $r = this.$root;
+		// Counted in challans — the rows ticked — not in transfers.
 		const n = $r.find(".lcc-pack-row-check:checked").length;
 		const $btn = $r.find(".lcc-pack-create-manifest-btn");
 		$btn.prop("disabled", n === 0);
 		$btn.html(`<i class="fa fa-plus"></i> ${__("Create Manifest")}${n ? ` (${n})` : ""}`);
-		const total = $r.find(".lcc-pack-row-check").length;
+		const total = $r.find(".lcc-pack-row-check:not(:disabled)").length;
 		$r.find(".lcc-pack-select-all").prop("checked", total > 0 && n === total);
 	}
 
@@ -1199,10 +1202,11 @@ class LogisticsCommandCenter {
 	 */
 	_pack_create_manifest() {
 		const $r = this.$root;
+		const challan_count = $r.find(".lcc-pack-row-check:checked").length;
 		const names = [...new Set(
 			$r.find(".lcc-pack-row-check:checked").map((_, el) => $(el).data("name")).get())];
 		if (!names.length) {
-			frappe.msgprint(__("Tick at least one Stock Entry."));
+			frappe.msgprint(__("Tick at least one delivery challan."));
 			return;
 		}
 		// No exact-route pre-check here — a manifest can now carry a
@@ -1229,7 +1233,7 @@ class LogisticsCommandCenter {
 				return frappe.call({ method: "frappe.client.submit", args: { doc } });
 			}).then(() => {
 				frappe.show_alert({
-					message: __("Manifest {0} created with {1} Stock Entry(s) and moved to Operations.", [manifest_name, names.length]),
+					message: __("Manifest {0} created with {1} delivery challan(s) and moved to Operations.", [manifest_name, challan_count]),
 					indicator: "green",
 				}, 6);
 				this._pack_load();
@@ -1698,14 +1702,14 @@ class LogisticsCommandCenter {
 			const nm = encodeURIComponent(m.name);
 			return `<tr>
 			<td><input type="checkbox" class="lcc-mf-check" data-name="${m.name}"></td>
-			<td><a href="/app/ch-transfer-manifest/${nm}" class="lcc-mf-open" data-name="${frappe.utils.escape_html(m.name)}">${frappe.utils.escape_html(m.name)}</a></td>
-			<td><span class="indicator-pill ${color}">${status}</span></td>
-			<td>${frappe.utils.escape_html(m.direction || "—")}</td>
-			<td><span class="lcc-prio lcc-prio-${(m.shipment_priority || "Normal").toLowerCase()}">${m.shipment_priority || "Normal"}</span></td>
-			<td>${window.ch_wh_label_html ? ch_wh_label_html(m.source_warehouse, "—") : frappe.utils.escape_html(m.source_warehouse || "—")} → ${lcc_destinations_html(m)}</td>
+			<td style="white-space:nowrap"><a href="/app/ch-transfer-manifest/${nm}" class="lcc-mf-open" data-name="${frappe.utils.escape_html(m.name)}">${frappe.utils.escape_html(m.name)}</a></td>
+			<td style="white-space:nowrap"><span class="indicator-pill ${color}" style="white-space:nowrap">${status}</span></td>
+			<td style="white-space:nowrap">${frappe.utils.escape_html(m.direction || "—")}</td>
+			<td style="white-space:nowrap"><span class="lcc-prio lcc-prio-${(m.shipment_priority || "Normal").toLowerCase()}">${m.shipment_priority || "Normal"}</span></td>
+			<td style="width:100%">${window.ch_wh_label_html ? ch_wh_label_html(m.source_warehouse, "—") : frappe.utils.escape_html(m.source_warehouse || "—")} → ${lcc_destinations_html(m)}</td>
 			<td class="tr">${m.total_qty || 0}</td>
 			<td class="tr">${m.box_count || 0}</td>
-			<td>${frappe.datetime.str_to_user(m.creation)}</td>
+			<td style="white-space:nowrap">${frappe.datetime.str_to_user(m.creation)}</td>
 			<td class="text-right" style="white-space:nowrap">
 				<button class="btn btn-xs btn-default lcc-mf-shipments" data-name="${frappe.utils.escape_html(m.name)}">
 					${__("Shipments")}</button>
@@ -2026,6 +2030,13 @@ class LogisticsCommandCenter {
 				title: __("Shipments on {0}", [manifest]),
 				size: "large",
 				fields: [{ fieldtype: "HTML", fieldname: "list" }],
+				// More packed shipments can join until the manifest is on a
+				// trip or picked up — the server holds the same line.
+				primary_action_label: __("Add Shipments"),
+				primary_action: () => {
+					d.hide();
+					this._ops_manifest_add_shipments(manifest);
+				},
 			});
 			d.fields_dict.list.$wrapper.html(`
 				<p class="text-muted small">${__(
@@ -2066,6 +2077,82 @@ class LogisticsCommandCenter {
 					__("Remove {0}", [stock_entry]),
 					__("Remove")
 				);
+			});
+			d.show();
+		});
+	}
+
+	// Packed shipments that can still join a manifest: fully packed, on no
+	// manifest, leaving from a warehouse it already picks up at. One line per
+	// delivery challan, as in Packed Orders.
+	_ops_manifest_add_shipments(manifest) {
+		frappe.call({
+			method: _TMA + "addable_transfers",
+			args: { manifest },
+		}).then((r) => {
+			const rows = (r && r.message) || [];
+			const esc = frappe.utils.escape_html;
+			const wh = (w) => (window.ch_wh_label ? ch_wh_label(w) : w) || "—";
+			if (!rows.length) {
+				frappe.msgprint({
+					title: __("Nothing to add"),
+					indicator: "orange",
+					message: __("No packed shipment is waiting at a pickup point of {0}. Pack the challan and Mark as Packed first.", [manifest]),
+				});
+				return;
+			}
+			const lines = rows.flatMap((se) => {
+				const challans = (se.delivery_challan_rows || []).filter((c) => c && c.name);
+				return (challans.length ? challans : [{ name: "", qty: se.total_qty, box_count: se.box_count }])
+					.map((c) => `<tr>
+						<td><input type="checkbox" class="ch-mf-add" data-se="${esc(se.name)}"></td>
+						<td>${esc(c.name || "—")}<div class="text-muted small">${esc(se.name)}</div></td>
+						<td class="small">${esc(wh(se.from_warehouse))} → ${esc(wh(se.to_warehouse))}</td>
+						<td class="text-right">${flt(c.qty) || 0}</td>
+						<td class="text-right">${cint(c.box_count) || 0}</td>
+					</tr>`);
+			}).join("");
+			const d = new frappe.ui.Dialog({
+				title: __("Add Shipments to {0}", [manifest]),
+				size: "large",
+				fields: [{ fieldtype: "HTML", fieldname: "list" }],
+				primary_action_label: __("Add"),
+				primary_action: () => {
+					const picked = [...new Set(d.$wrapper.find(".ch-mf-add:checked")
+						.map((_, el) => $(el).data("se")).get())];
+					if (!picked.length) {
+						frappe.msgprint(__("Tick at least one delivery challan."));
+						return;
+					}
+					frappe.call({
+						method: _TMA + "add_transfers_to_manifest",
+						args: { manifest, stock_entries: JSON.stringify(picked) },
+						freeze: true,
+						freeze_message: __("Adding shipments…"),
+					}).then((res) => {
+						d.hide();
+						frappe.show_alert({
+							message: (res && res.message && res.message.message) || __("Shipments added"),
+							indicator: "green",
+						}, 6);
+						this._ops_load();
+					});
+				},
+			});
+			d.fields_dict.list.$wrapper.html(`
+				<p class="text-muted small">${__(
+					"Packed delivery challans not on any manifest, leaving from a pickup point of this manifest. "
+					+ "A new destination becomes a new drop on the route.")}</p>
+				<table class="table table-bordered table-condensed">
+					<thead><tr><th></th><th>${__("Delivery Challan")}</th><th>${__("Route")}</th>
+						<th class="text-right">${__("Qty")}</th><th class="text-right">${__("Boxes")}</th></tr></thead>
+					<tbody>${lines}</tbody>
+				</table>`);
+			// A transfer's challans travel together, so they tick together.
+			d.$wrapper.on("change", ".ch-mf-add", (e) => {
+				const se = $(e.currentTarget).data("se");
+				d.$wrapper.find(".ch-mf-add").filter((_, el) => $(el).data("se") === se)
+					.prop("checked", e.currentTarget.checked);
 			});
 			d.show();
 		});
