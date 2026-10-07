@@ -1827,8 +1827,13 @@ class LogisticsCommandCenter {
 				$wrap().html(`<div class="lcc-empty">${__("No shipments found on this manifest.")}</div>`);
 				return;
 			}
+			// The transfer request leads, as it did before the challan was
+			// added: it is the ID the stock team raised and asks about. The
+			// challan stays beside it, and either one opens the items.
 			const body = se_rows.map((se) => `<tr>
-					<td>${challan(se)}</td>
+					<td><a href="#" class="lcc-se-open" data-se="${esc(se.stock_entry)}">${esc(se.stock_entry)}</a></td>
+					<td>${(se.delivery_challans || []).filter(Boolean).length
+						? challan(se) : `<span class="text-muted small">${__("challan not raised")}</span>`}</td>
 					<td class="tr">${se.qty != null ? se.qty : "—"}</td>
 					<td>${date(se.posting_date)}</td>
 					<td>${loc(se.from_warehouse)}</td>
@@ -1838,6 +1843,7 @@ class LogisticsCommandCenter {
 			$wrap().html(`
 				<div class="lcc-table-wrap"><table class="lcc-table">
 					<thead><tr>
+						<th>${__("Transfer Request")}</th>
 						<th>${__("Delivery Challan")}</th>
 						<th class="tr">${__("Qty")}</th>
 						<th>${__("Date")}</th>
@@ -1850,9 +1856,10 @@ class LogisticsCommandCenter {
 		};
 
 		const render_items = (se) => {
-			const clicked = (se.delivery_challans || []).filter(Boolean).join(", ")
-				|| se.stock_entry;
-			d.set_title(__("{0} — Items", [clicked]));
+			const challans = (se.delivery_challans || []).filter(Boolean).join(", ");
+			d.set_title(challans
+				? __("{0} ({1}) — Items", [se.stock_entry, challans])
+				: __("{0} — Items", [se.stock_entry]));
 			const rows = item_rows.filter((r) => r.stock_entry === se.stock_entry);
 			const back = `<div class="lcc-back" style="margin-bottom:8px">
 				<a href="#" class="lcc-back-to-se"><i class="fa fa-arrow-left"></i> ${__("Back to Shipments")}</a>
@@ -2852,6 +2859,15 @@ class LogisticsCommandCenter {
 						: __("{0} (no contact on file)", [p.executive_name]),
 				})),
 				default: people.length === 1 ? people[0].name : "",
+				reqd: 1,
+			});
+		} else {
+			// Nobody on the store's roster: the name is typed, as the driver
+			// app does, so a courier delivery still says who took the goods.
+			fields.push({
+				fieldname: "receiver_name", fieldtype: "Data", reqd: 1,
+				label: __("Receiver Name — {0}", [who]),
+				description: __("No POS Executive is on file for this store. Type the name of the person who received the goods."),
 			});
 		}
 		fields.push({
@@ -2894,7 +2910,9 @@ class LogisticsCommandCenter {
 				}
 				frappe.call({
 					method: _LCC + "trip_deliver_stop",
-					args: { trip, sequence: stop.sequence, otp, delivered_at },
+					args: { trip, sequence: stop.sequence, otp, delivered_at,
+						receiver: values.receiver || null,
+						receiver_name: (values.receiver_name || "").trim() || null },
 					freeze: true, freeze_message: __("Handing over..."),
 				}).then((r) => {
 					const out = r.message || {};

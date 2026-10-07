@@ -87,6 +87,9 @@ scheduler_events = {
 		# Predictive ETA + SLA-breach early warning for in-progress trips.
 		"*/10 * * * *": [
 			"ch_logistics.api.optimizer.check_eta_sla_breaches",
+			# Catch up any trip whose stops / status were not advanced when a
+			# delivery happened (the update is tried once, at that moment).
+			"ch_logistics.logistics.doctype.ch_logistics_trip.ch_logistics_trip.reconcile_trip_progress",
 		],
 		# Daily logistics digest to managers (server-time hour; gated by
 		# CH Logistics Settings → Send Daily Logistics Digest).

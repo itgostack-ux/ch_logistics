@@ -1171,7 +1171,7 @@ class CHTransferManifest(Document):
         from ch_logistics.api.customer_tracking import notify_destination
         notify_destination(self.name, "out_for_delivery")
 
-    def _scanned_matches_own_shipment(self, scanned):
+    def _scanned_matches_own_shipment(self, scanned, stock_entry=None):
         """True if ``scanned`` identifies a Stock Entry actually linked to
         THIS manifest — either its bare name, or a box label of the form
         ``{stock_entry}-B{NN}`` (see CH Stock Entry Box Label / pack_box_stock_entry).
@@ -1182,11 +1182,18 @@ class CHTransferManifest(Document):
         guessable if you already know the shipment), but still requires
         knowing which specific Stock Entries are on THIS exact manifest, not
         just any string, so it isn't a free pass around the scan requirement.
+
+        With ``stock_entry`` only THAT shipment's own codes count. A manifest
+        carries several shipments, and a driver accepting or delivering one of
+        them by scanning another's box — challan 7 for challan 1 — must be
+        stopped: the scan is the proof that this box is the one in hand.
         """
         scanned = (scanned or "").strip()
         if not scanned:
             return False
         stock_entries = {row.stock_entry for row in (self.transfers or []) if row.stock_entry}
+        if stock_entry:
+            stock_entries &= {stock_entry}
         if scanned in stock_entries:
             return True
         # Legacy box label form: strip a trailing "-B<digits>" and compare
@@ -1225,7 +1232,27 @@ class CHTransferManifest(Document):
                 return True
         return False
 
-    def _validate_pickup_qr(self, scanned_qr):
+    def _refuse_other_shipments_code(self, scanned, stock_entry):
+        """A code that belongs to this manifest but to another of its
+        shipments: say so, rather than a bare "Wrong QR"."""
+        if not stock_entry or not self._scanned_matches_own_shipment(scanned):
+            return
+        frappe.throw(
+            _("This QR belongs to another shipment on this manifest, not to {0}. "
+              "Scan the label of the shipment you are handling.").format(
+                self._shipment_label(stock_entry)),
+            title=_("Wrong QR"))
+
+    def _shipment_label(self, stock_entry):
+        """The number the driver knows a shipment by: its Delivery Challan,
+        or the transfer's own number where there is none."""
+        challan = None
+        if frappe.db.exists("DocType", "CH Delivery Challan"):
+            challan = frappe.db.get_value(
+                "CH Delivery Challan", {"stock_entry": stock_entry}, "name")
+        return challan or stock_entry
+
+    def _validate_pickup_qr(self, scanned_qr, stock_entry=None):
         """Enforce the mandatory pickup scan (Ekart/Delhivery: every shipment is
         scanned at handover). The scanned payload must match this manifest's
         ``qr_payload`` token (or, for legacy rows, the manifest name), OR
@@ -1238,8 +1265,9 @@ class CHTransferManifest(Document):
         if not scanned:
             frappe.throw(_("QR scan is mandatory. Scan the manifest/order QR to start pickup."),
                          title=_("Scan Required"))
-        if self._scanned_matches_own_shipment(scanned):
+        if self._scanned_matches_own_shipment(scanned, stock_entry):
             return
+        self._refuse_other_shipments_code(scanned, stock_entry)
         if len(expected) < 22 or expected == self.name:
             frappe.throw(_("This manifest is missing a secure QR token. Reassign it before pickup."),
                          title=_("QR Token Missing"))
@@ -1263,7 +1291,7 @@ class CHTransferManifest(Document):
             ) if b
         ]
         if len(box_labels) <= 1:
-            self._validate_pickup_qr(scanned_list[0] if scanned_list else "")
+            self._validate_pickup_qr(scanned_list[0] if scanned_list else "", stock_entry)
             return
         if not scanned_list:
             frappe.throw(
@@ -1299,7 +1327,7 @@ class CHTransferManifest(Document):
             ) if b
         ]
         if len(box_labels) <= 1:
-            self._validate_delivery_qr(scanned_list[0] if scanned_list else "")
+            self._validate_delivery_qr(scanned_list[0] if scanned_list else "", stock_entry)
             return
 
         enforce = frappe.db.get_single_value("CH Logistics Settings", "enforce_delivery_qr")
@@ -1322,7 +1350,7 @@ class CHTransferManifest(Document):
                 title=_("Scan All Boxes"),
             )
 
-    def _validate_delivery_qr(self, scanned_qr):
+    def _validate_delivery_qr(self, scanned_qr, stock_entry=None):
         """Enforce the mandatory delivery scan (same handover ritual as pickup,
         on the receiver side). Gated by ``enforce_delivery_qr`` so it can be
         relaxed for last-mile B2C lanes that don't carry a returnable QR."""
@@ -1335,8 +1363,9 @@ class CHTransferManifest(Document):
         if not scanned:
             frappe.throw(_("QR scan is mandatory. Scan the manifest/order QR to complete delivery."),
                          title=_("Scan Required"))
-        if self._scanned_matches_own_shipment(scanned):
+        if self._scanned_matches_own_shipment(scanned, stock_entry):
             return
+        self._refuse_other_shipments_code(scanned, stock_entry)
         if len(expected) < 22 or expected == self.name:
             frappe.throw(_("This manifest is missing a secure QR token. Reassign it before delivery."),
                          title=_("QR Token Missing"))
@@ -2671,12 +2700,12 @@ class CHTransferManifest(Document):
 
             if trip.status == "Started" and all_delivered:
                 trip.mark_completed()
-                trip.save(ignore_permissions=True)
+                trip.save_status_rollup()
                 trip.reload()
 
             if not blocks_close and trip.status == "Completed":
                 trip.mark_closed()
-                trip.save(ignore_permissions=True)
+                trip.save_status_rollup()
         except Exception:
             frappe.log_error(
                 frappe.get_traceback(),
@@ -2783,8 +2812,7 @@ class CHTransferManifest(Document):
                 changed = True
 
             if changed:
-                trip.flags.ignore_validate_update_after_submit = True
-                trip.save(ignore_permissions=True)
+                trip.save_status_rollup()
         except Exception:
             frappe.log_error(
                 frappe.get_traceback(),

@@ -82,6 +82,15 @@ class CHLogisticsTrip(Document):
         self.name = make_autoname(f"{abbr}TP{year}.######", doc=self)
 
     def validate(self):
+        if self.flags.get("status_rollup"):
+            # The system bringing the trip's statuses up to date after a
+            # delivery (see save_status_rollup). Nothing about the plan is
+            # being changed, so the plan is not re-examined: a stop naming a
+            # warehouse that has since been removed, a gap in the stop
+            # numbers or a vehicle double-booked elsewhere is a planning
+            # fault for ops to fix, and it must not leave a delivered
+            # shipment's trip sitting in Started with nobody told.
+            return
         self._validate_stops()
         self._validate_planned_times()
         self._resolve_route()
@@ -94,6 +103,24 @@ class CHLogisticsTrip(Document):
 
     def before_save(self):
         self._enforce_status_transition()
+
+    def save_status_rollup(self):
+        """Save a change of status made by the system, not by a planner.
+
+        Used when a delivery completes a stop or the trip itself. The status
+        transition rules still apply (before_save); the planning checks and
+        the link check on every stop do not — see validate().
+        """
+        self.flags.status_rollup = True
+        self.flags.ignore_links = True
+        self.flags.ignore_mandatory = True
+        self.flags.ignore_validate_update_after_submit = True
+        try:
+            self.save(ignore_permissions=True)
+        finally:
+            self.flags.status_rollup = False
+            self.flags.ignore_links = False
+            self.flags.ignore_mandatory = False
 
     def _validate_vehicle_assignment(self):
         """Each vehicle is assigned to one driver at a time — block handing the
@@ -792,3 +819,40 @@ class CHLogisticsTrip(Document):
             self.status = "Closed"
         finally:
             frappe.db.sql("SELECT RELEASE_LOCK(%s)", (_lk,))
+
+
+def reconcile_trip_progress(limit: int = 200) -> dict:
+    """Scheduled: bring every open trip's stops and status up to date with
+    what has actually been delivered.
+
+    A delivery updates its trip as it happens, but that is one attempt at one
+    moment — if it fails (it is logged, never shown to the driver) nothing
+    tried again, and a fully delivered trip stayed in Started until somebody
+    noticed and pressed Complete. This runs the same two steps for each open
+    trip, so a missed update is caught up within minutes.
+    """
+    done = {"checked": 0, "advanced": []}
+    for trip in frappe.get_all(
+            "CH Logistics Trip", filters={"status": ("in", ("Started", "Completed"))},
+            fields=["name", "status", "transport_mode"], order_by="modified asc",
+            limit_page_length=limit):
+        if (trip.transport_mode or "Own") != "Own":
+            continue        # courier / third-party trips are moved by ops, by hand
+        manifest = frappe.db.get_value(
+            "CH Transfer Manifest", {"trip": trip.name, "docstatus": ("<", 2)}, "name")
+        if not manifest:
+            continue
+        done["checked"] += 1
+        try:
+            doc = frappe.get_doc("CH Transfer Manifest", manifest)
+            doc._cascade_stop_status_to_trip()
+            doc._maybe_auto_close_parent_trip()
+            frappe.db.commit()
+        except Exception:
+            frappe.db.rollback()
+            frappe.log_error(frappe.get_traceback(), f"trip reconcile failed for {trip.name}")
+            continue
+        now = frappe.db.get_value("CH Logistics Trip", trip.name, "status")
+        if now != trip.status:
+            done["advanced"].append(f"{trip.name}: {trip.status} -> {now}")
+    return done

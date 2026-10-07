@@ -263,11 +263,18 @@ def trip_request_stop_otp(trip, sequence, receiver=None) -> dict:
 
 
 @frappe.whitelist(methods=["POST"])
-def trip_deliver_stop(trip, sequence, otp=None, delivered_at=None) -> dict:
+def trip_deliver_stop(trip, sequence, otp=None, delivered_at=None,
+                      receiver=None, receiver_name=None) -> dict:
     """Hand one stop's goods over, against that store's code.
 
     The trip itself only moves once every drop stop has been confirmed: a
     delivery half the stores acknowledged is not a delivery.
+
+    Who took the goods is recorded as it is for a driver's delivery:
+    ``receiver`` is the store's POS Executive ops picked, ``receiver_name`` a
+    typed name where the store has nobody on its roster. A courier hands the
+    box to a person, and without the name a courier delivery showed nobody
+    as having received it.
     """
     doc = _load_manual_trip(trip, _("move logistics trips"))
     entry = next((e for e in _drop_stops(doc) if cint(e["stop"].sequence) == cint(sequence)), None)
@@ -275,6 +282,10 @@ def trip_deliver_stop(trip, sequence, otp=None, delivered_at=None) -> dict:
         frappe.throw(_("Stop #{0} has nothing left to deliver.").format(sequence))
     stop = entry["stop"]
     delivered = _delivery_stamp(delivered_at)
+    received_by = _stop_receiver_name(receiver, receiver_name)
+    if not received_by:
+        frappe.throw(_("Say who received the goods at stop #{0}.").format(stop.sequence),
+                     title=_("Receiver Name"))
 
     from ch_logistics.logistics.doctype.ch_logistics_otp_log.ch_logistics_otp_log import (
         verify_manifest_otp,
@@ -283,6 +294,7 @@ def trip_deliver_stop(trip, sequence, otp=None, delivered_at=None) -> dict:
     verified = []
     for row in entry["rows"]:
         mf = frappe.get_doc("CH Transfer Manifest", row.name)
+        _record_stop_receiver(mf, received_by)
         # Every stop proves itself. A manifest already confirmed at an earlier
         # stop is not excused here: the store standing at THIS one reads out
         # the code issued for it.
@@ -335,6 +347,30 @@ def trip_deliver_stop(trip, sequence, otp=None, delivered_at=None) -> dict:
     return {"ok": True, "trip": doc.name, "sequence": cint(stop.sequence),
             "status": doc.status, "delivered_at": str(delivered), "pending": [],
             "state": {"trip": doc.name, "status": doc.status, "stops": [], "pending": []}}
+
+
+def _stop_receiver_name(receiver, receiver_name) -> str:
+    """The name to keep for whoever took the goods: the chosen POS
+    Executive's own name, or what was typed."""
+    receiver = (receiver or "").strip()
+    if receiver and frappe.db.exists("DocType", "POS Executive"):
+        row = frappe.db.get_value(
+            "POS Executive", receiver, ["executive_name", "user"], as_dict=True)
+        if row:
+            return (row.executive_name or row.user or receiver).strip()
+    return (receiver_name or "").strip()
+
+
+def _record_stop_receiver(mf, received_by) -> None:
+    """Keep the receiver on the manifest and on each of its shipments — the
+    two places a driver's delivery writes it, so reports read both alike."""
+    mf.db_set("receiver_name", received_by, update_modified=False)
+    if frappe.db.has_column("CH Transfer Manifest Item", "delivery_receiver_name"):
+        frappe.db.sql(
+            """UPDATE `tabCH Transfer Manifest Item`
+                  SET delivery_receiver_name = %s
+                WHERE parent = %s AND IFNULL(delivery_receiver_name, '') = ''""",
+            (received_by, mf.name))
 
 
 def _delivery_stamp(delivered_at):
