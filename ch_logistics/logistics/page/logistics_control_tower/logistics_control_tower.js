@@ -1415,7 +1415,17 @@ class LogisticsCommandCenter {
 		$r.on("click",  ".lcc-trip-link",     (e) => { e.preventDefault(); this._ops_open_trip($(e.currentTarget).data("name")); });
 
 		// Per-row print actions for the Operations → Manifests panel.
-		$r.on("click", ".lcc-mf-open",          (e) => { e.preventDefault(); this._ops_show_manifest_items($(e.currentTarget).data("name")); });
+		$r.on("click", ".lcc-mf-open", (e) => {
+			// Ctrl / Cmd-click still opens the manifest form in a new tab.
+			if (e.ctrlKey || e.metaKey) return;
+			// The link carries the form's address, and Frappe's own handler on
+			// <body> routes every such link — preventDefault alone does not
+			// stop it, so the click must not reach it or the form opens over
+			// the breakdown this is meant to show.
+			e.preventDefault();
+			e.stopPropagation();
+			this._ops_show_manifest_items($(e.currentTarget).data("name"));
+		});
 		$r.on("click", ".lcc-mf-print-box",     (e) => { e.preventDefault(); this._ops_print_manifest($(e.currentTarget).data("name"), "CH Transfer Manifest Label"); });
 		$r.on("click", ".lcc-mf-print-receipt", (e) => { e.preventDefault(); this._ops_print_manifest($(e.currentTarget).data("name"), "ePOD Transfer Manifest"); });
 		$r.on("click", ".lcc-mf-print-ewb",     (e) => { e.preventDefault(); this._ops_print_ewaybills($(e.currentTarget).data("name")); });
@@ -1702,7 +1712,7 @@ class LogisticsCommandCenter {
 			const nm = encodeURIComponent(m.name);
 			return `<tr>
 			<td><input type="checkbox" class="lcc-mf-check" data-name="${m.name}"></td>
-			<td style="white-space:nowrap"><a href="/app/ch-transfer-manifest/${nm}" class="lcc-mf-open" data-name="${frappe.utils.escape_html(m.name)}">${frappe.utils.escape_html(m.name)}</a></td>
+			<td style="white-space:nowrap"><a href="/app/ch-transfer-manifest/${nm}" class="lcc-mf-open" data-opens-in-place="1" data-name="${frappe.utils.escape_html(m.name)}">${frappe.utils.escape_html(m.name)}</a></td>
 			<td style="white-space:nowrap"><span class="indicator-pill ${color}" style="white-space:nowrap">${status}</span></td>
 			<td style="white-space:nowrap">${frappe.utils.escape_html(m.direction || "—")}</td>
 			<td style="white-space:nowrap"><span class="lcc-prio lcc-prio-${(m.shipment_priority || "Normal").toLowerCase()}">${m.shipment_priority || "Normal"}</span></td>
@@ -1827,13 +1837,8 @@ class LogisticsCommandCenter {
 				$wrap().html(`<div class="lcc-empty">${__("No shipments found on this manifest.")}</div>`);
 				return;
 			}
-			// The transfer request leads, as it did before the challan was
-			// added: it is the ID the stock team raised and asks about. The
-			// challan stays beside it, and either one opens the items.
 			const body = se_rows.map((se) => `<tr>
-					<td><a href="#" class="lcc-se-open" data-se="${esc(se.stock_entry)}">${esc(se.stock_entry)}</a></td>
-					<td>${(se.delivery_challans || []).filter(Boolean).length
-						? challan(se) : `<span class="text-muted small">${__("challan not raised")}</span>`}</td>
+					<td>${challan(se)}</td>
 					<td class="tr">${se.qty != null ? se.qty : "—"}</td>
 					<td>${date(se.posting_date)}</td>
 					<td>${loc(se.from_warehouse)}</td>
@@ -1843,7 +1848,6 @@ class LogisticsCommandCenter {
 			$wrap().html(`
 				<div class="lcc-table-wrap"><table class="lcc-table">
 					<thead><tr>
-						<th>${__("Transfer Request")}</th>
 						<th>${__("Delivery Challan")}</th>
 						<th class="tr">${__("Qty")}</th>
 						<th>${__("Date")}</th>
@@ -1856,10 +1860,9 @@ class LogisticsCommandCenter {
 		};
 
 		const render_items = (se) => {
-			const challans = (se.delivery_challans || []).filter(Boolean).join(", ");
-			d.set_title(challans
-				? __("{0} ({1}) — Items", [se.stock_entry, challans])
-				: __("{0} — Items", [se.stock_entry]));
+			const clicked = (se.delivery_challans || []).filter(Boolean).join(", ")
+				|| se.stock_entry;
+			d.set_title(__("{0} — Items", [clicked]));
 			const rows = item_rows.filter((r) => r.stock_entry === se.stock_entry);
 			const back = `<div class="lcc-back" style="margin-bottom:8px">
 				<a href="#" class="lcc-back-to-se"><i class="fa fa-arrow-left"></i> ${__("Back to Shipments")}</a>
@@ -1870,7 +1873,7 @@ class LogisticsCommandCenter {
 			}
 			const body = rows.map((row) => `<tr>
 					<td>
-						<a href="#" class="lcc-item-open" data-order="${esc(se.stock_entry)}" data-item="${esc(row.item_code || "")}">
+						<a href="#" class="lcc-item-open" data-order="${esc(se.stock_entry)}" data-label="${esc(clicked)}" data-item="${esc(row.item_code || "")}">
 							${esc(row.item_name || row.item_code || "—")}
 						</a>
 					</td>
@@ -1907,7 +1910,7 @@ class LogisticsCommandCenter {
 		d.$wrapper.on("click", ".lcc-item-open", (e) => {
 			e.preventDefault();
 			const $t = $(e.currentTarget);
-			this._ops_show_order_serials($t.data("order"), $t.data("item"));
+			this._ops_show_order_serials($t.data("order"), $t.data("item"), $t.data("label"));
 		});
 
 		try {
@@ -1925,9 +1928,11 @@ class LogisticsCommandCenter {
 		}
 	}
 
-	async _ops_show_order_serials(order_id, item_code) {
+	async _ops_show_order_serials(order_id, item_code, label) {
 		const d = new frappe.ui.Dialog({
-			title: __("Order {0}", [order_id]),
+			// Named by its Delivery Challan when opened from one, so all three
+			// levels of the manifest drill-down carry the same number.
+			title: __("Order {0}", [label || order_id]),
 			size: "large",
 			fields: [{ fieldname: "serials_html", fieldtype: "HTML" }],
 		});
