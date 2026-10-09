@@ -1148,8 +1148,12 @@ def _receiver_contacts(receiver) -> tuple:
 
 
 def _send_delivery_otp(doc, plaintext_otp=None, receiver=None,
-                       store=None, warehouse=None) -> dict:
+                       store=None, warehouse=None, stock_entry=None) -> dict:
     """Send delivery OTP to the connected destination warehouse + store contacts.
+
+    `stock_entry` narrows the notice to one shipment on the manifest: the
+    driver delivers them one at a time, each with its own fresh code, so each
+    gets its own mail naming its own Delivery Challan, sent to its own store.
 
     Recipient order (highest priority first):
       1. Destination Warehouse contacts (email_id / phone_no / mobile_no)
@@ -1182,6 +1186,11 @@ def _send_delivery_otp(doc, plaintext_otp=None, receiver=None,
     # over, which is not always the manifest's header destination: one
     # manifest can drop legs at two stores. The caller passes the stop's own
     # store/warehouse so the code goes to the people standing there.
+    leg = next((row for row in (doc.transfers or [])
+                if stock_entry and row.stock_entry == stock_entry), None)
+    if leg and not warehouse:
+        warehouse = leg.to_warehouse
+        store = store or store_for_warehouse(warehouse)
     destination_warehouse = warehouse or doc.destination_warehouse
     destination_store = store or doc.destination_store \
         or store_for_warehouse(destination_warehouse)
@@ -1237,14 +1246,27 @@ def _send_delivery_otp(doc, plaintext_otp=None, receiver=None,
 
     subject = _("Delivery OTP for Manifest {0}").format(doc.name)
     manifest_url = frappe.utils.get_url_to_form("CH Transfer Manifest", doc.name)
+
+    # The mail names the Delivery Challan, not the manifest: the challan is
+    # the number on the paperwork and the box label, which is what the store
+    # has in its hands. And one mail per challan, never two challans in one:
+    # the store files and checks each delivery against its own challan. Only
+    # the challans being dropped at this stop -- a consolidated manifest
+    # carries other stores' too. A shipment with no challan raised yet still
+    # says which manifest it is.
+    legs = [leg] if leg else [
+        row for row in (doc.transfers or [])
+        if not warehouse or row.to_warehouse == destination_warehouse
+    ] or list(doc.transfers or [])
+    leg_challans = _challans_by_stock_entry([row.stock_entry for row in legs])
     company_name = doc.company or "Congruence Holdings"
-    message = _(
+    mail_template = _(
         "<div style='font-family:Segoe UI,Arial,sans-serif;max-width:680px;border:1px solid #e5e7eb;border-radius:10px;overflow:hidden'>"
         "<div style='background:#0f172a;color:#ffffff;padding:12px 16px;font-weight:600'>{company_name} - Transfer Delivery OTP</div>"
         "<div style='padding:16px'><p>A delivery is on its way to your store.</p>"
         "<table style='border-collapse:collapse;font-size:14px'>"
-        "<tr><td style='padding:6px;font-weight:bold'>Manifest</td>"
-        "<td style='padding:6px'>{manifest}</td></tr>"
+        "<tr><td style='padding:6px;font-weight:bold'>{reference_label}</td>"
+        "<td style='padding:6px'>{reference}</td></tr>"
         "<tr><td style='padding:6px;font-weight:bold'>Driver</td>"
         "<td style='padding:6px'>{driver}</td></tr>"
         "<tr><td style='padding:6px;font-weight:bold'>Items</td>"
@@ -1252,18 +1274,46 @@ def _send_delivery_otp(doc, plaintext_otp=None, receiver=None,
         "</table>"
         "<p style='font-size:20px;font-weight:bold;letter-spacing:4px'>"
         "OTP: {otp}</p>"
+        "{shared_note}"
         "<p>Share this OTP with the driver only after physically verifying all items.</p>"
         "<p style='margin-top:16px'><a href='{manifest_url}' style='background:#0b57d0;color:#ffffff;text-decoration:none;padding:10px 14px;border-radius:6px;display:inline-block;font-weight:600'>Open Manifest</a></p>"
         "</div></div>"
-    ).format(
-        company_name=company_name,
-        manifest=doc.name,
-        driver=doc.driver_name or doc.driver or "—",
-        items=doc.total_items or 0,
-        qty=doc.total_qty or 0,
-        otp=plaintext_otp,
-        manifest_url=manifest_url,
     )
+    driver_label = doc.driver_name or doc.driver or "—"
+    with_challan = [row for row in legs if leg_challans.get(row.stock_entry)]
+    # (reference label, reference, lines, units) for each mail.
+    if with_challan:
+        notices = [
+            (_("Delivery Challan") if leg_challans.get(row.stock_entry) else _("Manifest"),
+             ", ".join(leg_challans.get(row.stock_entry, [])) or doc.name,
+             row.item_count, row.total_qty)
+            for row in legs
+        ]
+    else:
+        notices = [(_("Manifest"), doc.name, doc.total_items, doc.total_qty)]
+    # Shipments handed over together share the one code, and the store should
+    # not go looking for a second.
+    shared_note = (
+        "<p>" + _("The same OTP covers every Delivery Challan in this delivery.") + "</p>"
+        if len(notices) > 1 else ""
+    )
+    mails = [
+        (
+            _("Delivery OTP for {0} {1}").format(label, reference),
+            mail_template.format(
+                company_name=company_name,
+                reference_label=label,
+                reference=reference,
+                driver=driver_label,
+                items=items or 0,
+                qty=qty or 0,
+                otp=plaintext_otp,
+                shared_note=shared_note,
+                manifest_url=manifest_url,
+            ),
+        )
+        for label, reference, items, qty in notices
+    ]
 
     in_app_sent = []
     for user in manager_users:
@@ -1302,14 +1352,15 @@ def _send_delivery_otp(doc, plaintext_otp=None, receiver=None,
             "Email Account", {"default_outgoing": 1, "enable_outgoing": 1}, "name"
         )
         if default_outgoing and email_recipients:
-            frappe.sendmail(
-                recipients=email_recipients,
-                subject=subject,
-                message=message,
-                reference_doctype="CH Transfer Manifest",
-                reference_name=doc.name,
-                delayed=False,
-            )
+            for mail_subject, mail_body in mails:
+                frappe.sendmail(
+                    recipients=email_recipients,
+                    subject=mail_subject,
+                    message=mail_body,
+                    reference_doctype="CH Transfer Manifest",
+                    reference_name=doc.name,
+                    delayed=False,
+                )
             email_sent = True
     except Exception:
         frappe.log_error(frappe.get_traceback(), f"Manifest OTP email failed: {doc.name}")
@@ -1469,7 +1520,7 @@ def mask_mobile(num):
     seconds=60,
     methods=["POST"],
 )
-def request_delivery_otp(manifest, receiver=None) -> dict:
+def request_delivery_otp(manifest, receiver=None, stock_entry=None) -> dict:
     """Driver-side trigger: 'I'm at the destination, send me the OTP'.
 
     Wired to the **Complete Delivery** button on the driver app: tapping it
@@ -1496,7 +1547,13 @@ def request_delivery_otp(manifest, receiver=None) -> dict:
     # because reloading the app would otherwise clear the countdown.
     wait_s = role_registry.get_int_setting("delivery_otp_resend_seconds", 120)
     sent_at = doc.get("delivery_otp_sent_at")
-    if wait_s > 0 and sent_at:
+    # The wait protects a code that is still on its way. Once that code has
+    # been used -- one shipment delivered, the driver moving on to the next on
+    # the same manifest -- nothing is in flight to protect, and the next
+    # shipment gets its own code at once instead of sitting out the first's.
+    code_in_flight = frappe.db.exists(
+        "CH Logistics OTP Log", {"manifest": doc.name, "status": "Pending"})
+    if wait_s > 0 and sent_at and code_in_flight:
         elapsed = time_diff_in_seconds(now_datetime(), get_datetime(sent_at))
         left = int(wait_s - elapsed)
         if 0 < left <= wait_s:
@@ -1513,10 +1570,15 @@ def request_delivery_otp(manifest, receiver=None) -> dict:
             .format(doc.status),
             title=_("API Error"),
         )
+    # Delivering one shipment of several: the notice names that shipment's
+    # Delivery Challan and goes to that shipment's store, not the manifest's.
+    if stock_entry and not any(row.stock_entry == stock_entry for row in doc.transfers):
+        frappe.throw(_("Stock Entry {0} is not on manifest {1}.").format(stock_entry, manifest))
     plaintext_otp = doc._generate_delivery_otp(request_source="Driver App")
     doc.flags.ignore_validate_update_after_submit = True
     doc.save()
-    recipients = _send_delivery_otp(doc, plaintext_otp, receiver=receiver) or {}
+    recipients = _send_delivery_otp(doc, plaintext_otp, receiver=receiver,
+                                    stock_entry=stock_entry) or {}
 
     return {
         "message": _("OTP sent to the destination warehouse."),

@@ -2430,7 +2430,7 @@ class DeliveryApp {
     // proves nothing and gives the OTP nowhere to go; a store with nobody on
     // its roster falls back to free text so a delivery is never blocked by
     // missing master data.
-    _receiver_fields(manifest, receivers) {
+    _receiver_fields(manifest, receivers, stock_entry) {
         receivers = receivers || [];
         if (!receivers.length) {
             return [{
@@ -2439,7 +2439,7 @@ class DeliveryApp {
                 description: __("No POS Executive is on file for this store."),
             }, {
                 fieldname: "send_otp", fieldtype: "Button", label: __("Send OTP"),
-                click: () => this._send_receiver_otp(manifest, null),
+                click: () => this._send_receiver_otp(manifest, null, stock_entry),
             }];
         }
         return [{
@@ -2460,7 +2460,7 @@ class DeliveryApp {
                         [match.executive_name]));
                     return;
                 }
-                this._send_receiver_otp(manifest, match.name);
+                this._send_receiver_otp(manifest, match.name, stock_entry);
             },
         }];
     }
@@ -2509,10 +2509,12 @@ class DeliveryApp {
         };
     }
 
-    _send_receiver_otp(manifest, receiver) {
+    // stock_entry, when the dialog is delivering one shipment of several, so
+    // the notice names that shipment's Delivery Challan and no other.
+    _send_receiver_otp(manifest, receiver, stock_entry) {
         const dialog = cur_dialog;
         frappe.dom.freeze(__("Sending OTP…"));
-        this._call_promise(API + "request_delivery_otp", { manifest, receiver })
+        this._call_promise(API + "request_delivery_otp", { manifest, receiver, stock_entry })
             .then((info) => {
                 frappe.dom.unfreeze();
                 const to = [].concat(info?.masked_emails || [], info?.masked_mobiles || []);
@@ -2574,7 +2576,7 @@ class DeliveryApp {
                             fieldname: "scanned_qr", fieldtype: "Data", options: "Barcode",
                             label: __("Scan Manifest QR"), reqd: 1,
                         },
-                        ...this._receiver_fields(manifest, receivers),
+                        ...this._receiver_fields(manifest, receivers, stock_entry),
                         {
                             fieldname: "otp", fieldtype: "Data",
                             label: __("Delivery OTP"), reqd: 1,
@@ -2658,7 +2660,7 @@ class DeliveryApp {
                     fieldname: "box_list_html", fieldtype: "HTML",
                     options: `<div class="da-box-scan-list">${box_labels.map(box_row_html).join("")}</div>`,
                 },
-                ...this._receiver_fields(manifest, receivers),
+                ...this._receiver_fields(manifest, receivers, stock_entry),
                 {
                     fieldname: "otp", fieldtype: "Data",
                     label: __("Delivery OTP"), reqd: 1,
