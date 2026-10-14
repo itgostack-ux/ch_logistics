@@ -122,7 +122,7 @@
    "type": "Link"
   }
  ],
- "modified": "2026-09-10 13:42:18.952769",
+ "modified": "2026-10-12 18:49:59.029242",
  "modified_by": "Administrator",
  "module": "Logistics",
  "name": "Logistics Reports",
@@ -133,19 +133,7 @@
  "quick_lists": [],
  "roles": [
   {
-   "role": "Administrator"
-  },
-  {
    "role": "System Manager"
-  },
-  {
-   "role": "Logistics Manager"
-  },
-  {
-   "role": "Logistics Head"
-  },
-  {
-   "role": "Logistics User"
   },
   {
    "role": "Delivery Manager"
@@ -158,6 +146,21 @@
   },
   {
    "role": "Delivery User"
+  },
+  {
+   "role": "Logistics Manager"
+  },
+  {
+   "role": "Logistics Head"
+  },
+  {
+   "role": "CH Logistics Manager"
+  },
+  {
+   "role": "CH Logistics Coordinator"
+  },
+  {
+   "role": "Logistics User"
   }
  ],
  "sequence_id": 99.0,

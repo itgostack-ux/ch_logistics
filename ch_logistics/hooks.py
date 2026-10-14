@@ -52,6 +52,13 @@ doc_events = {
 	"CH Store": {
 		"on_update": "ch_logistics.api.optimizer.sync_one_store_geo",
 	},
+	# The audit team verifies a store's damaged bin; the goods still have to
+	# travel. ch_erp15 owns the audit and is the base layer, so it cannot reach
+	# into logistics -- logistics listens instead, which is the direction the
+	# estate's dependencies actually run.
+	"CH Stock Audit Session": {
+		"on_update": "ch_logistics.damaged_stock_release.on_audit_session_update",
+	},
 }
 
 permission_query_conditions = {
@@ -87,9 +94,6 @@ scheduler_events = {
 		# Predictive ETA + SLA-breach early warning for in-progress trips.
 		"*/10 * * * *": [
 			"ch_logistics.api.optimizer.check_eta_sla_breaches",
-			# Catch up any trip whose stops / status were not advanced when a
-			# delivery happened (the update is tried once, at that moment).
-			"ch_logistics.logistics.doctype.ch_logistics_trip.ch_logistics_trip.reconcile_trip_progress",
 		],
 		# Daily logistics digest to managers (server-time hour; gated by
 		# CH Logistics Settings → Send Daily Logistics Digest).
@@ -107,4 +111,5 @@ fixtures = [
 		"dt": "Custom Field",
 		"filters": [["module", "=", "Logistics"]],
 	},
+	{"dt": "Desktop Icon", "filters": [["name", "=", "Logistics"]]},
 ]
