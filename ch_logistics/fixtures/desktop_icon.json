@@ -13,7 +13,7 @@
   "link_to": "Logistics Reports",
   "link_type": "Workspace Sidebar",
   "logo_url": null,
-  "modified": "2026-10-09 18:27:52.077638",
+  "modified": "2026-10-15 13:21:04.822314",
   "name": "Logistics",
   "parent_icon": null,
   "restrict_removal": 0,
@@ -26,6 +26,33 @@
    },
    {
     "role": "All"
+   },
+   {
+    "role": "Logistic Head"
+   },
+   {
+    "role": "Logistics Head"
+   },
+   {
+    "role": "Logistics Manager"
+   },
+   {
+    "role": "Logistics User"
+   },
+   {
+    "role": "CH Logistics Coordinator"
+   },
+   {
+    "role": "CH Logistics Manager"
+   },
+   {
+    "role": "Delivery Manager"
+   },
+   {
+    "role": "Delivery User"
+   },
+   {
+    "role": "Driver"
    }
   ],
   "sidebar": "Logistics Reports",

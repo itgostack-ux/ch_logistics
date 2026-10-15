@@ -1,15 +1,17 @@
 {
  "add_total_row": 0,
+ "add_translate_data": 0,
  "columns": [],
- "creation": "2026-06-23 00:00:00.000000",
+ "creation": "2026-10-15 12:26:12.444805",
  "disabled": 0,
  "docstatus": 0,
  "doctype": "Report",
  "filters": [],
  "idx": 0,
  "is_standard": "Yes",
- "letterhead": null,
- "modified": "2026-06-23 00:00:00.000000",
+ "letter_head": null,
+ "modified": "2026-10-15 13:21:04.941778",
+ "modified_by": "Administrator",
  "module": "Logistics",
  "name": "Driver Performance Scorecard",
  "owner": "Administrator",
@@ -26,6 +28,28 @@
   },
   {
    "role": "Delivery User"
+  },
+  {
+   "role": "Logistic Head"
+  },
+  {
+   "role": "Logistics Head"
+  },
+  {
+   "role": "Logistics Manager"
+  },
+  {
+   "role": "Logistics User"
+  },
+  {
+   "role": "CH Logistics Coordinator"
+  },
+  {
+   "role": "CH Logistics Manager"
+  },
+  {
+   "role": "Driver"
   }
- ]
+ ],
+ "timeout": 0
 }

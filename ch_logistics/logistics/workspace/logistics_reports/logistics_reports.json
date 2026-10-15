@@ -2,7 +2,7 @@
  "app": "ch_logistics",
  "charts": [],
  "content": "[{\"id\": \"lr_hdr\", \"type\": \"header\", \"data\": {\"text\": \"<span class=\\\"h4\\\">Logistics Reports</span>\", \"col\": 12}}, {\"id\": \"lr_sp1\", \"type\": \"spacer\", \"data\": {\"col\": 12}}, {\"id\": \"lr_sc1\", \"type\": \"shortcut\", \"data\": {\"shortcut_name\": \"Delivery & SLA\", \"col\": 3}}, {\"id\": \"lr_sc2\", \"type\": \"shortcut\", \"data\": {\"shortcut_name\": \"Driver Scorecard\", \"col\": 3}}, {\"id\": \"lr_sc3\", \"type\": \"shortcut\", \"data\": {\"shortcut_name\": \"Exceptions & Rejections\", \"col\": 3}}, {\"id\": \"lr_sc4\", \"type\": \"shortcut\", \"data\": {\"shortcut_name\": \"Store Transfers\", \"col\": 3}}, {\"id\": \"lr_sp2\", \"type\": \"spacer\", \"data\": {\"col\": 12}}, {\"id\": \"lr_cd1\", \"type\": \"card\", \"data\": {\"card_name\": \"Managers & Logistics Head\", \"col\": 4}}, {\"id\": \"lr_cd2\", \"type\": \"card\", \"data\": {\"card_name\": \"Stores\", \"col\": 4}}, {\"id\": \"lr_cd3\", \"type\": \"card\", \"data\": {\"card_name\": \"Delivery Staff\", \"col\": 4}}]",
- "creation": "2026-06-23 00:00:00",
+ "creation": "2026-10-15 12:26:12.897530",
  "custom_blocks": [],
  "docstatus": 0,
  "doctype": "Workspace",
@@ -122,7 +122,7 @@
    "type": "Link"
   }
  ],
- "modified": "2026-10-12 18:49:59.029242",
+ "modified": "2026-10-15 13:21:04.893515",
  "modified_by": "Administrator",
  "module": "Logistics",
  "name": "Logistics Reports",
@@ -161,6 +161,12 @@
   },
   {
    "role": "Logistics User"
+  },
+  {
+   "role": "Logistic Head"
+  },
+  {
+   "role": "Driver"
   }
  ],
  "sequence_id": 99.0,
