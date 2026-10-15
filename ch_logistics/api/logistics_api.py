@@ -3110,6 +3110,373 @@ def ops_recall_inbox(limit=100):
 
 
 @frappe.whitelist()
+def ops_pickup_pending(company=None):
+    """Shipments a driver has been given but not yet accepted, per driver.
+
+    The same list each driver sees under Pickup Pending in the Delivery
+    App: one row per Stock Entry leg of an Assigned manifest whose
+    ``driver_accepted_at`` is still empty. Accepting the shipment stamps
+    that field, so the row drops off here on the next refresh.
+    """
+    _require_ops()
+    from ch_logistics.api.transfer_manifest_api import _challans_by_stock_entry
+
+    scope_clause, scope_params = scope_guard.build_scope_sql(
+        location_fields=("m.source_store", "m.source_warehouse"),
+        company_field="m.company",
+        prefix="ops_pickup",
+    )
+    company_clause = "AND m.company = %(company)s" if company else ""
+    trip_cols = ", m.trip" if _has_manifest_trip_field() else ", NULL AS trip"
+    rows = frappe.db.sql(
+        f"""
+        SELECT m.name AS manifest, m.driver, m.driver_name, m.company,
+               m.source_store, m.source_warehouse,
+               m.destination_store, m.destination_warehouse{trip_cols},
+               i.stock_entry, i.from_warehouse, i.to_warehouse,
+               i.item_count, i.total_qty,
+               COALESCE(m.trip_attached_at, m.modified) AS assigned_on
+        FROM `tabCH Transfer Manifest` m
+        JOIN `tabCH Transfer Manifest Item` i
+          ON i.parent = m.name AND i.parenttype = 'CH Transfer Manifest'
+        WHERE m.status = 'Assigned' AND m.docstatus < 2
+          AND i.driver_accepted_at IS NULL
+          {company_clause}
+          AND {scope_clause}
+        ORDER BY m.driver_name, m.name, i.idx
+        LIMIT %(limit)s
+        """,
+        {
+            "company": company,
+            "limit": role_registry.get_int_setting("ops_record_row_limit", 500),
+            **scope_params,
+        },
+        as_dict=True,
+    )
+
+    # A manifest assigned through a trip may carry its driver only on the
+    # trip, so fall back to the trip's driver.
+    trip_names = {r.trip for r in rows if r.trip and not r.driver_name}
+    trip_driver = {}
+    if trip_names:
+        for t in frappe.get_all(
+            "CH Logistics Trip",
+            filters={"name": ["in", list(trip_names)]},
+            fields=["name", "driver", "driver_name"],
+        ):
+            trip_driver[t.name] = t
+
+    challans = _challans_by_stock_entry([r.stock_entry for r in rows])
+    for r in rows:
+        if not r.driver_name and r.trip in trip_driver:
+            r.driver = trip_driver[r.trip].driver
+            r.driver_name = trip_driver[r.trip].driver_name
+        r["delivery_challan"] = ", ".join(challans.get(r.stock_entry, []))
+    return rows
+
+
+@frappe.whitelist()
+def ops_manifest_register(company=None, from_date=None, to_date=None):
+    """Every shipment on a manifest, one row per shipment, for the Manifest tab.
+
+    Pending / Fulfill / Rejected are quantities: Fulfill is what the driver
+    has delivered, Rejected is the transfer's own rejected qty (the whole
+    qty when it was refused), Pending is what is left of it. The logistic
+    status is read off the shipment's own pickup / delivery capture, since
+    a manifest carrying several stores' shipments keeps one status for all.
+    """
+    _require_ops()
+    from ch_logistics.api.transfer_manifest_api import _challans_by_stock_entry
+
+    scope_clause, scope_params = scope_guard.build_scope_sql(
+        location_fields=("m.source_store", "m.source_warehouse"),
+        company_field="m.company",
+        prefix="ops_register",
+    )
+    conds = ["m.docstatus < 2", scope_clause]
+    params = dict(scope_params)
+    if company:
+        conds.append("m.company = %(company)s")
+        params["company"] = company
+    if from_date:
+        conds.append("m.manifest_date >= %(from_date)s")
+        params["from_date"] = getdate(from_date)
+    if to_date:
+        conds.append("m.manifest_date <= %(to_date)s")
+        params["to_date"] = getdate(to_date)
+    trip_col = "m.trip" if _has_manifest_trip_field() else "NULL"
+    rows = frappe.db.sql(
+        f"""
+        SELECT m.name AS manifest, m.manifest_date, m.creation, m.status AS manifest_status,
+               m.driver, m.driver_name, {trip_col} AS trip,
+               i.stock_entry, i.from_warehouse, i.to_warehouse, i.total_qty,
+               i.driver_accepted_at, i.delivery_captured_at,
+               se.custom_logistics_status, se.custom_rejected_qty
+        FROM `tabCH Transfer Manifest` m
+        JOIN `tabCH Transfer Manifest Item` i
+          ON i.parent = m.name AND i.parenttype = 'CH Transfer Manifest'
+        LEFT JOIN `tabStock Entry` se ON se.name = i.stock_entry
+        WHERE {" AND ".join(conds)}
+        ORDER BY m.creation DESC, i.idx
+        LIMIT 5000
+        """,
+        params,
+        as_dict=True,
+    )
+
+    # A courier / "Others" trip has no driver tapping Accept or Deliver, and
+    # its manifests keep their Packed status — only the trip's own status
+    # moves (marked by ops). Those shipments follow their trip.
+    trip_info = {}
+    trip_names = {r.trip for r in rows if r.trip}
+    if trip_names:
+        for t in frappe.get_all("CH Logistics Trip", filters={"name": ["in", list(trip_names)]},
+                                fields=["name", "status", "transport_mode", "driver_name",
+                                        "courier_partner", "carrier_name", "tracking_number"]):
+            trip_info[t.name] = t
+
+    challans = _challans_by_stock_entry([r.stock_entry for r in rows])
+    # The DC's own date, for tabs that read at challan level.
+    dc_dates = {}
+    dc_names = [n for names in challans.values() for n in names]
+    if dc_names:
+        for c in frappe.get_all("CH Delivery Challan", filters={"name": ["in", dc_names]},
+                                fields=["name", "posting_date"]):
+            dc_dates[c.name] = c.posting_date
+    for r in rows:
+        ti = trip_info.get(r.trip)
+        by_hand = bool(ti and (ti.transport_mode or "Own") != "Own")
+        if by_hand:
+            who = ti.courier_partner or ti.carrier_name or _(ti.transport_mode)
+            r["driver_name"] = f"{who} ({ti.tracking_number})" if ti.tracking_number else who
+        else:
+            r["driver_name"] = r.driver_name or (ti.driver_name if ti else None)
+        r["delivery_challan"] = ", ".join(challans.get(r.stock_entry, []))
+        firsts = challans.get(r.stock_entry) or []
+        r["dc_date"] = dc_dates.get(firsts[0]) if firsts else None
+        qty = flt(r.total_qty)
+        rejected = min(flt(r.custom_rejected_qty), qty)
+        fulfilled = 0.0
+        if r.delivery_captured_at or r.manifest_status in (
+                "Delivered", "Partially Received", "Received", "Closed") or (
+                by_hand and ti.status in ("Delivered", "Completed", "Closed")):
+            fulfilled = max(qty - rejected, 0.0)
+        r["fulfilled_qty"] = fulfilled
+        r["rejected_qty"] = rejected
+        r["pending_qty"] = max(qty - fulfilled - rejected, 0.0)
+
+        se_status = r.custom_logistics_status or ""
+        if se_status in ("Revert Requested", "Reverted"):
+            r["logistic_status"] = se_status
+        elif r.manifest_status in ("Cancelled", "Rejected", "Returned", "Recall Initiated"):
+            r["logistic_status"] = r.manifest_status
+        elif fulfilled:
+            r["logistic_status"] = "Delivered"
+        elif by_hand:
+            r["logistic_status"] = ("In Transit" if ti.status in ("Started", "Picked Up", "Delivery Pending")
+                                    else "Pending Pickup")
+        elif r.driver_accepted_at or r.manifest_status == "In Transit":
+            r["logistic_status"] = "In Transit"
+        elif r.manifest_status in ("Assigned", "Pickup Started"):
+            r["logistic_status"] = "Pending Pickup"
+        else:
+            r["logistic_status"] = "Not Assigned"
+    return rows
+
+
+@frappe.whitelist()
+def ops_trip_register(company=None, from_date=None, to_date=None):
+    """Open trips for the Trip tab, newest first, with how far their shipments got.
+
+    Shipments are counted per challan line (one Stock Entry on a manifest):
+    how many the trip carries, how many its driver has accepted and how many
+    are delivered.
+    """
+    _require_ops()
+    trip_scope, params = scope_guard.build_scope_sql(
+        location_fields=("hub_warehouse",), company_field="company", prefix="ops_trips")
+    # Only trips still on the road: one leaves the tab once it is delivered
+    # (or completed / closed / cancelled).
+    conds = ["docstatus < 2",
+             "status NOT IN ('Delivered', 'Completed', 'Closed', 'Cancelled')", trip_scope]
+    if company:
+        conds.append("company = %(company)s")
+        params["company"] = company
+    if from_date:
+        conds.append("trip_date >= %(from_date)s")
+        params["from_date"] = getdate(from_date)
+    if to_date:
+        conds.append("trip_date <= %(to_date)s")
+        params["to_date"] = getdate(to_date)
+    trips = frappe.db.sql(
+        f"""
+        SELECT name, trip_date, status, direction, route, hub_warehouse, transport_mode,
+               driver, driver_name, vehicle, vehicle_number, carrier_name, courier_partner,
+               tracking_number,
+               planned_start, actual_start, actual_end, creation
+        FROM `tabCH Logistics Trip`
+        WHERE {" AND ".join(conds)}
+        ORDER BY creation DESC
+        LIMIT 2000
+        """,
+        params,
+        as_dict=True,
+    )
+    if not trips or not _has_manifest_trip_field():
+        return trips
+
+    counts = {}
+    for row in frappe.db.sql(
+        """
+        SELECT m.trip, COUNT(DISTINCT m.name) AS manifests, COUNT(i.name) AS shipments,
+               SUM(i.driver_accepted_at IS NOT NULL) AS accepted,
+               SUM(i.delivery_captured_at IS NOT NULL
+                   OR m.status IN ('Delivered', 'Partially Received', 'Received', 'Closed')) AS delivered
+        FROM `tabCH Transfer Manifest` m
+        LEFT JOIN `tabCH Transfer Manifest Item` i
+          ON i.parent = m.name AND i.parenttype = 'CH Transfer Manifest'
+        WHERE m.trip IN %(trips)s AND m.docstatus < 2
+        GROUP BY m.trip
+        """,
+        {"trips": tuple(t.name for t in trips)},
+        as_dict=True,
+    ):
+        counts[row.trip] = row
+
+    # Where the shipments actually go — a route template can carry stops
+    # this trip's shipments never reach.
+    drops = {}
+    for row in frappe.db.sql(
+        """
+        SELECT DISTINCT m.trip, i.to_warehouse
+        FROM `tabCH Transfer Manifest` m
+        JOIN `tabCH Transfer Manifest Item` i
+          ON i.parent = m.name AND i.parenttype = 'CH Transfer Manifest'
+        WHERE m.trip IN %(trips)s AND m.docstatus < 2 AND i.to_warehouse IS NOT NULL
+        ORDER BY m.trip, i.idx
+        """,
+        {"trips": tuple(t.name for t in trips)},
+        as_dict=True,
+    ):
+        drops.setdefault(row.trip, []).append(row.to_warehouse)
+
+    for t in trips:
+        c = counts.get(t.name) or {}
+        t["manifests"] = cint(c.get("manifests"))
+        t["shipments"] = cint(c.get("shipments"))
+        t["accepted"] = cint(c.get("accepted"))
+        t["delivered"] = cint(c.get("delivered"))
+        # Courier / "Others": no driver taps per shipment; the trip's own
+        # status says how far all of them got.
+        if (t.transport_mode or "Own") != "Own":
+            if t.status in ("Started", "Picked Up", "Delivery Pending"):
+                t["accepted"] = t["shipments"]
+            if not t.driver_name:
+                who = t.courier_partner or t.carrier_name or _(t.transport_mode)
+                t["driver_name"] = f"{who} ({t.tracking_number})" if t.tracking_number else who
+        t["drops"] = drops.get(t.name, [])
+    return trips
+
+
+@frappe.whitelist()
+def ops_trip_drilldown(trip):
+    """One trip opened up: its manifests, each manifest's orders (one per
+    Delivery Challan) and each order's items, with serials.
+
+    Items come from the challan — the paperwork that travels with the goods
+    — or, for a transfer that has none yet, from the Stock Entry itself.
+    """
+    _require_ops()
+    if not frappe.db.exists("CH Logistics Trip", trip):
+        frappe.throw(_("Trip {0} not found.").format(trip))
+    t = frappe.db.get_value(
+        "CH Logistics Trip", trip,
+        ["name", "trip_date", "status", "driver_name", "carrier_name", "vehicle_number",
+         "hub_warehouse", "company", "transport_mode", "courier_partner", "tracking_number"],
+        as_dict=True,
+    )
+    scope_guard.assert_scope(warehouse=t.hub_warehouse, company=t.company) if t.hub_warehouse \
+        else scope_guard.assert_scope(company=t.company)
+
+    manifests = frappe.get_all(
+        "CH Transfer Manifest",
+        filters={"trip": trip, "docstatus": ["<", 2]},
+        fields=["name", "status", "manifest_date", "source_warehouse", "total_qty"],
+        order_by="creation asc",
+    )
+    legs = frappe.get_all(
+        "CH Transfer Manifest Item",
+        filters={"parent": ["in", [m.name for m in manifests] or ["__none__"]],
+                 "parenttype": "CH Transfer Manifest"},
+        fields=["parent", "stock_entry", "from_warehouse", "to_warehouse", "total_qty",
+                "driver_accepted_at", "delivery_captured_at", "delivery_receiver_name"],
+        order_by="parent, idx",
+    )
+    from ch_logistics.api.transfer_manifest_api import _challans_by_stock_entry
+
+    challans = _challans_by_stock_entry([l.stock_entry for l in legs])
+    dc_names = [n for names in challans.values() for n in names]
+    dc_items = {}
+    for row in frappe.get_all(
+        "CH Delivery Challan Item",
+        filters={"parent": ["in", dc_names or ["__none__"]], "parenttype": "CH Delivery Challan"},
+        fields=["parent", "item_code", "item_name", "qty", "uom", "serial_no"],
+        order_by="parent, idx",
+    ):
+        dc_items.setdefault(row.parent, []).append(row)
+    se_items = {}
+    no_dc = [l.stock_entry for l in legs if l.stock_entry and not challans.get(l.stock_entry)]
+    for row in frappe.get_all(
+        "Stock Entry Detail",
+        filters={"parent": ["in", no_dc or ["__none__"]], "parenttype": "Stock Entry"},
+        fields=["parent", "item_code", "item_name", "qty", "uom", "serial_no"],
+        order_by="parent, idx",
+    ):
+        se_items.setdefault(row.parent, []).append(row)
+
+    def _serials(text):
+        return [s.strip() for s in (text or "").splitlines() if s.strip()]
+
+    by_hand = (t.transport_mode or "Own") != "Own"
+    if by_hand and not t.driver_name:
+        t["driver_name"] = t.courier_partner or t.carrier_name or _(t.transport_mode)
+    orders_by_manifest = {}
+    for l in legs:
+        dcs = challans.get(l.stock_entry) or []
+        if l.delivery_captured_at or (by_hand and t.status in ("Delivered", "Completed", "Closed")):
+            status = "Delivered"
+        elif l.driver_accepted_at or (by_hand and t.status in ("Started", "Picked Up", "Delivery Pending")):
+            status = "In Transit"
+        else:
+            status = "Pending Pickup"
+        items = []
+        for dc in dcs:
+            items += dc_items.get(dc, [])
+        if not dcs:
+            items = se_items.get(l.stock_entry, [])
+        orders_by_manifest.setdefault(l.parent, []).append({
+            "delivery_challan": ", ".join(dcs),
+            "stock_entry": l.stock_entry,
+            "from_warehouse": l.from_warehouse,
+            "to_warehouse": l.to_warehouse,
+            "qty": flt(l.total_qty),
+            "status": status,
+            "delivered_at": l.delivery_captured_at,
+            "receiver": l.delivery_receiver_name,
+            "items": [{
+                "item_code": i.item_code, "item_name": i.item_name,
+                "qty": flt(i.qty), "uom": i.uom, "serials": _serials(i.serial_no),
+            } for i in items],
+        })
+
+    for m in manifests:
+        m["orders"] = orders_by_manifest.get(m.name, [])
+        m["delivered"] = sum(1 for o in m["orders"] if o["status"] == "Delivered")
+    t["manifests"] = manifests
+    return t
+
+
+@frappe.whitelist()
 def ops_packing_queue(limit=100):
     """Draft manifests awaiting pack-station processing.
 

@@ -2771,11 +2771,45 @@ class CHTransferManifest(Document):
 
             wh_by_store = self._store_warehouse_map(trip.stops, peers)
 
+            # One manifest can carry shipments to several stores, and it only
+            # reaches Delivered when the last of them is dropped — so judged
+            # by the manifest alone, a store whose own shipments are all
+            # delivered stayed Pending until the driver finished the whole
+            # run. Each shipment knows where it goes and when it was picked
+            # up / delivered, so a stop those shipments reach is judged by
+            # them; the manifest rule below stays for stops they do not name.
+            legs = frappe.get_all(
+                "CH Transfer Manifest Item",
+                filters={
+                    "parent": ["in", [p.name for p in peers
+                                      if (p.status or "") not in ("Cancelled", "Rejected")]
+                               or ["__none__"]],
+                    "parenttype": "CH Transfer Manifest",
+                },
+                fields=["from_warehouse", "to_warehouse", "driver_accepted_at",
+                        "pickup_captured_at", "delivery_captured_at"],
+            )
+
             changed = False
             for stop in trip.stops:
                 if (stop.status or "Pending") in self._STOP_TERMINAL:
                     continue
                 stype = (stop.stop_type or "Drop").strip().lower()
+                stop_wh = stop.get("warehouse") or wh_by_store.get(stop.get("store"))
+                checks = []
+                if stop_wh and stype in ("pickup", "pickup+drop"):
+                    checks += [bool(l.pickup_captured_at or l.driver_accepted_at)
+                               for l in legs if l.from_warehouse == stop_wh]
+                if stop_wh and stype != "pickup":
+                    checks += [bool(l.delivery_captured_at)
+                               for l in legs if l.to_warehouse == stop_wh]
+                if checks:
+                    if all(checks):
+                        stop.status = "Completed"
+                        if not stop.ata:
+                            stop.ata = now_datetime()
+                        changed = True
+                    continue
                 if stype == "pickup":
                     sides = [("source", self._MANIFEST_PICKUP_DONE)]
                 elif stype == "pickup+drop":

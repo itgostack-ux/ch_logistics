@@ -424,17 +424,22 @@ class DeliveryApp {
         // per-leg breakdown, or the badge undercounts what's actually on
         // screen (e.g. one 3-Stock-Entry manifest showed "(1)" but 3 cards).
         const manifests = this.manifests || [];
+        //
+        // Each shipment counts in one tab only: not accepted -> Pickup,
+        // accepted but not delivered -> Drop, delivered -> Delivered.
         const pickup_n = manifests
             .filter((m) => m.bucket === "to_pickup")
             .reduce((sum, m) => {
                 if (m.status === "Assigned" && !m.driver_accepted_at) {
-                    return sum + ((m.transfers && m.transfers.length) || 1);
+                    return sum + (m.transfers && m.transfers.length
+                        ? m.transfers.filter((r) => !r.driver_accepted_at).length : 1);
                 }
                 return sum + 1;
             }, 0);
         const drop_n = manifests
             .filter((m) => m.bucket === "in_transit")
-            .reduce((sum, m) => sum + ((m.transfers && m.transfers.length) || 1), 0)
+            .reduce((sum, m) => sum + (m.transfers && m.transfers.length
+                ? m.transfers.filter((r) => !r.delivery_captured_at).length : 1), 0)
             + this._orphan_accepted_legs().length;
         this.$body.find("#da-tab-count-pickup").text(`(${pickup_n})`);
         this.$body.find("#da-tab-count-drop").text(`(${drop_n})`);
@@ -455,9 +460,25 @@ class DeliveryApp {
         const out = [];
         manifests.filter((m) => m.bucket === "to_pickup").forEach((m) => {
             (m.transfers || []).forEach((row) => {
-                if (row.driver_accepted_at) out.push({ m, row });
+                if (row.driver_accepted_at && !row.delivery_captured_at) out.push({ m, row });
             });
         });
+        return out;
+    }
+
+    _delivered_active_legs() {
+        // Shipments already delivered off a manifest that is still moving
+        // (siblings not yet accepted or delivered). The manifest itself only
+        // reaches History once every shipment is delivered, so these are
+        // listed under Delivered on their own until then.
+        const out = [];
+        (this.manifests || [])
+            .filter((m) => m.bucket === "to_pickup" || m.bucket === "in_transit")
+            .forEach((m) => {
+                (m.transfers || []).forEach((row) => {
+                    if (row.delivery_captured_at) out.push({ m, row });
+                });
+            });
         return out;
     }
 
@@ -499,11 +520,8 @@ class DeliveryApp {
         const trip_attr = frappe.utils.escape_html(trip || m.trip || "");
         let actions;
         if (row.delivery_captured_at) {
-            const pending = (m.transfers || []).filter((r) => !r.delivery_captured_at).length;
-            const wait_msg = pending > 0
-                ? __("Delivered — waiting on {0} more shipment(s) on this manifest", [pending])
-                : __("Delivered — manifest updating…");
-            actions = `<span class="da-card-status da-status-completed"><i class="fa fa-check-circle"></i> ${wait_msg}</span>`;
+            const at = frappe.datetime.str_to_user(row.delivery_captured_at);
+            actions = `<span class="da-card-status da-status-completed"><i class="fa fa-check-circle"></i> ${__("Delivered")} · ${at}</span>`;
         } else {
             actions = `<button class="btn btn-primary btn-sm da-leg-deliver-btn" data-manifest="${frappe.utils.escape_html(m.name)}" data-stock-entry="${se}" data-trip="${trip_attr}"><i class="fa fa-check-circle"></i> ${__("Deliver")}</button>`;
         }
@@ -516,7 +534,6 @@ class DeliveryApp {
                 </div>
                 <div class="text-muted" style="font-size:11px;padding:0 8px 6px;">
                     <i class="fa fa-file-text-o"></i> ${this._order_id_html(row)}
-                    <span class="text-muted" style="margin-left:8px;"><i class="fa fa-truck"></i> ${frappe.utils.escape_html(m.name)}</span>
                 </div>
                 <div class="da-stop-actions">${actions}</div>
             </div>`;
@@ -541,19 +558,21 @@ class DeliveryApp {
         const rows = manifests.filter((m) => m.bucket === bucketFilter);
         const orphan_legs = bucketFilter === "in_transit" ? this._orphan_accepted_legs() : [];
 
-        if (!rows.length && !orphan_legs.length) {
-            $c.html(`<div class="da-empty">
-                <i class="fa fa-truck fa-3x"></i>
-                <p>${empty_msg}</p>
-            </div>`);
-            return;
-        }
         const manifest_cards = rows.map((m) => this._render_board_manifest_card(m)).join("");
         // Per explicit request: a leg is deliverable as soon as ITS OWN
         // pickup is captured, independent of sibling Stock Entries on the
         // same manifest — so these get the same actionable Deliver card an
         // In Transit manifest's legs get, not a read-only "waiting" one.
         const orphan_cards = orphan_legs.map(({ m, row }) => this._render_leg_deliver_card(m, row, m.trip)).join("");
+        // A manifest whose shipments have all moved to the next tab renders
+        // no cards, so test what was drawn, not the manifest count.
+        if (!manifest_cards.trim() && !orphan_cards) {
+            $c.html(`<div class="da-empty">
+                <i class="fa fa-truck fa-3x"></i>
+                <p>${empty_msg}</p>
+            </div>`);
+            return;
+        }
         $c.html(`<div class="da-manifest-list">${manifest_cards}${orphan_cards}</div>`);
     }
 
@@ -561,14 +580,16 @@ class DeliveryApp {
         // Untouched from before the tab reshuffle — same data
         // (get_delivery_history) and same card rendering (manifest_card).
         let list = this.history || [];
-        if (!list.length) {
+        const legs = this._delivered_active_legs();
+        if (!list.length && !legs.length) {
             $c.html(`<div class="da-empty">
                 <i class="fa fa-inbox fa-3x"></i>
                 <p>${__("No delivery history")}</p>
             </div>`);
             return;
         }
-        let html = list.map((m) => this.manifest_card(m)).join("");
+        let html = legs.map(({ m, row }) => this._render_leg_deliver_card(m, row, m.trip)).join("")
+            + list.map((m) => this.manifest_card(m)).join("");
         $c.html(`<div class="da-manifest-list">${html}</div>`);
     }
 
@@ -586,7 +607,9 @@ class DeliveryApp {
         if (m.status === "Assigned" && !m.driver_accepted_at) {
             // Per-Stock-Entry decision cards here too — same reasoning as
             // the in-trip pending-decision cards (_render_leg_decision_card).
-            const rows = (m.transfers && m.transfers.length) ? m.transfers : [{
+            // Accepted ones have moved on to Delivery Pending.
+            const rows = (m.transfers && m.transfers.length)
+                ? m.transfers.filter((r) => !r.driver_accepted_at) : [{
                 stock_entry: m.name,
                 from_warehouse: m.source_warehouse,
                 to_warehouse: m.destination_warehouse,
@@ -600,7 +623,9 @@ class DeliveryApp {
             // accept branch above: a manifest can carry several unrelated
             // legs, each delivered independently as the driver reaches
             // that shipment's own destination.
-            const rows = (m.transfers && m.transfers.length) ? m.transfers : [{
+            // Delivered ones have moved on to the Delivered tab.
+            const rows = (m.transfers && m.transfers.length)
+                ? m.transfers.filter((r) => !r.delivery_captured_at) : [{
                 stock_entry: m.name,
                 from_warehouse: m.source_warehouse,
                 to_warehouse: m.destination_warehouse,
@@ -2945,8 +2970,7 @@ class DeliveryApp {
         const trip_attr = frappe.utils.escape_html(trip || m.trip || "");
         const actions = row.driver_accepted_at
             ? `<span class="da-card-status da-status-completed"><i class="fa fa-check-circle"></i> ${__("Accepted")}</span>`
-            : `<button class="btn btn-success btn-sm da-leg-accept-btn" data-manifest="${frappe.utils.escape_html(m.name)}" data-stock-entry="${se}" data-trip="${trip_attr}" ${accept_disabled}><i class="fa fa-check"></i> ${__("Accept Shipment")}</button>
-               <button class="btn btn-danger btn-sm da-leg-reject-btn" data-manifest="${frappe.utils.escape_html(m.name)}" data-stock-entry="${se}"><i class="fa fa-ban"></i> ${__("Reject")}</button>`;
+            : `<button class="btn btn-success btn-sm da-leg-accept-btn" data-manifest="${frappe.utils.escape_html(m.name)}" data-stock-entry="${se}" data-trip="${trip_attr}" ${accept_disabled}><i class="fa fa-check"></i> ${__("Accept Shipment")}</button>`;
         return `
             <div class="da-stop-card da-manifest-merged-card">
                 <div class="da-stop-where">
@@ -2956,7 +2980,6 @@ class DeliveryApp {
                 </div>
                 <div class="text-muted" style="font-size:11px;padding:0 8px 6px;">
                     <i class="fa fa-file-text-o"></i> ${this._order_id_html(row)}
-                    <span class="text-muted" style="margin-left:8px;"><i class="fa fa-truck"></i> ${frappe.utils.escape_html(m.name)}</span>
                 </div>
                 <div class="da-stop-actions">${actions}</div>
             </div>`;

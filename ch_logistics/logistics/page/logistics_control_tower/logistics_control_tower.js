@@ -146,8 +146,8 @@ class LogisticsCommandCenter {
 		this.unassigned = [];
 		this.drivers = [];
 		this.recalls = [];
-		// Driver refusals waiting for a decision — see rejection_api.
-		this.rejections = [];
+		// Shipments a driver has not accepted yet — see ops_pickup_pending.
+		this.pickup_pending = [];
 		this.selected_manifests = new Set();
 		this.active_trip = null;
 		this._leaflet_loading = null;
@@ -191,7 +191,7 @@ class LogisticsCommandCenter {
 		try {
 			last_mode = localStorage.getItem("lcc_last_mode") || "overview";
 		} catch (e) { /* localStorage unavailable — fall back to Overview */ }
-		this._switch_mode(["overview", "draft", "pending_with_goods", "packing", "ops"].includes(last_mode) ? last_mode : "overview");
+		this._switch_mode(["overview", "draft", "pending_with_goods", "packing", "mf_pickup", "mf_trip", "mf_transit", "mf_pickedup", "mf_delivered", "ops"].includes(last_mode) ? last_mode : "overview");
 	}
 
 	// ─────────────────────────────────────────────────────────────
@@ -206,7 +206,7 @@ class LogisticsCommandCenter {
 						<i class="fa fa-tachometer"></i> ${__("Overview")}
 					</button>
 					<button class="lcc-mode-btn" data-mode="draft">
-						<i class="fa fa-file-text-o"></i> ${__("Draft")}
+						<i class="fa fa-file-text-o"></i> ${__("Transfer Request Approved")}
 					</button>
 					<button class="lcc-mode-btn" data-mode="pending_with_goods">
 						<i class="fa fa-clock-o"></i> ${__("Pending With Goods")}
@@ -214,7 +214,27 @@ class LogisticsCommandCenter {
 					<button class="lcc-mode-btn" data-mode="packing">
 						<i class="fa fa-cube"></i> ${__("Packed Order")}
 					</button>
-					<button class="lcc-mode-btn" data-mode="ops">
+					<button class="lcc-mode-btn" data-mode="mf_pickup">
+					<i class="fa fa-inbox"></i> ${__("Manifest")}
+					<span class="lcc-tab-badge" id="lcc-reg-cnt-pickup"></span>
+				</button>
+				<button class="lcc-mode-btn" data-mode="mf_trip">
+					<i class="fa fa-road"></i> ${__("Trip")}
+					<span class="lcc-tab-badge" id="lcc-reg-cnt-trip"></span>
+				</button>
+				<button class="lcc-mode-btn" data-mode="mf_transit">
+					<i class="fa fa-truck"></i> ${__("Pickup Pending")}
+					<span class="lcc-tab-badge" id="lcc-reg-cnt-transit"></span>
+				</button>
+				<button class="lcc-mode-btn" data-mode="mf_pickedup">
+					<i class="fa fa-check-square-o"></i> ${__("Picked Up")}
+					<span class="lcc-tab-badge" id="lcc-reg-cnt-pickedup"></span>
+				</button>
+				<button class="lcc-mode-btn" data-mode="mf_delivered">
+					<i class="fa fa-check-circle"></i> ${__("Delivered")}
+					<span class="lcc-tab-badge" id="lcc-reg-cnt-delivered"></span>
+				</button>
+				<button class="lcc-mode-btn" data-mode="ops">
 						<i class="fa fa-sitemap"></i> ${__("Operations")}
 					</button>
 				</div>
@@ -256,6 +276,16 @@ class LogisticsCommandCenter {
 			$("#lcc-live-badge").hide();
 			this._stop_auto_refresh();
 			this._pack_init();
+		} else if (mode === "mf_trip") {
+			$("#lcc-live-badge").hide();
+			this._stop_auto_refresh();
+			this._trips_init();
+		} else if (["mf_pickup", "mf_transit", "mf_pickedup", "mf_delivered"].includes(mode)) {
+			$("#lcc-live-badge").hide();
+			this._stop_auto_refresh();
+			this.reg_sub = { mf_pickup: "pickup", mf_transit: "transit", mf_pickedup: "pickedup",
+				mf_delivered: "delivered" }[mode];
+			this._reg_show_sub();
 		} else {
 			$("#lcc-live-badge").show();
 			this._ops_init();
@@ -267,6 +297,8 @@ class LogisticsCommandCenter {
 		if (this.mode === "overview") this._ov_load();
 		else if (this.mode === "draft" || this.mode === "pending_with_goods") this._draft_pending_load();
 		else if (this.mode === "packing") this._pack_load();
+		else if (this.mode === "mf_trip") this._trips_load();
+		else if (String(this.mode).startsWith("mf_")) this._reg_show_sub();
 		else this._ops_load();
 	}
 
@@ -884,6 +916,51 @@ class LogisticsCommandCenter {
 		return `<th class="lcc-dp-sortable ${extra_cls || ""}" data-field="${field}">${label} ${icon}</th>`;
 	}
 
+	// Client-side Asc/Desc for tables whose rows are all in the browser
+	// (Packed Orders, Manifest). Same header look as _dp_sort_th; a click on
+	// the sorted column flips the order, a click on another starts at Asc.
+	_cs_sort_th(table, label, field, extra_cls) {
+		const st = (this.cs_sort || {})[table] || {};
+		let icon = `<i class="fa fa-sort lcc-dp-sort-icon"></i>`;
+		if (st.field === field) {
+			icon = `<i class="fa fa-sort-${st.order === "asc" ? "asc" : "desc"} lcc-dp-sort-icon active"></i>`;
+		}
+		return `<th class="lcc-dp-sortable lcc-cs-sortable ${extra_cls || ""}" data-table="${table}" data-field="${field}">${label} ${icon}</th>`;
+	}
+
+	_cs_sorted(table, list, getters) {
+		const st = (this.cs_sort || {})[table];
+		const get = st && getters[st.field];
+		if (!get) return list;
+		const dir = st.order === "asc" ? 1 : -1;
+		return [...list].sort((a, b) => {
+			const x = get(a), y = get(b);
+			const xe = x === null || x === undefined || x === "", ye = y === null || y === undefined || y === "";
+			if (xe || ye) return xe === ye ? 0 : (xe ? 1 : -1);   // blanks always last
+			if (typeof x === "number" && typeof y === "number") return (x - y) * dir;
+			return String(x).localeCompare(String(y), undefined, { numeric: true }) * dir;
+		});
+	}
+
+	_cs_bind_sort() {
+		if (this._cs_sort_bound) return;
+		this._cs_sort_bound = true;
+		this.$root.on("click", ".lcc-cs-sortable", (e) => {
+			const table = $(e.currentTarget).data("table");
+			const field = $(e.currentTarget).data("field");
+			this.cs_sort = this.cs_sort || {};
+			const st = this.cs_sort[table] || {};
+			this.cs_sort[table] = {
+				field, order: (st.field === field && st.order === "asc") ? "desc" : "asc",
+			};
+			this._pages = this._pages || {};
+			this._pages[table] = 1;
+			if (table === "packed") this._pack_render();
+			else if (table === "register") this._reg_render();
+			else if (table === "trips") this._trips_render();
+		});
+	}
+
 	_draft_pending_render() {
 		const $b = $("#lcc-dp-body");
 		const $p = $("#lcc-dp-pagination");
@@ -893,7 +970,8 @@ class LogisticsCommandCenter {
 			return;
 		}
 		const status_colors = {
-			"Draft": "red", "Pending With Goods": "orange", "Partially Packed": "yellow",
+			"Draft": "red", "Pending With Goods": "orange", "Partially Stock Outward": "yellow",
+			"Partially Packed": "yellow",
 			"Packed": "teal", "Ready For Pickup": "teal", "Assigned": "blue",
 			"Ready For Receive": "cyan", "In Transit": "yellow", "Receive At Transit": "purple",
 			"Partially Transferred": "orange", "Transferred": "green", "Force Closed": "gray",
@@ -966,6 +1044,513 @@ class LogisticsCommandCenter {
 	}
 
 	// ══════════════════════════════════════════════════════════════
+	// MANIFEST MODE — every shipment on a manifest, one row per challan,
+	// with where it stands: pending / fulfilled / rejected qty and its own
+	// logistic status (see logistics_api.ops_manifest_register).
+	// ══════════════════════════════════════════════════════════════
+	// Pickup Pending is Operations' Unassigned Manifests table itself (same
+	// rows, Attach / Create Trip / Shipments / Cancel), fed by _ops_load.
+	// Delivery Pending and Delivered are the per-challan register below,
+	// split by where each challan stands (see _reg_in_sub).
+	// ── Shared filter bar: the Packed Order filters (Search, Date, Source and
+	// Target Warehouse, several at once) for Manifest, Trip, Pickup Pending
+	// and Delivered. Each tab says how to read its rows (cfg); the rows are
+	// already in the browser, so filtering happens here.
+	_flt_bar_html(key, search_ph) {
+		return `<div class="lcc-flt-bar" data-key="${key}"
+				style="display:flex;flex-wrap:wrap;align-items:center;gap:8px;width:100%">
+			<input type="search" class="form-control input-xs lcc-flt-search" data-key="${key}"
+				style="width:260px" placeholder="${search_ph}">
+			<div class="lcc-flt-date" style="width:220px"></div>
+			<div class="lcc-flt-src" style="width:260px"></div>
+			<div class="lcc-flt-dst" style="width:260px"></div>
+		</div>`;
+	}
+
+	// cfg: rows(), text(r) -> [strings], date(r) -> "YYYY-MM-DD…",
+	//      src(r) / dst(r) -> [warehouse], date_ph, page_key, rerender()
+	_flt_mount(key, cfg) {
+		this._flt = this._flt || {};
+		this._flt_cfg = this._flt_cfg || {};
+		this._flt_cfg[key] = cfg;
+		const st = this._flt[key] = this._flt[key] || { search: "", date: null, src: [], dst: [] };
+		const $bar = this.$root.find(`.lcc-flt-bar[data-key="${key}"]`);
+		const refilter = () => {
+			this._pages = this._pages || {};
+			this._pages[cfg.page_key || key] = 1;
+			cfg.rerender();
+		};
+		if (!this._flt_bound) {
+			this._flt_bound = true;
+			this.$root.on("input", ".lcc-flt-search", frappe.utils.debounce((e) => {
+				const k = $(e.target).data("key");
+				if (!this._flt[k]) return;
+				this._flt[k].search = e.target.value || "";
+				const c = this._flt_cfg[k];
+				this._pages = this._pages || {};
+				this._pages[c.page_key || k] = 1;
+				c.rerender();
+			}, 200));
+		}
+		$bar.find(".lcc-flt-search").val(st.search);
+		const label = (wh) => (window.ch_wh_label ? ch_wh_label(wh) : wh);
+		const options = (pick, txt) => {
+			const needle = String(txt || "").toLowerCase();
+			const seen = new Set();
+			return (cfg.rows() || []).flatMap((r) => pick(r) || [])
+				.filter((wh) => wh && !seen.has(wh) && seen.add(wh))
+				.map((wh) => ({ value: wh, label: label(wh), description: wh !== label(wh) ? wh : "" }))
+				.filter((o) => !needle || `${o.label} ${o.value}`.toLowerCase().includes(needle))
+				.sort((a, b) => a.label.localeCompare(b.label));
+		};
+		const make = (sel, df) => {
+			const c = frappe.ui.form.make_control({ parent: $bar.find(sel), df, render_input: true });
+			c.$wrapper.css("margin-bottom", 0);
+			c.$wrapper.find(".control-label, .help-box").remove();
+			c.$wrapper.find(".form-group").css("margin-bottom", 0);
+			return c;
+		};
+		const date = make(".lcc-flt-date", {
+			fieldtype: "DateRange", fieldname: `${key}_date`, placeholder: cfg.date_ph || __("Date"),
+			onchange: () => {
+				const v = date.get_value();
+				st.date = (v && v[0] && v[1]) ? v : null;
+				refilter();
+			},
+		});
+		const src = make(".lcc-flt-src", {
+			fieldtype: "MultiSelectList", fieldname: `${key}_src`, placeholder: __("Source Warehouse"),
+			get_data: (txt) => options(cfg.src, txt),
+			onchange: () => { st.src = src.get_value() || []; refilter(); },
+		});
+		const dst = make(".lcc-flt-dst", {
+			fieldtype: "MultiSelectList", fieldname: `${key}_dst`, placeholder: __("Target Warehouse"),
+			get_data: (txt) => options(cfg.dst, txt),
+			onchange: () => { st.dst = dst.get_value() || []; refilter(); },
+		});
+		// Coming back to the tab keeps what was chosen.
+		if (st.date) date.set_value(st.date);
+		if (st.src.length) src.set_value(st.src);
+		if (st.dst.length) dst.set_value(st.dst);
+	}
+
+	_flt_apply(key, list) {
+		const st = (this._flt || {})[key];
+		const cfg = (this._flt_cfg || {})[key];
+		if (!st || !cfg) return list;
+		const label = (wh) => (window.ch_wh_label ? ch_wh_label(wh) : wh);
+		const needle = String(st.search || "").trim().toLowerCase();
+		return list.filter((r) => {
+			if (st.src.length && !(cfg.src(r) || []).some((w) => st.src.includes(w))) return false;
+			if (st.dst.length && !(cfg.dst(r) || []).some((w) => st.dst.includes(w))) return false;
+			if (st.date) {
+				const day = String(cfg.date(r) || "").slice(0, 10);
+				if (!day || day < st.date[0] || day > st.date[1]) return false;
+			}
+			if (needle) {
+				const whs = [...(cfg.src(r) || []), ...(cfg.dst(r) || [])];
+				const hay = [...(cfg.text(r) || []), ...whs, ...whs.map(label)];
+				if (!hay.some((v) => String(v || "").toLowerCase().includes(needle))) return false;
+			}
+			return true;
+		});
+	}
+
+	_flt_active(key) {
+		const st = (this._flt || {})[key];
+		return !!(st && (String(st.search || "").trim() || st.date || st.src.length || st.dst.length));
+	}
+
+	_reg_show_sub() {
+		const $s = $("#lcc-content");
+		if (this.reg_sub === "pickup") {
+			$s.html(`
+				<div class="lcc-ops-bar">${this._flt_bar_html("manifest", __("Search manifest or warehouse…"))}</div>
+				<div id="lcc-reg-pickup"><div class="lcc-loading"><i class="fa fa-spinner fa-spin"></i> ${__("Loading manifests…")}</div></div>`);
+			const dests = (m) => ((m.destinations || []).filter(Boolean).length
+				? m.destinations.filter(Boolean) : [m.destination_warehouse]);
+			this._flt_mount("manifest", {
+				rows: () => this.unassigned || [],
+				text: (m) => [m.name, m.status, m.direction],
+				date: (m) => m.creation,
+				date_ph: __("Created"),
+				src: (m) => [m.source_warehouse],
+				dst: dests,
+				page_key: "manifests",
+				rerender: () => this._reg_render_pickup(),
+			});
+			// The table's buttons are Operations' own delegated handlers.
+			this._ops_bind_events();
+			this._ops_load();
+			// Fills the Delivery Pending / Delivered counts on their tabs.
+			this._reg_load();
+			return;
+		}
+		// Delivery Pending and Delivered are the same per-challan list, split
+		// by where each challan stands (see _reg_in_sub). The rows are kept
+		// when switching between the two, so the switch is instant.
+		this._reg_init_register($s);
+	}
+
+	// Pickup Pending: on a trip, the driver has not accepted it yet.
+	// Picked Up: accepted (in the vehicle), not delivered yet.
+	// Delivered: everything finished. Not Assigned rows are on the Manifest tab.
+	_reg_in_sub(r, sub) {
+		const st = r.logistic_status;
+		if (st === "Not Assigned") return false;
+		const picked = ["In Transit", "Recall Initiated", "Revert Requested"].includes(st);
+		if (sub === "transit") return st === "Pending Pickup";
+		if (sub === "pickedup") return picked;
+		return st !== "Pending Pickup" && !picked;
+	}
+
+	_reg_update_counts() {
+		const rows = this.reg_rows || [];
+		$("#lcc-reg-cnt-transit").text(rows.filter((r) => this._reg_in_sub(r, "transit")).length);
+		$("#lcc-reg-cnt-pickedup").text(rows.filter((r) => this._reg_in_sub(r, "pickedup")).length);
+		$("#lcc-reg-cnt-delivered").text(rows.filter((r) => this._reg_in_sub(r, "delivered")).length);
+	}
+
+	// Called at the end of _ops_load while the Manifest tab is open.
+	_reg_render_pickup() {
+		$("#lcc-reg-cnt-pickup").text((this.unassigned || []).length);
+		const $p = $("#lcc-reg-pickup");
+		if ($p.length) this._ops_render_manifests($p);
+	}
+
+	_reg_init_register($c) {
+		$c.html(`
+			<div>
+				<div class="lcc-ops-bar">
+					<div class="lcc-ops-bar-actions">
+						<button class="btn btn-xs btn-default lcc-reg-refresh-btn">
+							<i class="fa fa-refresh"></i> ${__("Refresh")}
+						</button>
+					</div>
+					${this._flt_bar_html(`reg_${this.reg_sub}`, __("Search DC ID, manifest, driver or warehouse…"))}
+				</div>
+				<div id="lcc-reg-body">
+					<div class="lcc-loading"><i class="fa fa-spinner fa-spin"></i> ${__("Loading manifests…")}</div>
+				</div>
+			</div>`);
+		if (!this._reg_events_bound) {
+			const $r = this.$root;
+			$r.on("click", ".lcc-reg-refresh-btn", () => this._reg_load());
+			$r.on("click", ".lcc-reg-remove", (e) => {
+				e.preventDefault();
+				const $b = $(e.currentTarget);
+				this._ops_remove_pending($b.data("manifest"), $b.data("stock-entry"), $b.data("label"));
+			});
+			this._reg_events_bound = true;
+		}
+		this._flt_mount(`reg_${this.reg_sub}`, {
+			rows: () => (this.reg_rows || []).filter((r) => this._reg_in_sub(r, this.reg_sub)),
+			text: (r) => [r.delivery_challan, r.stock_entry, r.manifest, r.driver_name, r.trip,
+				r.logistic_status],
+			date: (r) => r.dc_date || r.manifest_date,
+			date_ph: __("DC Date"),
+			src: (r) => [r.from_warehouse],
+			dst: (r) => [r.to_warehouse],
+			page_key: "register",
+			rerender: () => this._reg_render(),
+		});
+		this._reg_load();
+	}
+
+	async _reg_load() {
+		const $b = $("#lcc-reg-body");
+		$b.html(`<div class="lcc-loading"><i class="fa fa-spinner fa-spin"></i> ${__("Loading manifests…")}</div>`);
+		try {
+			const co = this.filters?.fields?.company?.get_value() || undefined;
+			const args = {};
+			if (co) args.company = co;
+			const r = await frappe.call({ method: _LCC + "ops_manifest_register", args });
+			this.reg_rows = r.message || [];
+			this._pages = this._pages || {};
+			this._pages["register"] = 1;
+			this._reg_render();
+		} catch (e) {
+			$b.html(`<div class="lcc-empty"><i class="fa fa-exclamation-triangle"></i> ${__("Failed to load manifests.")}</div>`);
+		}
+	}
+
+	_reg_render() {
+		const $b = $("#lcc-reg-body");
+		const esc = frappe.utils.escape_html;
+		const label = (wh) => (window.ch_wh_label ? ch_wh_label(wh) : wh) || "";
+		const html_wh = (wh) => (window.ch_wh_label_html ? ch_wh_label_html(wh, "—") : esc(wh || "—"));
+		const sub = ["transit", "pickedup"].includes(this.reg_sub) ? this.reg_sub : "delivered";
+		this._reg_update_counts();
+		const list = this._flt_apply(`reg_${sub}`,
+			(this.reg_rows || []).filter((r) => this._reg_in_sub(r, sub)));
+		if (!list.length) {
+			$b.html(`<div class="lcc-empty"><i class="fa fa-search"></i> ${this._flt_active(`reg_${sub}`)
+				? __("No row matches the filters.")
+				: ({ transit: __("No order waiting for the driver to accept."),
+					pickedup: __("No order picked up and on the way.") }[sub]
+					|| __("Nothing delivered in this period."))}</div>`);
+			return;
+		}
+		const pill = {
+			"Not Assigned": "gray", "Pending Pickup": "orange", "In Transit": "blue",
+			"Delivered": "green", "Revert Requested": "yellow", "Reverted": "red",
+			"Cancelled": "red", "Rejected": "red", "Returned": "red", "Recall Initiated": "yellow",
+		};
+		const qty = (v) => {
+			const n = Number(v || 0);
+			return n ? String(Math.round(n * 100) / 100) : `<span class="text-muted">0</span>`;
+		};
+		this._cs_bind_sort();
+		const sorted = this._cs_sorted("register", list, {
+			manifest: (r) => r.manifest,
+			date: (r) => r.dc_date || r.manifest_date || "",
+			driver: (r) => r.driver_name || "",
+			dc: (r) => r.delivery_challan || r.stock_entry || "",
+			src: (r) => label(r.from_warehouse),
+			dst: (r) => label(r.to_warehouse),
+			pending: (r) => Number(r.pending_qty || 0),
+			fulfill: (r) => Number(r.fulfilled_qty || 0),
+			rejected: (r) => Number(r.rejected_qty || 0),
+			lstatus: (r) => r.logistic_status || "",
+		});
+		const page = this._page_slice("register", sorted);
+		const rows = page.rows.map((r) => `<tr>
+			<td title="${esc(r.stock_entry || "")}"><b>${esc(r.delivery_challan || r.stock_entry || "—")}</b></td>
+			<td>${(r.dc_date || r.manifest_date) ? frappe.datetime.str_to_user(r.dc_date || r.manifest_date) : "—"}</td>
+			<td><a href="/app/ch-transfer-manifest/${encodeURIComponent(r.manifest)}" target="_blank">${esc(r.manifest)}</a></td>
+			<td>${esc(r.driver_name || "—")}</td>
+			<td>${html_wh(r.from_warehouse)}</td>
+			<td>${html_wh(r.to_warehouse)}</td>
+			<td class="tr">${qty(r.pending_qty)}</td>
+			<td class="tr">${qty(r.fulfilled_qty)}</td>
+			<td class="tr">${qty(r.rejected_qty)}</td>
+			<td><span class="indicator-pill ${pill[r.logistic_status] || "gray"}"><span>${esc(
+				r.logistic_status === "In Transit" ? __("Picked Up") : __(r.logistic_status || "—"))}</span></span></td>
+			${sub === "transit" ? `<td class="text-right">${
+				// Only a driver's shipment not yet accepted can come off the trip
+				// (remove_pending_shipment); a courier's moves with its trip.
+				r.manifest_status === "Assigned" ? `<button class="btn btn-xs btn-default lcc-reg-remove"
+					data-manifest="${esc(r.manifest)}" data-stock-entry="${esc(r.stock_entry)}"
+					data-label="${esc(r.delivery_challan || r.stock_entry)}">
+					<i class="fa fa-undo"></i> ${__("Remove")}</button>` : ""}</td>` : ""}
+		</tr>`).join("");
+		$b.html(`
+			<div class="lcc-table-wrap"><table class="lcc-table">
+				<thead><tr>
+					${this._cs_sort_th("register", __("DC ID"), "dc")}
+					${this._cs_sort_th("register", __("DC Date"), "date")}
+					${this._cs_sort_th("register", __("Manifest ID"), "manifest")}
+					${this._cs_sort_th("register", __("Driver Name"), "driver")}
+					${this._cs_sort_th("register", __("Source Warehouse"), "src")}
+					${this._cs_sort_th("register", __("Delivery Warehouse"), "dst")}
+					${this._cs_sort_th("register", __("Pending"), "pending", "tr")}
+					${this._cs_sort_th("register", __("Fulfill"), "fulfill", "tr")}
+					${this._cs_sort_th("register", __("Rejected"), "rejected", "tr")}
+					${this._cs_sort_th("register", __("DC Status"), "lstatus")}
+					${sub === "transit" ? `<th></th>` : ""}
+				</tr></thead>
+				<tbody>${rows}</tbody>
+			</table></div>
+			${this._pager_html("register", page, list.length)}`);
+		this._bind_pager($b, "register", () => this._reg_render());
+	}
+
+	// ══════════════════════════════════════════════════════════════
+	// TRIP MODE — every trip, newest first, with how far its shipments got
+	// (see logistics_api.ops_trip_register). Create Trip from Selected on
+	// the Manifest tab lands here.
+	// ══════════════════════════════════════════════════════════════
+	_trips_init() {
+		$("#lcc-content").html(`
+			<div class="lcc-section">
+				<div class="lcc-ops-bar">
+					<div class="lcc-ops-bar-actions">
+						<button class="btn btn-xs btn-default lcc-trips-refresh-btn">
+							<i class="fa fa-refresh"></i> ${__("Refresh")}
+						</button>
+					</div>
+					${this._flt_bar_html("trips", __("Search trip, driver or vehicle…"))}
+				</div>
+				<div id="lcc-trips-body">
+					<div class="lcc-loading"><i class="fa fa-spinner fa-spin"></i> ${__("Loading trips…")}</div>
+				</div>
+			</div>`);
+		if (!this._trips_events_bound) {
+			this._trips_events_bound = true;
+			const $r = this.$root;
+			$r.on("click", ".lcc-trips-refresh-btn", () => this._trips_load());
+			$r.on("click", ".lcc-trip-drill", (e) => {
+				e.preventDefault();
+				this._trip_drilldown($(e.currentTarget).data("name"));
+			});
+		}
+		this._flt_mount("trips", {
+			rows: () => this.trips_rows || [],
+			text: (t) => [t.name, t.driver_name, t.carrier_name, t.vehicle_number, t.vehicle, t.status, t.route],
+			date: (t) => t.trip_date,
+			date_ph: __("Trip Date"),
+			src: (t) => [t.hub_warehouse],
+			dst: (t) => t.drops || [],
+			page_key: "trips",
+			rerender: () => this._trips_render(),
+		});
+		this._trips_load();
+	}
+
+	// Trip → its manifests, in the same window style as the manifest
+	// drill-down. A manifest opens _ops_show_manifest_items, which carries on
+	// to Delivery Challan → Items → IMEI exactly as from the Manifest tab.
+	async _trip_drilldown(trip) {
+		const esc = frappe.utils.escape_html;
+		const loc = (w) => (window.ch_wh_label_html ? ch_wh_label_html(w, "—") : esc(w || "—"));
+		const d = new frappe.ui.Dialog({
+			title: __("Trip {0}", [trip]),
+			size: "large",
+			fields: [{ fieldname: "trip_html", fieldtype: "HTML" }],
+		});
+		const $w = d.fields_dict.trip_html.$wrapper;
+		$w.html(`<div class="lcc-loading"><i class="fa fa-spinner fa-spin"></i> ${__("Loading…")}</div>`);
+		d.show();
+		let t;
+		try {
+			t = (await frappe.call({ method: _LCC + "ops_trip_drilldown", args: { trip } })).message || {};
+		} catch (e) {
+			$w.html(`<div class="lcc-empty"><i class="fa fa-exclamation-triangle"></i> ${__("Failed to load the trip.")}</div>`);
+			return;
+		}
+		const manifests = t.manifests || [];
+		if (!manifests.length) {
+			$w.html(`<div class="lcc-empty">${__("No manifests on this trip.")}</div>`);
+			return;
+		}
+		const body = manifests.map((m) => {
+			const orders = m.orders || [];
+			const dests = [...new Set(orders.map((o) => o.to_warehouse).filter(Boolean))];
+			return `<tr>
+				<td><a href="#" class="lcc-trip-mf-open" data-name="${esc(m.name)}">${esc(m.name)}</a></td>
+				<td class="tr">${orders.length}</td>
+				<td class="tr">${m.delivered}</td>
+				<td class="tr">${m.total_qty || 0}</td>
+				<td>${m.manifest_date ? frappe.datetime.str_to_user(m.manifest_date) : "—"}</td>
+				<td>${loc(m.source_warehouse)}</td>
+				<td>${dests.map(loc).join(", ") || "—"}</td>
+				<td><span class="indicator-pill ${this._status_color(m.status)}"><span>${esc(__(m.status || "—"))}</span></span></td>
+			</tr>`;
+		}).join("");
+		$w.html(`
+			<p class="text-muted small">${esc(t.driver_name || t.carrier_name || "—")} · ${esc(t.vehicle_number || "—")} · ${
+				t.trip_date ? frappe.datetime.str_to_user(t.trip_date) : ""} · ${esc(__(t.status || ""))}</p>
+			<div class="lcc-table-wrap"><table class="lcc-table">
+				<thead><tr>
+					<th>${__("Manifest")}</th>
+					<th class="tr">${__("Orders")}</th>
+					<th class="tr">${__("Delivered")}</th>
+					<th class="tr">${__("Qty")}</th>
+					<th>${__("Date")}</th>
+					<th>${__("From")}</th>
+					<th>${__("To")}</th>
+					<th>${__("Status")}</th>
+				</tr></thead>
+				<tbody>${body}</tbody>
+			</table></div>`);
+		$w.on("click", ".lcc-trip-mf-open", (e) => {
+			e.preventDefault();
+			this._ops_show_manifest_items($(e.currentTarget).data("name"));
+		});
+	}
+
+	async _trips_load() {
+		$("#lcc-trips-body").html(`<div class="lcc-loading"><i class="fa fa-spinner fa-spin"></i> ${__("Loading trips…")}</div>`);
+		try {
+			const co = this.filters?.fields?.company?.get_value() || undefined;
+			const args = {};
+			if (co) args.company = co;
+			const r = await frappe.call({ method: _LCC + "ops_trip_register", args });
+			this.trips_rows = r.message || [];
+			this._pages = this._pages || {};
+			this._pages["trips"] = 1;
+			this._trips_render();
+		} catch (e) {
+			$("#lcc-trips-body").html(`<div class="lcc-empty"><i class="fa fa-exclamation-triangle"></i> ${__("Failed to load trips.")}</div>`);
+		}
+	}
+
+	_trips_render() {
+		const $b = $("#lcc-trips-body");
+		const esc = frappe.utils.escape_html;
+		const label = (wh) => (window.ch_wh_label ? ch_wh_label(wh) : wh) || "";
+		const html_wh = (wh) => (window.ch_wh_label_html ? ch_wh_label_html(wh, "—") : esc(wh || "—"));
+		const carrier = (t) => t.driver_name || t.carrier_name || "";
+		const all = this.trips_rows || [];
+		$("#lcc-reg-cnt-trip").text(all.length);
+		const list = this._flt_apply("trips", all);
+		if (!list.length) {
+			$b.html(`<div class="lcc-empty"><i class="fa fa-search"></i> ${this._flt_active("trips")
+				? __("No trip matches the filters.") : __("No trips on the road. A trip leaves this list once it is delivered or closed.")}</div>`);
+			return;
+		}
+		this._cs_bind_sort();
+		const sorted = this._cs_sorted("trips", list, {
+			trip: (t) => t.name,
+			date: (t) => t.trip_date || "",
+			driver: (t) => carrier(t),
+			vehicle: (t) => t.vehicle_number || t.vehicle || "",
+			stops: (t) => (t.drops || []).length,
+			manifests: (t) => Number(t.manifests || 0),
+			shipments: (t) => Number(t.shipments || 0),
+			accepted: (t) => Number(t.accepted || 0),
+			delivered: (t) => Number(t.delivered || 0),
+			status: (t) => t.status || "",
+			created: (t) => t.creation || "",
+		});
+		const pill = {
+			"Draft": "gray", "Assigned": "orange", "Started": "blue", "Picked Up": "blue",
+			"Delivery Pending": "yellow", "Delivered": "green", "Completed": "green",
+			"Closed": "darkgrey", "Cancelled": "red",
+		};
+		const page = this._page_slice("trips", sorted);
+		const rows = page.rows.map((t) => {
+			const drops = t.drops || [];
+			const shown = drops.slice(0, 3).map(html_wh).join(", ");
+			const more = drops.length > 3 ? ` <span class="lcc-muted">+${drops.length - 3}</span>` : "";
+			return `<tr>
+				<td style="white-space:nowrap">
+					<a href="#" class="lcc-trip-drill" data-name="${esc(t.name)}" title="${__("Manifests, orders and items")}">${esc(t.name)}</a>
+				</td>
+				<td>${t.trip_date ? frappe.datetime.str_to_user(t.trip_date) : "—"}</td>
+				<td>${esc(carrier(t) || "—")}</td>
+				<td>${esc(t.vehicle_number || t.vehicle || "—")}</td>
+				<td>${html_wh(t.hub_warehouse)} → ${shown || "—"}${more}</td>
+				<td class="tr">${t.manifests || 0}</td>
+				<td class="tr">${t.shipments || 0}</td>
+				<td class="tr">${t.accepted || 0}</td>
+				<td class="tr">${t.delivered || 0}</td>
+				<td><span class="indicator-pill ${pill[t.status] || "gray"}"><span>${esc(__(t.status || "—"))}</span></span></td>
+				<td>${t.creation ? frappe.datetime.str_to_user(t.creation) : "—"}</td>
+			</tr>`;
+		}).join("");
+		$b.html(`
+			<div class="lcc-table-wrap"><table class="lcc-table">
+				<thead><tr>
+					${this._cs_sort_th("trips", __("Trip ID"), "trip")}
+					${this._cs_sort_th("trips", __("Trip Date"), "date")}
+					${this._cs_sort_th("trips", __("Driver"), "driver")}
+					${this._cs_sort_th("trips", __("Vehicle"), "vehicle")}
+					${this._cs_sort_th("trips", __("Route"), "stops")}
+					${this._cs_sort_th("trips", __("Manifests"), "manifests", "tr")}
+					${this._cs_sort_th("trips", __("Shipments"), "shipments", "tr")}
+					${this._cs_sort_th("trips", __("Accepted"), "accepted", "tr")}
+					${this._cs_sort_th("trips", __("Delivered"), "delivered", "tr")}
+					${this._cs_sort_th("trips", __("Trip Status"), "status")}
+					${this._cs_sort_th("trips", __("Created"), "created")}
+				</tr></thead>
+				<tbody>${rows}</tbody>
+			</table></div>
+			${this._pager_html("trips", page, list.length)}`);
+		this._bind_pager($b, "trips", () => this._trips_render());
+	}
+
+	// ══════════════════════════════════════════════════════════════
 	// PACKING MODE
 	// Oracle WMS Cloud / Manhattan Active WMS-style "Pack Station Work
 	// Queue".  Lists every Draft manifest with running packing progress
@@ -998,13 +1583,18 @@ class LogisticsCommandCenter {
 						<button class="btn btn-xs btn-primary lcc-pack-create-manifest-btn" disabled>
 							<i class="fa fa-plus"></i> ${__("Create Manifest")}
 						</button>
+					</div>
+					<div class="lcc-pack-filters" style="display:flex;flex-wrap:wrap;align-items:center;gap:8px;width:100%">
 						<input type="search" class="form-control input-xs lcc-pack-search"
-							style="width:220px;display:inline-block;margin-left:8px"
+							style="width:260px"
 							placeholder="${__("Search challan, order, store or warehouse…")}">
+						<div class="lcc-pack-f-date" style="width:220px"></div>
+						<div class="lcc-pack-f-src" style="width:260px"></div>
+						<div class="lcc-pack-f-dst" style="width:260px"></div>
 					</div>
 					<span class="lcc-muted lcc-ops-bar-hint">
 						<i class="fa fa-info-circle"></i>
-						${__("Showing packed delivery challans not yet on a manifest. Tick some and click Create Manifest to group them for dispatch — a transfer's challans go together, once every one of them is packed.")}
+						${__("Showing packed delivery challans not yet on a manifest. Tick the challans to send and click Create Manifest — each challan can go on its own once it is packed.")}
 					</span>
 				</div>
 				<div class="lcc-pack-body" id="lcc-pack-body">
@@ -1028,17 +1618,81 @@ class LogisticsCommandCenter {
 				$r.find(".lcc-pack-row-check:not(:disabled)").prop("checked", e.currentTarget.checked);
 				this._pack_update_create_btn();
 			});
-			$r.on("change", ".lcc-pack-row-check", (e) => {
-				// A transfer's challan rows go onto a manifest together.
-				const name = $(e.currentTarget).data("name");
-				$r.find(".lcc-pack-row-check")
-					.filter((_, el) => $(el).data("name") === name)
-					.prop("checked", e.currentTarget.checked);
-				this._pack_update_create_btn();
-			});
+			// Each challan is ticked on its own — Create Manifest separates a
+			// transfer sent in batches into one transfer per challan.
+			$r.on("change", ".lcc-pack-row-check", () => this._pack_update_create_btn());
 			this._pack_events_bound = true;
 		}
+		this._pack_make_filters();
 		this._pack_load();
+	}
+
+	// Date range + Source / Target warehouse (several at once). The queue is
+	// already all in the browser, so these narrow it here, like the search.
+	_pack_make_filters() {
+		this.pack_filters = this.pack_filters || { date: null, src: [], dst: [] };
+		const $r = this.$root;
+		const refilter = () => {
+			this._pages = this._pages || {};
+			this._pages["packed"] = 1;
+			this._pack_render();
+		};
+		const label = (wh) => (window.ch_wh_label ? ch_wh_label(wh) : wh);
+		const options = (key, txt) => {
+			const needle = String(txt || "").toLowerCase();
+			const seen = new Set();
+			return (this.pack_queue || [])
+				.map((se) => se[key])
+				.filter((wh) => wh && !seen.has(wh) && seen.add(wh))
+				.map((wh) => ({ value: wh, label: label(wh), description: wh !== label(wh) ? wh : "" }))
+				.filter((o) => !needle || `${o.label} ${o.value}`.toLowerCase().includes(needle))
+				.sort((a, b) => a.label.localeCompare(b.label));
+		};
+		const make = (parent, df) => {
+			const c = frappe.ui.form.make_control({
+				parent: $r.find(parent), df, render_input: true, only_input: false,
+			});
+			// No label above the box: keep the row as tall as the search box.
+			c.$wrapper.css({ "margin-bottom": 0 });
+			c.$wrapper.find(".control-label, .help-box").remove();
+			c.$wrapper.find(".form-group").css("margin-bottom", 0);
+			return c;
+		};
+		this.pack_f_date = make(".lcc-pack-f-date", {
+			fieldtype: "DateRange", fieldname: "pack_date", placeholder: __("Date"),
+			onchange: () => {
+				const v = this.pack_f_date.get_value();
+				this.pack_filters.date = (v && v[0] && v[1]) ? v : null;
+				refilter();
+			},
+		});
+		this.pack_f_src = make(".lcc-pack-f-src", {
+			fieldtype: "MultiSelectList", fieldname: "pack_src", placeholder: __("Source Warehouse"),
+			get_data: (txt) => options("from_warehouse", txt),
+			onchange: () => { this.pack_filters.src = this.pack_f_src.get_value() || []; refilter(); },
+		});
+		this.pack_f_dst = make(".lcc-pack-f-dst", {
+			fieldtype: "MultiSelectList", fieldname: "pack_dst", placeholder: __("Target Warehouse"),
+			get_data: (txt) => options("to_warehouse", txt),
+			onchange: () => { this.pack_filters.dst = this.pack_f_dst.get_value() || []; refilter(); },
+		});
+		// Coming back to this tab keeps what was chosen.
+		$r.find(".lcc-pack-search").val(this.pack_search || "");
+		if (this.pack_filters.date) this.pack_f_date.set_value(this.pack_filters.date);
+		if (this.pack_filters.src.length) this.pack_f_src.set_value(this.pack_filters.src);
+		if (this.pack_filters.dst.length) this.pack_f_dst.set_value(this.pack_filters.dst);
+	}
+
+	_pack_passes_filters(se) {
+		const f = this.pack_filters || {};
+		if (f.src && f.src.length && !f.src.includes(se.from_warehouse)) return false;
+		if (f.dst && f.dst.length && !f.dst.includes(se.to_warehouse)) return false;
+		if (f.date) {
+			// The Date column: when the order reached Packed.
+			const day = String(se.custom_status_since || se.creation || "").slice(0, 10);
+			if (!day || day < f.date[0] || day > f.date[1]) return false;
+		}
+		return true;
 	}
 
 	async _pack_load() {
@@ -1078,13 +1732,29 @@ class LogisticsCommandCenter {
 			return;
 		}
 		const needle = String(this.pack_search || "").trim().toLowerCase();
-		const queue = this.pack_queue.filter((se) => this._pack_matches(se, needle));
+		const queue = this.pack_queue.filter(
+			(se) => this._pack_matches(se, needle) && this._pack_passes_filters(se));
 		if (!queue.length) {
-			$b.html(`<div class="lcc-empty"><i class="fa fa-search"></i> ${
-				__("No packed order matches “{0}”.", [frappe.utils.escape_html(needle)])}</div>`);
+			$b.html(`<div class="lcc-empty"><i class="fa fa-search"></i> ${needle
+				? __("No packed order matches “{0}”.", [frappe.utils.escape_html(needle)])
+				: __("No packed order matches the filters.")}</div>`);
 			return;
 		}
-		const page = this._page_slice("packed", queue);
+		this._cs_bind_sort();
+		const label = (wh) => (window.ch_wh_label ? ch_wh_label(wh) : wh) || "";
+		const first_dc = (se) => ((se.delivery_challan_rows || []).find((c) => c && c.name) || {});
+		const sorted = this._cs_sorted("packed", queue, {
+			order: (se) => first_dc(se).name || se.name,
+			date: (se) => se.custom_status_since || se.creation || "",
+			status: (se) => first_dc(se).packing_status || se.custom_status || "",
+			src: (se) => label(se.from_warehouse),
+			dst: (se) => label(se.to_warehouse),
+			qty: (se) => Number(se.total_qty || 0),
+			boxes: (se) => Number(se.box_count || 0),
+			weight: (se) => Number(se.weight_kg || 0),
+			age: (se) => Number(se.age_minutes != null ? se.age_minutes : (se.age_hours || 0) * 60),
+		});
+		const page = this._page_slice("packed", sorted);
 		const rows = page.rows.map((se) => {
 			const nm = frappe.utils.escape_html(se.name);
 			const total_qty = Number(se.total_qty || 0);
@@ -1120,6 +1790,7 @@ class LogisticsCommandCenter {
 			const boxes_per_challan = challans.some((c) => Number(c.box_count || 0));
 			const lines = challans.length
 				? challans.map((c, i) => ({
+					challan: c.name,
 					cell: frappe.utils.escape_html(c.name),
 					title: frappe.utils.escape_html(`${c.name} · ${se.name}`),
 					status: c.packing_status || "Not Packed",
@@ -1136,35 +1807,41 @@ class LogisticsCommandCenter {
 					weight: weight,
 				}];
 			const pill = { "Packed": "green", "Partially Packed": "yellow", "Not Packed": "orange" };
-			return lines.map((line) => `<tr class="${ready ? "" : "text-muted"}">
+			return lines.map((line) => {
+				// A challan can go once IT is packed; a transfer with no challan
+				// (older data) only when the whole transfer is.
+				const can = line.challan ? line.status === "Packed" : ready;
+				return `<tr class="${can ? "" : "text-muted"}">
 				<td><input type="checkbox" class="lcc-pack-row-check" data-name="${nm}"
-					${ready ? "" : `disabled title="${__("Waiting for {0} to be packed", [waiting])}"`}></td>
+					data-challan="${line.challan ? frappe.utils.escape_html(line.challan) : ""}"
+					${can ? "" : `disabled title="${__("Not packed yet")}"`}></td>
 				<td title="${line.title}">${line.cell}</td>
 				<td>${since ? frappe.datetime.str_to_user(since) : "—"}</td>
 				<td><span class="indicator-pill ${pill[line.status] || "gray"}"><span>${frappe.utils.escape_html(__(line.status))}</span></span>
-					${ready ? "" : `<div class="lcc-muted" style="font-size:11px;margin-top:2px">${__("Waiting for {0}", [waiting])}</div>`}</td>
+					${ready || line.challan ? "" : `<div class="lcc-muted" style="font-size:11px;margin-top:2px">${__("Waiting for {0}", [waiting])}</div>`}</td>
 				<td>${window.ch_wh_label_html ? ch_wh_label_html(se.from_warehouse, "—") : frappe.utils.escape_html(se.from_warehouse || "—")}</td>
 				<td>${window.ch_wh_label_html ? ch_wh_label_html(se.to_warehouse, "—") : frappe.utils.escape_html(se.to_warehouse || "—")}</td>
 				<td class="tr">${line.qty}</td>
 				<td class="tr">${line.boxes}</td>
 				<td class="tr">${line.weight ? line.weight.toFixed(1) + " kg" : "—"}</td>
 				<td><span class="lcc-sev ${age_cls}">${age}</span></td>
-			</tr>`).join("");
+			</tr>`;
+			}).join("");
 		}).join("");
 
 		$b.html(`
 			<div class="lcc-table-wrap"><table class="lcc-table lcc-pack-table">
 				<thead><tr>
 					<th style="width:32px"><input type="checkbox" class="lcc-pack-select-all"></th>
-					<th>${__("Order ID")}</th>
-					<th>${__("Date")}</th>
-					<th>${__("Status")}</th>
-					<th>${__("Source Warehouse")}</th>
-					<th>${__("Target Warehouse")}</th>
-					<th class="tr">${__("Qty")}</th>
-					<th class="tr">${__("Boxes")}</th>
-					<th class="tr">${__("Weight")}</th>
-					<th>${__("Age")}</th>
+					${this._cs_sort_th("packed", __("Order ID"), "order")}
+					${this._cs_sort_th("packed", __("Date"), "date")}
+					${this._cs_sort_th("packed", __("Status"), "status")}
+					${this._cs_sort_th("packed", __("Source Warehouse"), "src")}
+					${this._cs_sort_th("packed", __("Target Warehouse"), "dst")}
+					${this._cs_sort_th("packed", __("Qty"), "qty", "tr")}
+					${this._cs_sort_th("packed", __("Boxes"), "boxes", "tr")}
+					${this._cs_sort_th("packed", __("Weight"), "weight", "tr")}
+					${this._cs_sort_th("packed", __("Age"), "age")}
 				</tr></thead>
 				<tbody>${rows}</tbody>
 			</table></div>
@@ -1202,10 +1879,13 @@ class LogisticsCommandCenter {
 	 */
 	_pack_create_manifest() {
 		const $r = this.$root;
-		const challan_count = $r.find(".lcc-pack-row-check:checked").length;
-		const names = [...new Set(
-			$r.find(".lcc-pack-row-check:checked").map((_, el) => $(el).data("name")).get())];
-		if (!names.length) {
+		const $ticked = $r.find(".lcc-pack-row-check:checked");
+		const challan_count = $ticked.length;
+		const challans = $ticked.map((_, el) => $(el).data("challan")).get().filter(Boolean);
+		// Older transfers with no challan go whole, by transfer.
+		const names = [...new Set($ticked.filter((_, el) => !$(el).data("challan"))
+			.map((_, el) => $(el).data("name")).get())];
+		if (!challans.length && !names.length) {
 			frappe.msgprint(__("Tick at least one delivery challan."));
 			return;
 		}
@@ -1216,8 +1896,8 @@ class LogisticsCommandCenter {
 		// Stops table. It still refuses (with a clear message) if the
 		// ticked entries genuinely don't connect.
 		frappe.call({
-			method: "ch_erp15.ch_erp15.custom.stock_entry.group_stock_entries_into_manifest",
-			args: { stock_entries: JSON.stringify(names) },
+			method: "ch_erp15.ch_erp15.custom.stock_entry.group_challans_into_manifest",
+			args: { challans: JSON.stringify(challans), stock_entries: JSON.stringify(names) },
 			freeze: true,
 		}).then((r) => {
 			const manifest_name = r.message;
@@ -1314,9 +1994,9 @@ class LogisticsCommandCenter {
 						<i class="fa fa-undo"></i> ${__("Recalls")}
 						<span class="lcc-tab-badge lcc-tab-badge-warn" id="lcc-cnt-rec">0</span>
 					</button>
-					<button class="lcc-tab" data-tab="rejections">
-						<i class="fa fa-ban"></i> ${__("Rejected")}
-						<span class="lcc-tab-badge lcc-tab-badge-warn" id="lcc-cnt-rej">0</span>
+					<button class="lcc-tab" data-tab="pickup_pending">
+						<i class="fa fa-clock-o"></i> ${__("Pending")}
+						<span class="lcc-tab-badge lcc-tab-badge-warn" id="lcc-cnt-pend">0</span>
 					</button>
 					<button class="lcc-tab" data-tab="drivers">
 						<i class="fa fa-id-card"></i> ${__("Drivers")}
@@ -1432,6 +2112,13 @@ class LogisticsCommandCenter {
 
 		// Recalls inbox — confirm physical return + reverse stock.
 		$r.on("click", ".lcc-rec-confirm",      (e) => { e.preventDefault(); this._ops_confirm_recall_return($(e.currentTarget).data("name")); });
+
+		// Pending tab — take a shipment the driver has not accepted back to Packed Orders.
+		$r.on("click", ".lcc-pend-remove", (e) => {
+			e.preventDefault();
+			const $b = $(e.currentTarget);
+			this._ops_remove_pending($b.data("manifest"), $b.data("stock-entry"), $b.data("label"));
+		});
 	}
 
 	async _ops_load() {
@@ -1442,20 +2129,20 @@ class LogisticsCommandCenter {
 		// The exception inbox was dropped from this console, and with it the
 		// query behind it: a trip's own exceptions still show on its side
 		// panel, read from the board payload it already carries.
-		const [b, u, d, rc, lc, rj] = await Promise.all([
+		const [b, u, d, rc, lc, pp] = await Promise.all([
 			frappe.call({ method: _LCC + "ops_board",              args: args_board }),
 			frappe.call({ method: _LCC + "ops_unassigned_manifests", args: { limit: 0 } }),
 			frappe.call({ method: _LCC + "ops_drivers_available" }),
 			frappe.call({ method: _LCC + "ops_recall_inbox",        args: { limit: 100 } }),
 			frappe.call({ method: _LCC + "ops_lifecycle_counts",    args: args_board }),
-			frappe.call({ method: _REJ + "rejection_inbox",         args: co ? { company: co } : {} }),
+			frappe.call({ method: _LCC + "ops_pickup_pending",      args: co ? { company: co } : {} }),
 		]);
 
 		this.board      = b.message || { buckets: {}, totals: {} };
 		this.unassigned = u.message || [];
 		this.drivers    = d.message || [];
 		this.recalls    = rc.message || [];
-		this.rejections = rj.message || [];
+		this.pickup_pending = pp.message || [];
 		this.lifecycle  = lc.message || { stages: [] };
 		this.selected_manifests.clear();
 
@@ -1463,6 +2150,7 @@ class LogisticsCommandCenter {
 		this._ops_render_board();
 		this._ops_render_kpi();
 		this._ops_render_bottom();
+		if (this.mode === "mf_pickup") { this._reg_render_pickup(); return; }
 		if (this.active_trip) this._ops_open_trip(this.active_trip);
 	}
 
@@ -1628,16 +2316,16 @@ class LogisticsCommandCenter {
 
 	_ops_render_bottom() {
 		const rec_cnt = (this.recalls || []).length;
-		const rej_cnt = (this.rejections || []).length;
+		const pend_cnt = (this.pickup_pending || []).length;
 		$("#lcc-cnt-mf").text(this.unassigned.length);
 		$("#lcc-cnt-rec").text(rec_cnt).toggleClass("has-items", rec_cnt > 0);
-		$("#lcc-cnt-rej").text(rej_cnt).toggleClass("has-items", rej_cnt > 0);
+		$("#lcc-cnt-pend").text(pend_cnt).toggleClass("has-items", pend_cnt > 0);
 		$("#lcc-cnt-drv").text(this.drivers.length);
 
 		const $b = $("#lcc-ops-bottom").empty();
 		if (this.bottom_tab === "manifests")  return this._ops_render_manifests($b);
 		if (this.bottom_tab === "recalls")    return this._ops_render_recalls($b);
-		if (this.bottom_tab === "rejections") return this._ops_render_rejections($b);
+		if (this.bottom_tab === "pickup_pending") return this._ops_render_pickup_pending($b);
 		if (this.bottom_tab === "drivers")    return this._ops_render_drivers($b);
 	}
 
@@ -1647,7 +2335,10 @@ class LogisticsCommandCenter {
 	// and with a cap, anything packed after it simply never appeared.
 	// Twenty rows suit a full-width table; a Kanban lane is a narrow column,
 	// so ten cards is as much as fits without scrolling the board.
-	_page_size(key) { return String(key).startsWith("board:") ? 10 : 20; }
+	_page_size(key) {
+		if (key === "packed" || key === "register" || key === "trips") return 100;   // 100 a page
+		return String(key).startsWith("board:") ? 10 : 20;
+	}
 
 	_page_slice(key, list) {
 		this._pages = this._pages || {};
@@ -1687,9 +2378,17 @@ class LogisticsCommandCenter {
 		// active, narrow the panel to just that status. Otherwise show
 		// everything attachable, like before.
 		const want = this._ops_manifest_status_filter;
-		const list = want
+		let list = want
 			? (this.unassigned || []).filter((m) => (m.status || "").toLowerCase() === want.toLowerCase())
 			: (this.unassigned || []);
+		// The Manifest tab's filter bar (Operations has none).
+		if (this.mode === "mf_pickup") {
+			list = this._flt_apply("manifest", list);
+			if (!list.length && (this.unassigned || []).length) {
+				$b.html(`<div class="lcc-empty"><i class="fa fa-search"></i> ${__("No manifest matches the filters.")}</div>`);
+				return;
+			}
+		}
 		if (!list.length) {
 			const empty_msg = want
 				? __("No {0} manifests right now.", [want])
@@ -2168,6 +2867,99 @@ class LogisticsCommandCenter {
 			});
 			d.show();
 		});
+	}
+
+	// ── Pending: given to a driver, not yet accepted ─────────────────────
+	//
+	// Each driver's Pickup Pending list from the Delivery App, one row per
+	// shipment. A row drops off once the driver taps Accept Shipment.
+	_ops_render_pickup_pending($b) {
+		const rows = this.pickup_pending || [];
+		if (!rows.length) {
+			$b.html(`<div class="lcc-empty"><i class="fa fa-check-circle"></i> ${
+				__("Every assigned shipment has been accepted by its driver.")}</div>`);
+			return;
+		}
+		const esc = frappe.utils.escape_html;
+		const place = (wh) => (window.ch_wh_label_html ? ch_wh_label_html(wh, "—") : esc(wh || "—"));
+		const by_driver = new Map();
+		for (const r of rows) {
+			const key = r.driver_name || r.driver || __("No driver");
+			if (!by_driver.has(key)) by_driver.set(key, []);
+			by_driver.get(key).push(r);
+		}
+		const groups = [...by_driver.entries()].map(([driver, list]) => {
+			const body = list.map((r) => `<tr>
+				<td>${r.delivery_challan
+					? esc(r.delivery_challan)
+					: `<a href="/app/stock-entry/${encodeURIComponent(r.stock_entry)}" target="_blank">${esc(r.stock_entry)}</a>`}</td>
+				<td>${place(r.from_warehouse)} → ${place(r.to_warehouse)}</td>
+				<td>${r.trip ? `<i class="fa fa-truck"></i> ${esc(r.trip)}` : "—"}</td>
+				<td class="text-right">${flt(r.total_qty)}</td>
+				<td class="lcc-muted">${r.assigned_on ? frappe.datetime.str_to_user(r.assigned_on) : "—"}</td>
+				<td class="text-right">
+					<button class="btn btn-xs btn-default lcc-pend-remove" data-manifest="${esc(r.manifest)}"
+						data-stock-entry="${esc(r.stock_entry)}" data-label="${esc(r.delivery_challan || r.stock_entry)}">
+						<i class="fa fa-undo"></i> ${__("Remove")}</button>
+				</td>
+			</tr>`).join("");
+			return `
+				<div class="lcc-ops-bar" style="margin-top:10px">
+					<b><i class="fa fa-user"></i> ${esc(driver)}</b>
+					<span class="lcc-tab-badge lcc-tab-badge-warn has-items">${list.length}</span>
+				</div>
+				<div class="lcc-table-wrap"><table class="lcc-table">
+					<thead><tr>
+						<th>${__("Delivery Challan")}</th>
+						<th>${__("From → To")}</th>
+						<th>${__("Trip")}</th>
+						<th class="text-right">${__("Qty")}</th>
+						<th>${__("Assigned")}</th>
+						<th></th>
+					</tr></thead>
+					<tbody>${body}</tbody>
+				</table></div>`;
+		}).join("");
+		$b.html(`
+			<div class="lcc-ops-bar">
+				<span class="lcc-muted">${__(
+					"Shipments each driver still has to accept in the Delivery App. "
+					+ "A shipment leaves this list as soon as the driver taps Accept Shipment.")}</span>
+			</div>
+			${groups}`);
+	}
+
+	_ops_remove_pending(manifest, stock_entry, label) {
+		const d = new frappe.ui.Dialog({
+			title: __("Remove {0}", [label]),
+			fields: [
+				{
+					fieldtype: "HTML",
+					options: `<div class="alert alert-warning">${__(
+						"The shipment comes off the driver's list and goes back to Packed Orders, "
+						+ "ready to go on another manifest. Nothing is packed again.")}</div>`,
+				},
+				...ch_mf_reason_fields(CH_MF_REMOVE_REASONS),
+			],
+			primary_action_label: __("Remove"),
+			primary_action: (vals) => {
+				d.hide();
+				frappe.dom.freeze(__("Removing…"));
+				frappe.call({
+					method: _TMA + "remove_pending_shipment",
+					args: { manifest, stock_entry, reason: ch_mf_reason_text(vals) },
+				}).then((r) => {
+					frappe.dom.unfreeze();
+					frappe.show_alert({
+						message: (r && r.message && r.message.message) || __("Back in Packed Orders"),
+						indicator: "orange",
+					}, 6);
+					if (this.mode === "mf_transit") this._reg_load();
+					else this._ops_load();
+				}).catch(() => frappe.dom.unfreeze());
+			},
+		});
+		d.show();
 	}
 
 	// ── Rejected: a driver said no, and somebody has to answer ──────────
@@ -3334,6 +4126,10 @@ class LogisticsCommandCenter {
 						this.selected_manifests.clear();
 						this._ops_load();
 						if (r.message) this._ops_open_trip(r.message);
+					} else if (String(this.mode).startsWith("mf_")) {
+						// The new trip is listed on the Trip tab — go there.
+						this.selected_manifests.clear();
+						this._switch_mode("mf_trip");
 					} else {
 						this._switch_mode("ops");
 					}

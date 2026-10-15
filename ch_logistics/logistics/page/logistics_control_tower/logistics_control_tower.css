@@ -1181,3 +1181,7 @@
 	font-size: 11px;
 	padding: 8px 6px 10px;
 }
+
+/* Count pills on the Pickup Pending / Delivery Pending / Delivered tabs — hidden until a count is known. */
+.lcc-mode-btn .lcc-tab-badge:empty { display: none; }
+.lcc-mode-btn .lcc-tab-badge { margin-left: 4px; }

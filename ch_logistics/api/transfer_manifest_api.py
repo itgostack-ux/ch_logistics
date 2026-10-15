@@ -730,6 +730,10 @@ def driver_complete_delivery_row(manifest, stock_entry, delivery_photo, receiver
                 mf.arrival_lat = lat_f
                 mf.arrival_lng = lng_f
             mf._apply_delivery_complete_transition(delivery_photo, lat_f, lng_f, receiver_name)
+        else:
+            # The manifest is still moving, but this shipment's store may now
+            # have everything it was owed — close that stop on the trip.
+            mf._cascade_stop_status_to_trip()
     except DeliveryOTPError as exc:
         # Returning a normal response is deliberate: Frappe rolls the whole
         # request back for an uncaught exception, which would make failed
@@ -1564,16 +1568,28 @@ def request_delivery_otp(manifest, receiver=None, stock_entry=None) -> dict:
                     else _("{0} sec").format(left)),
                 title=_("Please Wait"),
             )
-    if doc.status != "In Transit":
+    # Delivering one shipment of several: the notice names that shipment's
+    # Delivery Challan and goes to that shipment's store, not the manifest's.
+    leg = None
+    if stock_entry:
+        leg = next((row for row in doc.transfers if row.stock_entry == stock_entry), None)
+        if not leg:
+            frappe.throw(_("Stock Entry {0} is not on manifest {1}.").format(stock_entry, manifest))
+    # Same rule as delivering the shipment: each one goes on its own once the
+    # driver has accepted it, so a manifest still Assigned (siblings waiting
+    # to be accepted) must not block the code for a shipment already picked up.
+    if leg and doc.status in ("Assigned", "In Transit"):
+        if not leg.driver_accepted_at:
+            frappe.throw(_("Accept this shipment before asking for its delivery OTP."),
+                         title=_("API Error"))
+        if leg.delivery_captured_at:
+            frappe.throw(_("This shipment is already delivered."), title=_("API Error"))
+    elif doc.status != "In Transit":
         frappe.throw(
             _("OTP can only be requested while the manifest is In Transit (current: {0}).")
             .format(doc.status),
             title=_("API Error"),
         )
-    # Delivering one shipment of several: the notice names that shipment's
-    # Delivery Challan and goes to that shipment's store, not the manifest's.
-    if stock_entry and not any(row.stock_entry == stock_entry for row in doc.transfers):
-        frappe.throw(_("Stock Entry {0} is not on manifest {1}.").format(stock_entry, manifest))
     plaintext_otp = doc._generate_delivery_otp(request_source="Driver App")
     doc.flags.ignore_validate_update_after_submit = True
     doc.save()
@@ -2429,6 +2445,101 @@ def remove_transfer_from_manifest(manifest: str, stock_entry: str, reason: str) 
         "remaining": len(remaining),
         "message": _("{0} is back in Packed Orders. {1} shipment(s) left on {2}.").format(
             stock_entry, len(remaining), doc.name),
+    }
+
+
+@frappe.whitelist(methods=["POST"])
+def remove_pending_shipment(manifest: str, stock_entry: str, reason: str) -> dict:
+    """Take a shipment the driver has not accepted yet back to Packed Orders.
+
+    remove_transfer_from_manifest works only before a manifest goes on a
+    trip. Once a driver has it, a shipment they have not accepted is still
+    sitting at the source, so it can come off as safely: the row leaves the
+    manifest and the entry goes back to Packed, ready for another manifest.
+    The manifest's other shipments stay with the driver. When it was the
+    manifest's only shipment, the manifest comes off the trip and is
+    cancelled the way release_manifest cancels one, rather than being left
+    on the driver's list with nothing on it.
+    """
+    from ch_logistics.api.rejection_api import _maybe_complete_manifest_pickup
+    from ch_logistics.api.trip_lock import get_locked_trip, set_manifest_trip
+
+    reason = str(reason or "").strip()
+    if not reason:
+        frappe.throw(_("A reason is required to remove a shipment."))
+    _require_stage_role("initiate_recall")
+    frappe.db.sql(
+        "SELECT name FROM `tabCH Transfer Manifest` WHERE name = %s FOR UPDATE", (manifest,))
+    doc = frappe.get_doc("CH Transfer Manifest", manifest)
+    doc.check_permission("write")
+    scope_guard.assert_manifest_scope(doc.as_dict(), side="source")
+
+    row = next((r for r in doc.transfers if r.stock_entry == stock_entry), None)
+    if not row:
+        frappe.throw(_("{0} is not on manifest {1}.").format(stock_entry, doc.name))
+    if doc.status != "Assigned" or row.driver_accepted_at or row.get("pickup_captured_at"):
+        frappe.throw(
+            _("The driver has already accepted {0}. Use Initiate Recall to bring it back.")
+            .format(stock_entry),
+            title=_("Already Accepted"),
+        )
+
+    if len(doc.transfers) == 1:
+        trip = doc.get("trip")
+        if trip:
+            set_manifest_trip(doc.name, None)
+            if frappe.get_meta("CH Transfer Manifest").has_field("stop_sequence"):
+                frappe.db.set_value("CH Transfer Manifest", doc.name, "stop_sequence", 0)
+        frappe.db.set_value(
+            "CH Transfer Manifest", doc.name,
+            {"status": "Packed", "driver": None, "driver_name": None, "driver_phone": None},
+        )
+        if trip:
+            trip_doc = get_locked_trip(trip)
+            trip_doc.add_comment("Comment", _("Manifest {0} taken off by {1}: {2}").format(
+                doc.name, frappe.session.user, reason))
+            trip_doc.flags.ignore_mandatory = True
+            trip_doc.save()
+        out = release_manifest(doc.name, reason)
+        return {
+            "manifest": doc.name,
+            "stock_entry": stock_entry,
+            "returned_to_packed": stock_entry in (out.get("released") or []),
+            "remaining": 0,
+            "message": _("{0} is back in Packed Orders. Manifest {1} had nothing else on it "
+                         "and is cancelled.").format(stock_entry, doc.name),
+        }
+
+    note = _("Removed from manifest {0} by {1} before the driver accepted it: {2}").format(
+        doc.name, frappe.session.user, reason)
+    # The transfers table is not allow_on_submit — same direct write as
+    # remove_transfer_from_manifest and the leg-rejection split.
+    frappe.db.sql("DELETE FROM `tabCH Transfer Manifest Item` WHERE name = %s", (row.name,))
+    remaining = [r for r in doc.transfers if r.name != row.name]
+    frappe.db.set_value(
+        "CH Transfer Manifest", doc.name,
+        {
+            "total_stock_entries": len(remaining),
+            "total_items": sum(cint(r.item_count) for r in remaining),
+            "total_qty": sum(flt(r.total_qty) for r in remaining),
+        },
+        update_modified=False,
+    )
+    returned = _return_entry_to_packed(stock_entry, note)
+    doc.add_comment("Comment", _("Shipment {0} removed before acceptance: {1}").format(
+        stock_entry, reason))
+    # The removed one may have been the last the driver had not accepted;
+    # the rest then move on to In Transit, as if it had been accepted.
+    _maybe_complete_manifest_pickup(doc.name)
+    # Its store may now have nothing left to wait for (the rest already
+    # delivered) — close that stop on the trip.
+    frappe.get_doc("CH Transfer Manifest", doc.name)._cascade_stop_status_to_trip()
+    return {
+        "manifest": doc.name,
+        "stock_entry": stock_entry,
+        "returned_to_packed": returned,
+        "remaining": len(remaining),
+        "message": _("{0} is back in Packed Orders.").format(stock_entry),
     }
 
 
