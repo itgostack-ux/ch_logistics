@@ -3024,6 +3024,26 @@ def ops_unassigned_manifests(direction=None, hub=None, limit=100):
                 if not r.box_count:
                     r.box_count = counts.get(r.name, 0)
 
+    # How many Delivery Challans travel on each manifest — a shipment sent
+    # in batches carries one per batch.
+    if rows:
+        dc_count = {
+            r.manifest: r.n
+            for r in frappe.db.sql(
+                """
+                SELECT tr.parent AS manifest, COUNT(DISTINCT dc.name) AS n
+                FROM `tabCH Transfer Manifest Item` tr
+                JOIN `tabCH Delivery Challan` dc ON dc.stock_entry = tr.stock_entry
+                WHERE tr.parent IN %(names)s
+                GROUP BY tr.parent
+                """,
+                {"names": [r.name for r in rows]},
+                as_dict=True,
+            )
+        }
+        for r in rows:
+            r["dc_count"] = dc_count.get(r.name, 0)
+
     return rows
 
 
@@ -3198,12 +3218,11 @@ def ops_manifest_register(company=None, from_date=None, to_date=None):
     if company:
         conds.append("m.company = %(company)s")
         params["company"] = company
-    if from_date:
-        conds.append("m.manifest_date >= %(from_date)s")
-        params["from_date"] = getdate(from_date)
-    if to_date:
-        conds.append("m.manifest_date <= %(to_date)s")
-        params["to_date"] = getdate(to_date)
+    # The date range is applied to each row's DC date further down — the
+    # date these tabs show — not to the manifest's date: a challan raised one
+    # day often goes on a manifest the next.
+    lo = getdate(from_date) if from_date else None
+    hi = getdate(to_date) if to_date else None
     trip_col = "m.trip" if _has_manifest_trip_field() else "NULL"
     rows = frappe.db.sql(
         f"""
@@ -3232,7 +3251,8 @@ def ops_manifest_register(company=None, from_date=None, to_date=None):
     if trip_names:
         for t in frappe.get_all("CH Logistics Trip", filters={"name": ["in", list(trip_names)]},
                                 fields=["name", "status", "transport_mode", "driver_name",
-                                        "courier_partner", "carrier_name", "tracking_number"]):
+                                        "courier_partner", "carrier_name", "tracking_number",
+                                        "trip_date"]):
             trip_info[t.name] = t
 
     challans = _challans_by_stock_entry([r.stock_entry for r in rows])
@@ -3245,6 +3265,8 @@ def ops_manifest_register(company=None, from_date=None, to_date=None):
             dc_dates[c.name] = c.posting_date
     for r in rows:
         ti = trip_info.get(r.trip)
+        r["trip_date"] = ti.trip_date if ti else None
+        r["trip_status"] = ti.status if ti else None
         by_hand = bool(ti and (ti.transport_mode or "Own") != "Own")
         if by_hand:
             who = ti.courier_partner or ti.carrier_name or _(ti.transport_mode)
@@ -3281,6 +3303,10 @@ def ops_manifest_register(company=None, from_date=None, to_date=None):
             r["logistic_status"] = "Pending Pickup"
         else:
             r["logistic_status"] = "Not Assigned"
+    if lo or hi:
+        rows = [r for r in rows
+                if (lo is None or getdate(r.dc_date or r.manifest_date) >= lo)
+                and (hi is None or getdate(r.dc_date or r.manifest_date) <= hi)]
     return rows
 
 

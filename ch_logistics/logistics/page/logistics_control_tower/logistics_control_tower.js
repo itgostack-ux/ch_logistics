@@ -134,7 +134,7 @@ class LogisticsCommandCenter {
 		this.wrapper = wrapper;
 
 		// shared state
-		this.mode = "overview";
+		this.mode = "draft";
 		this.filters = null;		// hub_filters handle
 		this._auto_timer = null;
 
@@ -175,9 +175,13 @@ class LogisticsCommandCenter {
 		this.page.add_button(__("Refresh"), () => this.refresh(), { icon: "refresh" });
 
 		// Shared hub_filters (header bar): company, city, zone, store, dates
+		// No period until the user picks one: until then every tab shows
+		// everything. Once picked, the header dates narrow every tab, and each
+		// tab's own date box narrows that tab only.
 		this.filters = ch_erp15.hub_filters.attach(this.page, {
 			include_dates: true,
-			on_change: () => { if (this.mode === "overview") this._ov_load(); },
+			blank_dates: true,
+			on_change: () => this.refresh(),
 		});
 
 		// Root shell
@@ -187,11 +191,13 @@ class LogisticsCommandCenter {
 		// so without remembering the tab, it always landed back on
 		// Overview even if you'd been sitting in Operations. Restore
 		// whichever tab was last open instead.
-		let last_mode = "overview";
+		// The Overview tab is no longer offered; a browser that last had it
+		// open starts on Transfer Request Approved instead.
+		let last_mode = "draft";
 		try {
-			last_mode = localStorage.getItem("lcc_last_mode") || "overview";
+			last_mode = localStorage.getItem("lcc_last_mode") || "draft";
 		} catch (e) { /* localStorage unavailable — fall back to Overview */ }
-		this._switch_mode(["overview", "draft", "pending_with_goods", "packing", "mf_pickup", "mf_trip", "mf_transit", "mf_pickedup", "mf_delivered", "ops"].includes(last_mode) ? last_mode : "overview");
+		this._switch_mode(["draft", "pending_with_goods", "packing", "mf_pickup", "mf_trip", "mf_transit", "mf_pickedup", "mf_delivered", "ops"].includes(last_mode) ? last_mode : "draft");
 	}
 
 	// ─────────────────────────────────────────────────────────────
@@ -202,9 +208,6 @@ class LogisticsCommandCenter {
 		this.$root.html(`
 			<div class="lcc-modebar">
 				<div class="lcc-modebar-tabs">
-					<button class="lcc-mode-btn" data-mode="overview">
-						<i class="fa fa-tachometer"></i> ${__("Overview")}
-					</button>
 					<button class="lcc-mode-btn" data-mode="draft">
 						<i class="fa fa-file-text-o"></i> ${__("Transfer Request Approved")}
 					</button>
@@ -249,6 +252,7 @@ class LogisticsCommandCenter {
 		this.$root.on("click", ".lcc-mode-btn", (e) => {
 			this._switch_mode($(e.currentTarget).data("mode"));
 		});
+		this._bind_trip_drill();
 	}
 
 	_switch_mode(mode) {
@@ -821,7 +825,7 @@ class LogisticsCommandCenter {
 		this.dp_state = { start: 0, page_length: 10, sort_field: "creation", sort_order: "desc" };
 		const hint = status === "Draft"
 			? __("Showing Material Transfers still in Draft — not yet packed. Click a column heading to sort.")
-			: __("Showing Material Transfers at Stock Outward — not yet packed. Click a column heading to sort.");
+			: __("Showing Delivery Challans sent out but not yet packed — one row per challan. Click a column heading to sort.");
 		$("#lcc-content").html(`
 			<div class="lcc-pack" id="lcc-draft-pending">
 				<div class="lcc-ops-bar">
@@ -830,6 +834,7 @@ class LogisticsCommandCenter {
 							<i class="fa fa-refresh"></i> ${__("Refresh")}
 						</button>
 					</div>
+					<div class="lcc-dp-f-date" style="width:220px"></div>
 					<span class="lcc-muted lcc-ops-bar-hint">
 						<i class="fa fa-info-circle"></i>
 						${hint}
@@ -852,22 +857,54 @@ class LogisticsCommandCenter {
 				st.start = 0;
 				this._draft_pending_load();
 			});
-			$r.on("click", ".lcc-dp-page-prev:not([disabled])", () => {
-				const st = this.dp_state;
-				st.start = Math.max(0, st.start - st.page_length);
+			const dp_go = (e) => {
+				const n = this._pager_target($(e.currentTarget));
+				if (!n) return;
+				this.dp_state.start = (n - 1) * this.dp_state.page_length;
 				this._draft_pending_load();
-			});
-			$r.on("click", ".lcc-dp-page-next:not([disabled])", () => {
-				const st = this.dp_state;
-				if (st.start + st.page_length < (this.dp_total_count || 0)) {
-					st.start += st.page_length;
-					this._draft_pending_load();
-				}
-			});
+			};
+			$r.on("click", '[data-pager="dp"] [data-go], [data-pager="dp"] .lcc-np-go', dp_go);
+			$r.on("keydown", '[data-pager="dp"] .lcc-np-input', (e) => { if (e.key === "Enter") dp_go(e); });
 			this._dp_events_bound = true;
 		}
+		this._dp_mount_date();
 		this._draft_pending_load();
 	}
+
+	// This tab's own date box (Transfer Request Approved / Stock Outward kept
+	// apart), on top of the header dates.
+	_dp_mount_date() {
+		this.dp_dates = this.dp_dates || {};
+		const key = this.dp_status;
+		const c = frappe.ui.form.make_control({
+			parent: this.$root.find(".lcc-dp-f-date"),
+			df: {
+				fieldtype: "DateRange", fieldname: "dp_date", placeholder: __("Date"),
+				onchange: () => {
+					const v = c.get_value();
+					const next = (v && v[0] && v[1]) ? v : null;
+					if (JSON.stringify(next) === JSON.stringify(this.dp_dates[key] || null)) return;
+					this.dp_dates[key] = next;
+					this.dp_state.start = 0;
+					this._draft_pending_load();
+				},
+			},
+			render_input: true,
+		});
+		c.$wrapper.find(".control-label, .help-box").remove();
+		c.$wrapper.css("margin-bottom", 0).find(".form-group").css("margin-bottom", 0);
+		if (this.dp_dates[key]) c.set_value(this.dp_dates[key]);
+	}
+
+	// Header dates narrowed by a tab's own [from, to] — the later start and
+	// the earlier end of the two.
+	_merged_dates(tab) {
+		const out = this._header_dates();
+		if (tab && tab[0] && (!out.from_date || tab[0] > out.from_date)) out.from_date = tab[0];
+		if (tab && tab[1] && (!out.to_date || tab[1] < out.to_date)) out.to_date = tab[1];
+		return out;
+	}
+
 
 	async _draft_pending_load() {
 		const $b = $("#lcc-dp-body");
@@ -878,6 +915,7 @@ class LogisticsCommandCenter {
 			const r = await frappe.call({
 				method: "ch_erp15.ch_erp15.custom.stock_entry.get_draft_pending_stock_entries",
 				args: {
+					...this._merged_dates((this.dp_dates || {})[this.dp_status]),
 					company: co,
 					status: this.dp_status,
 					start: st.start,
@@ -914,6 +952,35 @@ class LogisticsCommandCenter {
 				: `<i class="fa fa-sort-desc lcc-dp-sort-icon active"></i>`;
 		}
 		return `<th class="lcc-dp-sortable ${extra_cls || ""}" data-field="${field}">${label} ${icon}</th>`;
+	}
+
+	// A Trip ID link anywhere on the page opens the trip window. Bound once.
+	_bind_trip_drill() {
+		if (this._trip_drill_bound) return;
+		this._trip_drill_bound = true;
+		this.$root.on("click", ".lcc-trip-drill", (e) => {
+			e.preventDefault();
+			this._trip_drilldown($(e.currentTarget).data("name"));
+		});
+	}
+
+	// The header's From / To dates (shared hub filters), as API args.
+	_header_dates() {
+		const f = this.filters || {};
+		const out = {};
+		const from = typeof f.from_date === "function" ? f.from_date() : "";
+		const to = typeof f.to_date === "function" ? f.to_date() : "";
+		if (from) out.from_date = from;
+		if (to) out.to_date = to;
+		return out;
+	}
+
+	_trip_pill(status) {
+		return {
+			"Draft": "gray", "Assigned": "orange", "Started": "blue", "Picked Up": "blue",
+			"Delivery Pending": "yellow", "Delivered": "green", "Completed": "green",
+			"Closed": "darkgrey", "Cancelled": "red",
+		}[status] || "gray";
 	}
 
 	// Client-side Asc/Desc for tables whose rows are all in the browser
@@ -971,6 +1038,7 @@ class LogisticsCommandCenter {
 		}
 		const status_colors = {
 			"Draft": "red", "Pending With Goods": "orange", "Partially Stock Outward": "yellow",
+			"Not Packed": "orange",
 			"Partially Packed": "yellow",
 			"Packed": "teal", "Ready For Pickup": "teal", "Assigned": "blue",
 			"Ready For Receive": "cyan", "In Transit": "yellow", "Receive At Transit": "purple",
@@ -1010,7 +1078,7 @@ class LogisticsCommandCenter {
 		$b.html(`
 			<div class="lcc-table-wrap"><table class="lcc-table lcc-dp-table">
 				<thead><tr>
-					${this._dp_sort_th(__("Order Id"), "name")}
+					${this._dp_sort_th(this.dp_status === "Draft" ? __("Order Id") : __("DC ID"), "name")}
 					${this._dp_sort_th(__("Date"), "creation")}
 					${this._dp_sort_th(__("Status"), "custom_status")}
 					${this._dp_sort_th(__("Source Warehouse"), "from_warehouse")}
@@ -1028,19 +1096,11 @@ class LogisticsCommandCenter {
 		const total = this.dp_total_count || 0;
 		const from = total ? st.start + 1 : 0;
 		const to = Math.min(st.start + st.page_length, total);
-		$p.html(`
-			<div class="lcc-dp-page-info">
-				${__("Showing {0}-{1} of {2}", [from, to, total])}
-			</div>
-			<div class="lcc-dp-page-btns">
-				<button class="btn btn-xs btn-default lcc-dp-page-prev" ${st.start <= 0 ? "disabled" : ""}>
-					<i class="fa fa-chevron-left"></i> ${__("Prev")}
-				</button>
-				<button class="btn btn-xs btn-default lcc-dp-page-next" ${(st.start + st.page_length >= total) ? "disabled" : ""}>
-					${__("Next")} <i class="fa fa-chevron-right"></i>
-				</button>
-			</div>
-		`);
+		const pages = Math.max(Math.ceil(total / st.page_length), 1);
+		const page = Math.floor(st.start / st.page_length) + 1;
+		$p.html(total > st.page_length
+			? this._numbered_pager_html("dp", page, pages, from, to, total)
+			: `<div class="lcc-dp-page-info">${__("Showing {0}-{1} of {2}", [from, to, total])}</div>`);
 	}
 
 	// ══════════════════════════════════════════════════════════════
@@ -1246,7 +1306,7 @@ class LogisticsCommandCenter {
 		this._flt_mount(`reg_${this.reg_sub}`, {
 			rows: () => (this.reg_rows || []).filter((r) => this._reg_in_sub(r, this.reg_sub)),
 			text: (r) => [r.delivery_challan, r.stock_entry, r.manifest, r.driver_name, r.trip,
-				r.logistic_status],
+				r.trip_status, r.logistic_status],
 			date: (r) => r.dc_date || r.manifest_date,
 			date_ph: __("DC Date"),
 			src: (r) => [r.from_warehouse],
@@ -1264,6 +1324,7 @@ class LogisticsCommandCenter {
 			const co = this.filters?.fields?.company?.get_value() || undefined;
 			const args = {};
 			if (co) args.company = co;
+			Object.assign(args, this._header_dates());
 			const r = await frappe.call({ method: _LCC + "ops_manifest_register", args });
 			this.reg_rows = r.message || [];
 			this._pages = this._pages || {};
@@ -1305,6 +1366,10 @@ class LogisticsCommandCenter {
 			manifest: (r) => r.manifest,
 			date: (r) => r.dc_date || r.manifest_date || "",
 			driver: (r) => r.driver_name || "",
+			mcreated: (r) => r.creation || "",
+			trip: (r) => r.trip || "",
+			tdate: (r) => r.trip_date || "",
+			tstatus: (r) => r.trip_status || "",
 			dc: (r) => r.delivery_challan || r.stock_entry || "",
 			src: (r) => label(r.from_warehouse),
 			dst: (r) => label(r.to_warehouse),
@@ -1316,8 +1381,12 @@ class LogisticsCommandCenter {
 		const page = this._page_slice("register", sorted);
 		const rows = page.rows.map((r) => `<tr>
 			<td title="${esc(r.stock_entry || "")}"><b>${esc(r.delivery_challan || r.stock_entry || "—")}</b></td>
-			<td>${(r.dc_date || r.manifest_date) ? frappe.datetime.str_to_user(r.dc_date || r.manifest_date) : "—"}</td>
+			<td style="white-space:nowrap">${(r.dc_date || r.manifest_date) ? frappe.datetime.str_to_user(r.dc_date || r.manifest_date) : "—"}</td>
 			<td><a href="/app/ch-transfer-manifest/${encodeURIComponent(r.manifest)}" target="_blank">${esc(r.manifest)}</a></td>
+			<td style="white-space:nowrap">${r.creation ? frappe.datetime.str_to_user(r.creation) : "—"}</td>
+			<td>${r.trip ? `<a href="#" class="lcc-trip-drill" data-name="${esc(r.trip)}">${esc(r.trip)}</a>` : "—"}</td>
+			<td style="white-space:nowrap">${r.trip_date ? frappe.datetime.str_to_user(r.trip_date) : "—"}</td>
+			<td>${r.trip_status ? `<span class="indicator-pill ${this._trip_pill(r.trip_status)}"><span>${esc(__(r.trip_status))}</span></span>` : "—"}</td>
 			<td>${esc(r.driver_name || "—")}</td>
 			<td>${html_wh(r.from_warehouse)}</td>
 			<td>${html_wh(r.to_warehouse)}</td>
@@ -1340,6 +1409,10 @@ class LogisticsCommandCenter {
 					${this._cs_sort_th("register", __("DC ID"), "dc")}
 					${this._cs_sort_th("register", __("DC Date"), "date")}
 					${this._cs_sort_th("register", __("Manifest ID"), "manifest")}
+					${this._cs_sort_th("register", __("Manifest Created"), "mcreated")}
+					${this._cs_sort_th("register", __("Trip ID"), "trip")}
+					${this._cs_sort_th("register", __("Trip Date"), "tdate")}
+					${this._cs_sort_th("register", __("Trip Status"), "tstatus")}
 					${this._cs_sort_th("register", __("Driver Name"), "driver")}
 					${this._cs_sort_th("register", __("Source Warehouse"), "src")}
 					${this._cs_sort_th("register", __("Delivery Warehouse"), "dst")}
@@ -1379,10 +1452,7 @@ class LogisticsCommandCenter {
 			this._trips_events_bound = true;
 			const $r = this.$root;
 			$r.on("click", ".lcc-trips-refresh-btn", () => this._trips_load());
-			$r.on("click", ".lcc-trip-drill", (e) => {
-				e.preventDefault();
-				this._trip_drilldown($(e.currentTarget).data("name"));
-			});
+
 		}
 		this._flt_mount("trips", {
 			rows: () => this.trips_rows || [],
@@ -1465,6 +1535,7 @@ class LogisticsCommandCenter {
 			const co = this.filters?.fields?.company?.get_value() || undefined;
 			const args = {};
 			if (co) args.company = co;
+			Object.assign(args, this._header_dates());
 			const r = await frappe.call({ method: _LCC + "ops_trip_register", args });
 			this.trips_rows = r.message || [];
 			this._pages = this._pages || {};
@@ -1685,6 +1756,11 @@ class LogisticsCommandCenter {
 
 	_pack_passes_filters(se) {
 		const f = this.pack_filters || {};
+		const hd = this._header_dates();
+		if (hd.from_date || hd.to_date) {
+			const day = String(se.custom_status_since || se.creation || "").slice(0, 10);
+			if ((hd.from_date && day < hd.from_date) || (hd.to_date && day > hd.to_date)) return false;
+		}
 		if (f.src && f.src.length && !f.src.includes(se.from_warehouse)) return false;
 		if (f.dst && f.dst.length && !f.dst.includes(se.to_warehouse)) return false;
 		if (f.date) {
@@ -2349,28 +2425,72 @@ class LogisticsCommandCenter {
 		return { page, pages, size, rows: list.slice((page - 1) * size, page * size) };
 	}
 
+	// Numbered pager: First · Previous · 1 2 3 4 5 … 271 · Next · Last, plus a
+	// "Go to page" box. Shared by the in-browser tables (_pager_html) and the
+	// server-paged Transfer Request Approved / Stock Outward list.
+	_numbered_pager_html(key, page, pages, from, to, total) {
+		const btn = (label, go, opts = {}) => `<button class="lcc-np-btn ${opts.active ? "active" : ""}"
+			${opts.disabled ? "disabled" : `data-go="${go}"`}>${label}</button>`;
+		// A window of five around the current page, with the first and last
+		// always reachable and "…" for the gaps.
+		let lo = Math.max(1, page - 2);
+		let hi = Math.min(pages, lo + 4);
+		lo = Math.max(1, hi - 4);
+		const nums = [];
+		if (lo > 1) {
+			nums.push(btn("1", 1));
+			if (lo > 2) nums.push(`<span class="lcc-np-gap">…</span>`);
+		}
+		for (let n = lo; n <= hi; n++) nums.push(btn(String(n), n, { active: n === page }));
+		if (hi < pages) {
+			if (hi < pages - 1) nums.push(`<span class="lcc-np-gap">…</span>`);
+			nums.push(btn(String(pages), pages));
+		}
+		return `<div class="lcc-np" data-pager="${key}" data-pages="${pages}">
+			<span class="lcc-muted lcc-np-info">${__("{0}–{1} of {2}", [from, to, total])}</span>
+			<div class="lcc-np-group">
+				${btn(__("First"), 1, { disabled: page <= 1 })}
+				${btn(__("Previous"), page - 1, { disabled: page <= 1 })}
+				${nums.join("")}
+				${btn(__("Next"), page + 1, { disabled: page >= pages })}
+				${btn(__("Last"), pages, { disabled: page >= pages })}
+			</div>
+			<span class="lcc-np-jump">
+				${__("Go to page")}
+				<input type="number" class="form-control input-xs lcc-np-input" min="1" max="${pages}" value="${page}">
+				<button class="btn btn-xs btn-default lcc-np-go">${__("Go")}</button>
+			</span>
+		</div>`;
+	}
+
+	// The page number a pager click or "Go to page" asks for, kept inside 1…pages.
+	_pager_target($el) {
+		const $np = $el.closest(".lcc-np");
+		const pages = parseInt($np.data("pages")) || 1;
+		const raw = $el.is("[data-go]") ? $el.data("go") : $np.find(".lcc-np-input").val();
+		const n = parseInt(raw);
+		return Number.isFinite(n) ? Math.min(Math.max(n, 1), pages) : null;
+	}
+
 	_pager_html(key, info, total) {
 		if (total <= info.size) return "";
 		const from = (info.page - 1) * info.size + 1;
 		const to = Math.min(info.page * info.size, total);
-		return `<div class="lcc-pager" data-pager="${key}">
-			<button class="btn btn-xs btn-default lcc-page-prev" ${info.page <= 1 ? "disabled" : ""}>
-				<i class="fa fa-chevron-left"></i> ${__("Previous")}</button>
-			<span class="lcc-muted">${__("{0}–{1} of {2}", [from, to, total])}
-				&nbsp;·&nbsp; ${__("Page {0} of {1}", [info.page, info.pages])}</span>
-			<button class="btn btn-xs btn-default lcc-page-next" ${info.page >= info.pages ? "disabled" : ""}>
-				${__("Next")} <i class="fa fa-chevron-right"></i></button>
-		</div>`;
+		return this._numbered_pager_html(key, info.page, info.pages, from, to, total);
 	}
 
 	_bind_pager($scope, key, rerender) {
-		$scope.off("click.lccpager").on("click.lccpager", `[data-pager="${key}"] .lcc-page-prev`, () => {
-			this._pages[key] = Math.max((this._pages[key] || 1) - 1, 1);
+		const go = (e) => {
+			const n = this._pager_target($(e.currentTarget));
+			if (!n) return;
+			this._pages[key] = n;
 			rerender();
-		}).on("click.lccpager", `[data-pager="${key}"] .lcc-page-next`, () => {
-			this._pages[key] = (this._pages[key] || 1) + 1;
-			rerender();
-		});
+		};
+		$scope.off(".lccpager")
+			.on("click.lccpager", `[data-pager="${key}"] [data-go], [data-pager="${key}"] .lcc-np-go`, go)
+			.on("keydown.lccpager", `[data-pager="${key}"] .lcc-np-input`, (e) => {
+				if (e.key === "Enter") go(e);
+			});
 	}
 
 	_ops_render_manifests($b) {
@@ -2383,7 +2503,11 @@ class LogisticsCommandCenter {
 			: (this.unassigned || []);
 		// The Manifest tab's filter bar (Operations has none).
 		if (this.mode === "mf_pickup") {
-			list = this._flt_apply("manifest", list);
+			const hd = this._header_dates();
+			list = this._flt_apply("manifest", list).filter((m) => {
+				const day = String(m.creation || "").slice(0, 10);
+				return (!hd.from_date || day >= hd.from_date) && (!hd.to_date || day <= hd.to_date);
+			});
 			if (!list.length && (this.unassigned || []).length) {
 				$b.html(`<div class="lcc-empty"><i class="fa fa-search"></i> ${__("No manifest matches the filters.")}</div>`);
 				return;
@@ -2415,8 +2539,9 @@ class LogisticsCommandCenter {
 			<td style="white-space:nowrap"><span class="indicator-pill ${color}" style="white-space:nowrap">${status}</span></td>
 			<td style="white-space:nowrap">${frappe.utils.escape_html(m.direction || "—")}</td>
 			<td style="white-space:nowrap"><span class="lcc-prio lcc-prio-${(m.shipment_priority || "Normal").toLowerCase()}">${m.shipment_priority || "Normal"}</span></td>
-			<td style="width:100%">${window.ch_wh_label_html ? ch_wh_label_html(m.source_warehouse, "—") : frappe.utils.escape_html(m.source_warehouse || "—")} → ${lcc_destinations_html(m)}</td>
-			<td class="tr">${m.total_qty || 0}</td>
+			<td>${window.ch_wh_label_html ? ch_wh_label_html(m.source_warehouse, "—") : frappe.utils.escape_html(m.source_warehouse || "—")}</td>
+			<td>${lcc_destinations_html(m)}</td>
+			<td class="tr">${m.dc_count || 0}</td>
 			<td class="tr">${m.box_count || 0}</td>
 			<td style="white-space:nowrap">${frappe.datetime.str_to_user(m.creation)}</td>
 			<td class="text-right" style="white-space:nowrap">
@@ -2445,7 +2570,8 @@ class LogisticsCommandCenter {
 					<th>${__("Manifest")}</th>
 					<th>${__("Status")}</th>
 					<th>${__("Dir")}</th><th>${__("Priority")}</th>
-					<th>${__("Route")}</th><th class="tr">${__("Qty")}</th>
+					<th>${__("From")}</th><th>${__("To")}</th>
+					<th class="tr">${__("No. of DCs")}</th>
 					<th class="tr">${__("Boxes")}</th><th>${__("Created")}</th>
 					<th class="text-right">${__("Actions")}</th>
 				</tr></thead>
