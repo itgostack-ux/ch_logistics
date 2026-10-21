@@ -1984,8 +1984,9 @@ class LogisticsCommandCenter {
 			// manifest creation means one action gets the shipment all the
 			// way into Operations → Unassigned Manifests, ready for driver
 			// assignment.
+			// Status is server-managed: before_submit moves Draft → Packed.
+			// Setting it here trips the lifecycle-field forgery guard.
 			frappe.db.get_doc("CH Transfer Manifest", manifest_name).then((doc) => {
-				doc.status = "Packed";
 				return frappe.call({ method: "frappe.client.submit", args: { doc } });
 			}).then(() => {
 				frappe.show_alert({
