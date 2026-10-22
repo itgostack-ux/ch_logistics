@@ -14,6 +14,7 @@
   "geofence_arrival_meters",
   "maps_section",
   "google_maps_api_key",
+  "public_maps_api_key",
   "column_break_2",
   "default_map_zoom",
   "default_map_center_lat",
@@ -88,6 +89,12 @@
    "label": "Google Maps API Key"
   },
   {
+   "description": "Browser key for the public /track page only. Restrict it to this site's domain (HTTP referrer) and to the Maps JavaScript API in Google Cloud. The server key above is never sent to anonymous visitors.",
+   "fieldname": "public_maps_api_key",
+   "fieldtype": "Password",
+   "label": "Public Map Key (Tracking Page)"
+  },
+  {
    "fieldname": "column_break_2",
    "fieldtype": "Column Break"
   },
@@ -152,7 +159,7 @@
  "index_web_pages_for_search": 0,
  "issingle": 1,
  "links": [],
- "modified": "2026-06-23 10:00:00.000000",
+ "modified": "2026-10-21 16:44:49.948826",
  "modified_by": "Administrator",
  "module": "Logistics",
  "name": "CH Tracking Settings",

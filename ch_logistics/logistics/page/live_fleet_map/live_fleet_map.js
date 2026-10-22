@@ -87,7 +87,7 @@ ch_logistics.LiveFleetMap = class LiveFleetMap {
 		} catch (e) {
 			this.config = {
 				default_map_zoom: 12,
-				default_map_center: { lat: 13.0827, lng: 80.2707 },
+				default_map_center: { lat: 0, lng: 0 },
 			};
 		}
 
@@ -110,7 +110,7 @@ ch_logistics.LiveFleetMap = class LiveFleetMap {
 		this.map = new google.maps.Map(
 			document.getElementById("ch-fleet-map-canvas"),
 			{
-				center: this.config.default_map_center || { lat: 13.0827, lng: 80.2707 },
+				center: this.config.default_map_center || { lat: 0, lng: 0 },
 				zoom: this.config.default_map_zoom || 12,
 				mapTypeControl: false,
 				streetViewControl: false,

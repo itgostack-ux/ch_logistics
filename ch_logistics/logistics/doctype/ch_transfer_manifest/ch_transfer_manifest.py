@@ -710,23 +710,30 @@ class CHTransferManifest(Document):
                 frappe.throw(_("Duplicate Stock Entry {0} in manifest.").format(row.stock_entry), title=_("Ch Transfer Manifest Error"))
             seen.add(row.stock_entry)
 
-            existing = frappe.db.get_value(
+            # Every earlier manifest, not just the first: an order that came
+            # back (Returned) or was released (Cancelled) may go out again.
+            parents = frappe.get_all(
                 "CH Transfer Manifest Item",
-                {
+                filters={
                     "stock_entry": row.stock_entry,
                     "parent": ("!=", self.name or ""),
                     "parenttype": "CH Transfer Manifest",
                 },
-                ["parent"],
+                pluck="parent",
             )
-            if existing:
-                parent_status = frappe.db.get_value("CH Transfer Manifest", existing, "docstatus")
-                if parent_status == 1:
-                    frappe.throw(
-                        _("Stock Entry {0} is already in active manifest {1}.").format(
-                            row.stock_entry, existing
-                        )
+            active = frappe.get_all(
+                "CH Transfer Manifest",
+                filters={"name": ("in", parents), "docstatus": 1,
+                         "status": ("not in", ("Returned", "Cancelled"))},
+                pluck="name",
+                limit=1,
+            ) if parents else []
+            if active:
+                frappe.throw(
+                    _("Stock Entry {0} is already in active manifest {1}.").format(
+                        row.stock_entry, active[0]
                     )
+                )
 
     def _update_stock_entries_manifest(self):
         """Link Stock Entries back to this manifest via custom field."""
@@ -1549,9 +1556,24 @@ class CHTransferManifest(Document):
         dist_m = haversine_km(lat_f, lng_f, coords[0], coords[1]) * 1000.0
         # Widen the fence by the fix's own margin of error: a reading 400 m out
         # with +/-300 m accuracy is not evidence the driver is elsewhere.
-        allowance_m = radius_m + min(acc_m or 0.0, max_usable_accuracy_m)
+        # The accuracy is reported by the driver's own device, so it may widen
+        # the fence by at most one radius.
+        allowance_m = radius_m + min(acc_m or 0.0, radius_m)
         if dist_m <= allowance_m:
             return
+
+        # A driver may explain a nearby miss; a far miss needs someone with the
+        # driver_override capability, not a free-text reason from the driver.
+        from ch_logistics import roles as role_registry
+
+        far_miss = dist_m > radius_m * 5
+        if far_miss and override_reason and not role_registry.user_has("driver_override"):
+            frappe.throw(
+                _("You are {0} m from {1}. A location this far off needs dispatch to "
+                  "override it.").format(int(dist_m), place),
+                exc=GeofenceError,
+                title=_("Wrong Location"),
+            )
 
         if override_reason and str(override_reason).strip():
             self._note_geofence_event(
@@ -1653,7 +1675,8 @@ class CHTransferManifest(Document):
                 f"driver-state sync failed after action on {self.name}",
             )
 
-    def reject_manifest(self, rejection_reason, rejection_photo, rejection_notes=None):
+    def reject_manifest(self, rejection_reason, rejection_photo, rejection_notes=None,
+                        latitude=None, longitude=None):
         """Driver rejects a manifest that cannot be completed.
 
         Two rejection paths are supported — they share this entry point but
@@ -1685,11 +1708,16 @@ class CHTransferManifest(Document):
                 frappe.throw(_("Can only reject a manifest before delivery is completed (current: {0}).").format(self.status),
                              title=_("Ch Transfer Manifest Error"))
             during = "In Transit" if self.status == "In Transit" else "Pickup"
+            if during == "In Transit":
+                # No RTO: once picked up, the order goes on by Transfer, Hold
+                # or a drop at a nearby store.
+                frappe.throw(_("This order is already picked up. Use Transfer, Hold or Drop at nearby store."),
+                             title=_("Ch Transfer Manifest Error"))
             pickup_reasons = {"Material Not Ready", "Wrong Package", "Store Closed",
                               "Damaged Package", "Other"}
             in_transit_reasons = {"Customer Not Available", "Address Not Found",
                                   "Receiver Refused", "Damaged in Transit",
-                                  "Vehicle Breakdown", "Other"}
+                                  "Vehicle Breakdown", "Store Closed", "Other"}
             valid_reasons = in_transit_reasons if during == "In Transit" else pickup_reasons
             if rejection_reason not in valid_reasons:
                 frappe.throw(_("'{0}' is not a valid rejection reason at {1}. Allowed: {2}.").format(
@@ -1708,25 +1736,11 @@ class CHTransferManifest(Document):
             self.status = "Rejected"
             self.flags.ignore_validate_update_after_submit = True
             self.save()
-            # Every linked Stock Entry moved into the transit ledger back at
-            # Pending With Goods (custom stock-ledger management starts
-            # there, well before a driver physically touches anything — see
-            # TRANSIT_LEDGER_MANAGED_STATUSES in ch_erp15), so a pickup-time
-            # rejection still has real stock sitting in the transit
-            # warehouse that needs reversing, exactly like an in-transit
-            # rejection does. reverse_transfer_to_source does that reversal
-            # AND sets custom_status to "Rejected" in one call — replacing
-            # the old logistics-status-only sync, which left the Stock
-            # Entry's stock position wrong (nothing was ever moved back).
-            from ch_erp15.ch_erp15.custom.stock_entry import reverse_transfer_to_source
-
-            for row in self.transfers:
-                reverse_transfer_to_source(
-                    row.stock_entry,
-                    reason=rejection_reason,
-                    reference=self.name,
-                    target_status="Rejected",
-                )
+            # Pickup-time rejection: the goods never left the hub and their
+            # stock already sits on the transit ledger (Stock Outward), so
+            # nothing moves here. Dispatch decides in the rejection review
+            # (back to the pool or back to this driver); RTO is the path
+            # that moves stock back to the source.
             if during == "In Transit":
                 # Goods were physically with the driver — still worth a trip
                 # exception so the control tower sees the failed delivery
@@ -3040,11 +3054,20 @@ class CHTransferManifest(Document):
             for item in inventory
             for serial_no in item.get("serials", [])
         ))
+        # Every box label that left on this manifest must be scanned back in.
+        boxes = [
+            b for b in frappe.get_all(
+                "CH Stock Entry Package",
+                filters={"parent": ("in", [r.stock_entry for r in self.transfers if r.stock_entry])},
+                pluck="package_label",
+            ) if b
+        ] if self.transfers else []
         return {
             "items": inventory,
             "serials": serials,
             "serial_count": len(serials),
             "total_qty": sum(flt(item.get("qty")) for item in inventory),
+            "boxes": boxes,
         }
 
     @staticmethod
@@ -3101,6 +3124,7 @@ class CHTransferManifest(Document):
         return_photo,
         returned_serials=None,
         returned_quantities=None,
+        returned_boxes=None,
     ):
         """Delivery person confirms all items have been physically returned to source.
 
@@ -3125,6 +3149,18 @@ class CHTransferManifest(Document):
                 frappe.throw(_("Return photo is mandatory."), title=_("Transfer Return Error"))
 
             requirements = self.get_return_requirements()
+            if requirements["boxes"]:
+                raw = returned_boxes or ""
+                raw = frappe.parse_json(raw) if isinstance(raw, str) and raw.strip().startswith("[") else raw
+                if isinstance(raw, str):
+                    raw = raw.replace(",", "\n").splitlines()
+                scanned_boxes = {str(b).strip() for b in (raw or []) if str(b).strip()}
+                missing_boxes = [b for b in requirements["boxes"] if b not in scanned_boxes]
+                if missing_boxes:
+                    frappe.throw(
+                        _("Scan every returned box. Missing: {0}").format(", ".join(missing_boxes)),
+                        title=_("Return Count Mismatch"),
+                    )
             expected = set(requirements["serials"])
             scanned_values = self._parse_returned_serials(returned_serials)
             scanned = set(scanned_values)
@@ -3181,10 +3217,14 @@ class CHTransferManifest(Document):
             self.return_confirmed_by = frappe.session.user
             self.return_confirmed_at = now_datetime()
 
+            # RTO (driver rejected in transit): goods are booked back into the
+            # source warehouse, then re-queued for a new manifest below.
+            is_rto = bool(self.get("rejection_reason"))
             reversed_ses = self._reverse_stock_entries(
                 reason=self.recall_reason or _("Manifest recall"),
                 reference=f"manifest {self.name} confirmed return",
                 allow_original_cancellation=False,
+                target_status="Rejected" if is_rto else "Draft",
             )
             self.reversed_stock_entries = ", ".join(reversed_ses) if reversed_ses else "—"
 
@@ -3214,17 +3254,36 @@ class CHTransferManifest(Document):
                 ),
             )
 
+            if is_rto:
+                self._requeue_rto_orders()
+
             self._maybe_finalize_recalled_trip()
             self._maybe_auto_close_parent_trip()
             return reversed_ses
         finally:
             frappe.db.sql("SELECT RELEASE_LOCK(%s)", (lock_key,))
 
+    def _requeue_rto_orders(self):
+        """RTO received -> ready for dispatch: back to Packed, off this manifest.
+
+        The orders reappear in Packed Orders and go out on a new manifest.
+        """
+        from ch_logistics.api.rejection_api import _put_the_goods_back
+
+        note = _("RTO received from manifest {0}; ready for dispatch on a new manifest.").format(self.name)
+        requeued = _put_the_goods_back(self, "Packed", note)
+        for name in requeued:
+            frappe.db.set_value("Stock Entry", name, "custom_transfer_manifest", None,
+                                update_modified=False)
+        if requeued:
+            self.add_comment("Comment", _("Back in Packed Orders: {0}").format(", ".join(requeued)))
+
     def _reverse_stock_entries(
         self,
         reason,
         reference=None,
         allow_original_cancellation=False,
+        target_status="Draft",
     ):
         """Reverse every linked Stock Entry or fail the whole transaction.
 
@@ -3255,6 +3314,7 @@ class CHTransferManifest(Document):
                 se,
                 reason=reason,
                 reference=reference or f"manifest {self.name}",
+                target_status=target_status,
             )
             if custom_action:
                 results.append(custom_action)

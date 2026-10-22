@@ -1,44 +1,19 @@
-"""Central role registry for ch_logistics.
+"""Central permission gate for ch_logistics.
 
-Single source of truth for every role-based gate in the logistics app.
-Nothing outside this module should hardcode a role name — API modules ask
-``user_has("<function_key>")`` / ``require("<function_key>")`` instead.
+Every logistics action is a capability key (``user_has("assign_driver")`` /
+``require("ops_control")``). A key is granted by a DocType permission set in
+**Role Permissions Manager**, never by a role name in code:
 
-Resolution per function key — **the DB is the only source**:
+    CAPABILITIES[key] = (doctype, permission type)
 
-**CH Logistics Settings → Role Matrix** child rows (``CH Logistics Role Rule``)
-ARE the allowed role set. Admins can re-map any gate without a code change, and
-an empty set means DENY.
+so who may assign drivers, run the control tower or receive a delivery is
+changed in Permission Manager alone. The mapping separates drivers from
+dispatch by permission type: drivers have Write on manifests, dispatch has
+Create on trips, recall needs Cancel, receiving needs Submit on Stock Entry.
 
-``DEFAULT_ROLE_MATRIX`` below is the **seed source and key registry only**.
-``setup._provision_access_control()`` copies it into the settings table once per
-function key (never overwriting existing rows), so fresh sites come up with the
-shipped policy. It is deliberately not consulted at runtime — a fallback would
-silently resurrect a role an administrator had removed.
-
-``System Manager`` and ``Administrator`` always bypass — same convention as
-``ch_erp15.scope`` (the central store-scope guard).
-
-Function keys
-─────────────
-Stage keys (manifest lifecycle transitions — used by transfer_manifest_api):
-  create_manifest, assign_driver, start_pickup, mark_reached_destination, reject_manifest,
-  complete_delivery, driver_close_manifest, accept_delivery, close_manifest,
-  initiate_recall, confirm_return
-
-Console / override keys:
-  ops_control            – Control-Tower mutations (attach to Started trip,
-                           dynamic stop insert, recall approval …)
-  ops_view               – ops-wide list endpoints (see all manifests/trips,
-                           not just own-driver rows)
-  head_override          – Logistics-Head-only overrides (close trip with
-                           open exceptions, close_as_head)
-  resequence_override    – resequence stops on a Started trip
-  app_access             – logistics app screen access (permissions.py)
-  report_ops             – report default widens from own-driver to all
-  digest_recipients      – roles that receive the daily logistics digest
-  digest_preview         – may call preview_digest
-  rejection_dispatcher_notify – dispatcher realtime alert on rejection
+Administrator always passes. Beyond that, "privileged" (the server-side
+validation bypass) is whoever Permission Manager allows to Delete
+CH Logistics Settings.
 """
 
 from __future__ import annotations
@@ -49,81 +24,59 @@ import frappe
 from frappe import _
 from frappe.utils import cint
 
-# SEED SOURCE ONLY — not a runtime fallback.  setup._provision_access_control()
-# copies these into CH Logistics Settings -> Role Matrix once per function key
-# (never overwriting existing rows), and get_roles_for() then reads the DB
-# exclusively, so removing a role in the UI actually removes it.  This dict also
-# defines the set of valid function keys.  "Logistic Head" (legacy misspelling)
-# is retained as an accepted alias so any site that hand-created the misspelt
-# role keeps working; it is skipped at seed time when the Role does not exist.
-DEFAULT_ROLE_MATRIX: dict[str, set[str]] = {
-    "create_manifest": {"Delivery Manager", "Stock Manager", "Operations Manager"},
-    # Outward stages — source-store dispatch lane
-    "assign_driver": {"Delivery Manager", "Stock Manager", "Store Manager"},
-    "start_pickup": {"Delivery Manager", "Delivery User", "Stock Manager"},
-    "mark_reached_destination": {"Delivery Manager", "Delivery User", "Stock Manager"},
-    "reject_manifest": {"Delivery Manager", "Delivery User", "Stock Manager"},
-    "complete_delivery": {"Delivery User", "Delivery Manager"},
-    "driver_close_manifest": {"Delivery User", "Delivery Manager"},
-    # Inward stages — destination-store receipt lane
-    "accept_delivery": {"Store Manager", "Stock Manager"},
-    "close_manifest": {"Store Manager", "Stock Manager"},
-    # Reversal — manager-only
-    "initiate_recall": {"Stock Manager", "Delivery Manager", "Store Manager"},
-    "confirm_return": {"Stock Manager", "Delivery Manager"},
-    # Console / overrides
-    "ops_control": {"Operations Manager", "Delivery Manager", "Logistics Head", "Logistic Head"},
-    "ops_view": {"Delivery Manager", "Delivery User", "Operations Manager", "Logistics Head"},
-    "driver_override": {"Delivery Manager", "Stock Manager", "Operations Manager", "Logistics Head", "Logistic Head"},
-    "tracking_view": {"Delivery Manager", "Operations Manager", "Logistics Head", "Logistic Head"},
-    "courier_poll": {"Delivery Manager", "Operations Manager", "Logistics Head", "Logistic Head"},
-    "ewaybill_sync": {"Delivery Manager", "Stock Manager", "Operations Manager"},
-    "head_override": {"Logistics Head", "Logistic Head"},
-    "resequence_override": {"Logistics Head", "Logistic Head", "Operations Manager"},
-    "app_access": {"Logistics Manager", "Logistics User", "Delivery Manager"},
-    "report_ops": {"Delivery Manager", "Stock Manager", "Operations Manager"},
-    "digest_recipients": {"Delivery Manager", "Stock Manager"},
-    "digest_preview": {"Delivery Manager"},
-    "rejection_dispatcher_notify": {"Logistics Manager", "Delivery Manager"},
+_MANIFEST = "CH Transfer Manifest"
+_TRIP = "CH Logistics Trip"
+
+CAPABILITIES: dict[str, tuple[str, str]] = {
+    # Driver steps: Write on the manifest (endpoints also require the
+    # caller to be the manifest's assigned driver).
+    "start_pickup": (_MANIFEST, "write"),
+    "mark_reached_destination": (_MANIFEST, "write"),
+    "reject_manifest": (_MANIFEST, "write"),
+    "complete_delivery": (_MANIFEST, "write"),
+    "driver_close_manifest": (_MANIFEST, "write"),
+    "create_manifest": (_MANIFEST, "create"),
+    # Reversal
+    "initiate_recall": (_MANIFEST, "cancel"),
+    "confirm_return": (_MANIFEST, "cancel"),
+    # Store receipt posts stock
+    "accept_delivery": ("Stock Entry", "submit"),
+    "close_manifest": ("Stock Entry", "submit"),
+    # Dispatch / control tower: Create on trips (drivers only write them)
+    "assign_driver": (_TRIP, "create"),
+    "ops_control": (_TRIP, "create"),
+    "ops_view": (_TRIP, "create"),
+    "driver_override": (_TRIP, "create"),
+    "tracking_view": (_TRIP, "create"),
+    "courier_poll": (_TRIP, "create"),
+    "ewaybill_sync": (_TRIP, "create"),
+    "resequence_override": (_TRIP, "create"),
+    "report_ops": (_TRIP, "create"),
+    "digest_recipients": (_TRIP, "create"),
+    "digest_preview": (_TRIP, "create"),
+    "rejection_dispatcher_notify": (_TRIP, "create"),
+    "head_override": (_TRIP, "delete"),
+    "app_access": (_TRIP, "read"),
 }
 
-# Roles referenced anywhere in the matrix that are NOT created by any
-# doctype permission JSON — ensure_roles() provisions these on migrate.
-_PROVISIONED_ROLES = ("Logistics Head", "Logistics Manager", "Logistics User")
+_PRIVILEGE = ("CH Logistics Settings", "delete")
 
 
-def _settings_matrix() -> dict[str, set[str]]:
-    """Role matrix from CH Logistics Settings, keyed by function_key.
-
-    Tolerates the table/doctype not existing yet (mid-migrate on old
-    sites) by returning an empty mapping.
-    """
-    try:
-        settings = frappe.get_cached_doc("CH Logistics Settings")
-    except Exception:
-        return {}
-    matrix: dict[str, set[str]] = {}
-    for row in settings.get("role_matrix") or []:
-        key = (row.get("function_key") or "").strip()
-        role = (row.get("role") or "").strip()
-        if key in DEFAULT_ROLE_MATRIX and role:
-            matrix.setdefault(key, set()).add(role)
-    return matrix
+def _roles_with(doctype: str, ptype: str) -> set[str]:
+    """Roles Permission Manager grants ``ptype`` on ``doctype`` (level 0)."""
+    source = "Custom DocPerm" if frappe.db.exists("Custom DocPerm", {"parent": doctype}) else "DocPerm"
+    return set(frappe.get_all(
+        source,
+        filters={"parent": doctype, "permlevel": 0, ptype: 1},
+        pluck="role",
+    ))
 
 
 def get_roles_for(function_key: str) -> set[str]:
-    """Allowed role set for a function key, from CH Logistics Settings.
-
-    DB is law: the Role Matrix child rows are the only source. An empty set
-    means DENY. ``DEFAULT_ROLE_MATRIX`` is the seed source (applied once per
-    key by ``setup._provision_access_control``) and the registry of valid
-    function keys -- it is deliberately NOT a runtime fallback, because falling
-    back would silently resurrect a shipped role that an administrator removed.
-    """
-    if function_key not in DEFAULT_ROLE_MATRIX:
+    """Roles that hold a capability, read from Permission Manager."""
+    if function_key not in CAPABILITIES:
         return set()
-
-    return set(_settings_matrix().get(function_key) or ())
+    return _roles_with(*CAPABILITIES[function_key])
 
 
 def get_int_setting(fieldname: str, default: int, minimum: int = 1) -> int:
@@ -151,17 +104,13 @@ def get_list_setting(fieldname: str) -> set[str]:
 
 
 def is_privileged(user: str | None = None) -> bool:
-    """Immutable Administrator/System Manager bypass.
-
-    Administrator is a Frappe principal, not a role.  System Manager cannot
-    be removed from this bypass through the editable role matrix.
-    """
+    """Administrator, or whoever Permission Manager lets delete CH Logistics Settings."""
     user = user or frappe.session.user
     if user == "Administrator":
         return True
     if not user or user == "Guest":
         return False
-    return "System Manager" in set(frappe.get_roles(user))
+    return bool(set(frappe.get_roles(user)) & _roles_with(*_PRIVILEGE))
 
 
 def filter_notification_users(users) -> list[str]:
@@ -242,7 +191,7 @@ def get_name_batch(
 def user_has(function_key: str, user: str | None = None) -> bool:
     """True when `user` may exercise `function_key` (bypass roles included)."""
     user = user or frappe.session.user
-    if function_key not in DEFAULT_ROLE_MATRIX or not user or user == "Guest":
+    if function_key not in CAPABILITIES or not user or user == "Guest":
         return False
     if is_privileged(user):
         return True
@@ -254,17 +203,18 @@ def user_has(function_key: str, user: str | None = None) -> bool:
 
 
 def require(function_key: str, action_label: str | None = None) -> None:
-    """Raise PermissionError unless the session user holds a role for the key."""
+    """Raise PermissionError unless Permission Manager grants the capability."""
     if user_has(function_key):
         return
-    needed = get_roles_for(function_key)
+    doctype, ptype = CAPABILITIES.get(function_key, ("", ""))
     frappe.throw(
-        _("You do not have the required role to <b>{0}</b>. Required: {1}").format(
+        _("You are not permitted to <b>{0}</b>. It needs the {1} permission on {2} "
+          "(Role Permissions Manager).").format(
             action_label or function_key.replace("_", " ").title(),
-            ", ".join(sorted(needed)) or _("(none configured)"),
+            _(ptype.title()), _(doctype),
         ),
         frappe.PermissionError,
-        title=_("Logistics — Role Required"),
+        title=_("Logistics — Not Permitted"),
     )
 
 
@@ -275,14 +225,4 @@ def get_my_capabilities():
     Purely cosmetic on the client — every server endpoint re-checks via
     require()/user_has().
     """
-    return {key: user_has(key) for key in DEFAULT_ROLE_MATRIX}
-
-
-def ensure_roles():
-    """Create Role records referenced by the matrix that no doctype JSON
-    provisions (after_migrate hook)."""
-    for role in _PROVISIONED_ROLES:
-        if not frappe.db.exists("Role", role):
-            frappe.get_doc({"doctype": "Role", "role_name": role, "desk_access": 1}).insert(
-                ignore_permissions=True
-            )
+    return {key: user_has(key) for key in CAPABILITIES}

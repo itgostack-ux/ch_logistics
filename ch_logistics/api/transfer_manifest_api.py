@@ -15,7 +15,7 @@ from urllib.parse import quote, urlsplit
 import frappe
 from frappe import _
 from frappe.rate_limiter import rate_limit
-from frappe.utils import cint, flt, get_datetime, now_datetime, time_diff_in_seconds
+from frappe.utils import add_to_date, cint, flt, get_datetime, now_datetime, time_diff_in_seconds
 
 # ── Role gating (Phase B — Outward / Inward governance) ─────────────────────
 # Stage → allowed-roles mapping lives in the central registry
@@ -381,7 +381,7 @@ def start_pickup(manifest, pickup_photo, lat=None, lng=None, notes=None,
 
 @frappe.whitelist(methods=["POST"])
 def reject_manifest(manifest, rejection_reason, rejection_photo, rejection_photo_2,
-                    rejection_notes=None) -> dict:
+                    rejection_notes=None, latitude=None, longitude=None) -> dict:
     """Compatibility endpoint routed through the audited two-proof lifecycle."""
     from ch_logistics.api.rejection_api import create_and_submit_rejection
 
@@ -391,13 +391,18 @@ def reject_manifest(manifest, rejection_reason, rejection_photo, rejection_photo
         proof_image_1=rejection_photo,
         proof_image_2=rejection_photo_2,
         remarks=rejection_notes,
+        latitude=latitude,
+        longitude=longitude,
     )
-    return {"status": "Rejected", "rejection": rejection.name}
+    # "Recall Initiated" when an in-transit rejection became an RTO.
+    status = frappe.db.get_value("CH Transfer Manifest", manifest, "status")
+    return {"status": status, "rejection": rejection.name}
 
 
 @frappe.whitelist(methods=["POST"])
 def reject_manifest_leg(manifest, stock_entry, rejection_reason, rejection_photo,
-                        rejection_photo_2, rejection_notes=None) -> dict:
+                        rejection_photo_2, rejection_notes=None, latitude=None,
+                        longitude=None) -> dict:
     """Compatibility wrapper (naming mirrors ``reject_manifest`` above) for
     rejecting ONE Stock Entry leg inside a multi-entry manifest."""
     from ch_logistics.api.rejection_api import driver_reject_manifest_row
@@ -409,6 +414,8 @@ def reject_manifest_leg(manifest, stock_entry, rejection_reason, rejection_photo
         proof_image_1=rejection_photo,
         proof_image_2=rejection_photo_2,
         remarks=rejection_notes,
+        latitude=latitude,
+        longitude=longitude,
     )
 
 
@@ -681,7 +688,9 @@ def driver_complete_delivery_row(manifest, stock_entry, delivery_photo, receiver
             no_location_reason=no_location_reason,
         )
 
-        if mf.delivery_otp or mf._delivery_otp_required():
+        if mf.name in (frappe.flags.get("ch_store_otp_verified") or ()):
+            pass  # driver_complete_store_delivery verified the one code for this store
+        elif mf.delivery_otp or mf._delivery_otp_required():
             verification = verify_manifest_otp(mf, otp)
             if not verification.get("valid"):
                 raise DeliveryOTPError(verification.get("message") or _("Invalid delivery OTP."))
@@ -755,6 +764,292 @@ def driver_complete_delivery_row(manifest, stock_entry, delivery_photo, receiver
         "stock_entry": stock_entry,
         "delivery_fully_completed": fully_delivered_now,
     }
+
+
+def _scans_for_leg(mf, stock_entry, scans) -> list:
+    """Order the driver's scans so this order's own label comes first.
+
+    A single-box order is checked against the first scan only, so each order
+    in a store delivery has to be handed its own label first.
+    """
+    for i, first in enumerate(scans):
+        ordered = [first] + scans[:i] + scans[i + 1:]
+        log_len = len(frappe.local.message_log or [])
+        try:
+            mf._validate_delivery_qr_multi(stock_entry, ordered)
+        except frappe.ValidationError:
+            frappe.local.message_log = (frappe.local.message_log or [])[:log_len]
+            continue
+        return ordered
+    frappe.throw(_("No scanned label matches order {0}.").format(stock_entry),
+                 title=_("Scan Required"))
+
+
+@frappe.whitelist(methods=["POST"])
+@rate_limit(
+    limit=lambda: role_registry.get_int_setting("delivery_otp_attempts_per_minute", 10),
+    seconds=60,
+    methods=["POST"],
+)
+def driver_complete_store_delivery(manifest, stock_entry, delivery_photo, receiver_name,
+                                   otp, scanned_qrs, stock_entries=None, lat=None, lng=None,
+                                   gps_accuracy_m=None, geofence_override_reason=None,
+                                   no_location_reason=None, delivery_photos=None) -> dict:
+    """Deliver every order for one store with the single code request_delivery_otp sent.
+
+    The code is checked once per manifest in the group; each order is then
+    captured by driver_complete_delivery_row (scan, photo, GPS, receiver), so
+    the per-order evidence and the manifest roll-up stay exactly as before.
+    """
+    _require_stage_role("complete_delivery")
+    from ch_logistics.api.driver_resolver import assert_manifest_driver_access
+    from ch_logistics.logistics.doctype.ch_logistics_otp_log.ch_logistics_otp_log import (
+        verify_manifest_otp,
+    )
+
+    lead = frappe.get_doc("CH Transfer Manifest", manifest)
+    lead.check_permission("write")
+    assert_manifest_driver_access(lead, scope_side="destination")
+    leg = next((r for r in lead.transfers if r.stock_entry == stock_entry), None)
+    selected = [x for x in (frappe.parse_json(stock_entries) if stock_entries else []) if x]
+    group = _same_store_group(lead, leg, only=selected or None)
+    if not group:
+        frappe.throw(_("Nothing is waiting to be delivered at this store."))
+    scans = [str(s).strip() for s in (frappe.parse_json(scanned_qrs) or []) if str(s or "").strip()]
+
+    verified = []
+    for name in dict.fromkeys(g.manifest for g in group):
+        mf = lead if name == lead.name else frappe.get_doc("CH Transfer Manifest", name)
+        mf.check_permission("write")
+        assert_manifest_driver_access(mf, scope_side="destination")
+        if mf.delivery_otp or mf._delivery_otp_required():
+            result = verify_manifest_otp(mf, otp)
+            if not result.get("valid"):
+                # Returned, not raised, so the failed attempt stays on record.
+                return {"ok": False, "otp_valid": False, "manifest": name,
+                        "message": result.get("message"),
+                        "attempts": cint(result.get("attempts"))}
+        verified.append(mf)
+    for mf in verified:
+        mf.db_set({
+            "delivery_otp_verified": 1,
+            "delivery_otp": None,
+            "delivery_otp_verified_at": now_datetime(),
+            "delivery_otp_verified_by": frappe.session.user,
+        }, update_modified=False)
+
+    deliver_row = getattr(driver_complete_delivery_row, "__wrapped__", driver_complete_delivery_row)
+    frappe.flags.ch_store_otp_verified = {mf.name for mf in verified}
+    delivered = []
+    try:
+        for g in group:
+            mf = frappe.get_doc("CH Transfer Manifest", g.manifest)
+            own = _scans_for_leg(mf, g.stock_entry, scans)
+            result = deliver_row(
+                manifest=g.manifest, stock_entry=g.stock_entry,
+                delivery_photo=delivery_photo, receiver_name=receiver_name,
+                scanned_qr=own[0], additional_scanned_qrs=frappe.as_json(own[1:]),
+                lat=lat, lng=lng, gps_accuracy_m=gps_accuracy_m,
+                geofence_override_reason=geofence_override_reason,
+                no_location_reason=no_location_reason, delivery_photos=delivery_photos,
+            ) or {}
+            if result.get("ok") is False:
+                frappe.throw(result.get("message") or _("Order {0} could not be delivered.").format(g.stock_entry))
+            delivered.append(g.stock_entry)
+    finally:
+        frappe.flags.ch_store_otp_verified = None
+    return {"ok": True, "delivered": delivered,
+            "manifests": list(dict.fromkeys(g.manifest for g in group))}
+
+
+def _capture_handover(mf, row, photo, scanned_qrs, lat, lng, gps_accuracy_m, photos):
+    """Box-label scan + photo + GPS for a hand-over; marks the order taken."""
+    scans = [str(x).strip() for x in (frappe.parse_json(scanned_qrs) if scanned_qrs else []) if str(x or "").strip()]
+    if not scans:
+        frappe.throw(_("Scan the order's box label."), title=_("Scan Required"))
+    mf._validate_pickup_qr_multi(row.stock_entry, scans)
+    if not photo:
+        frappe.throw(_("Take a photo of the hand-over."))
+    now = now_datetime()
+    capture = {"driver_accepted_at": now, "pickup_photo": photo,
+               "pickup_scanned_qr": "; ".join(scans), "pickup_captured_at": now}
+    photo_list = [str(u).strip() for u in (frappe.parse_json(photos) if photos else []) if str(u or "").strip()]
+    if photo_list and frappe.get_meta("CH Transfer Manifest Item").has_field("pickup_photos"):
+        capture["pickup_photos"] = frappe.as_json(photo_list)
+    if lat not in (None, "") and lng not in (None, ""):
+        capture["pickup_lat"], capture["pickup_lng"] = flt(lat), flt(lng)
+    if gps_accuracy_m not in (None, ""):
+        capture["pickup_gps_accuracy_m"] = gps_accuracy_m
+    frappe.db.set_value("CH Transfer Manifest Item", row.name, capture, update_modified=False)
+    frappe.db.set_value("CH Transfer Manifest", mf.name, {"status": "In Transit", "driver_accepted_at": now})
+    return now
+
+
+@frappe.whitelist(methods=["POST"])
+def driver_accept_handover(manifest, stock_entry, pickup_photo, scanned_qrs, lat=None, lng=None,
+                           gps_accuracy_m=None, pickup_photos=None) -> dict:
+    """New driver collects an order from the driver handing it over."""
+    _require_stage_role("start_pickup")
+    from ch_logistics.api.driver_resolver import assert_manifest_driver_access
+
+    mf = frappe.get_doc("CH Transfer Manifest", manifest)
+    mf.check_permission("write")
+    assert_manifest_driver_access(mf, scope_side="destination")
+    row = next((r for r in mf.transfers if r.stock_entry == stock_entry), None)
+    if not row or not (row.get("handover_from") or row.get("held_at_store")) or row.get("handover_carrier"):
+        frappe.throw(_("Order {0} is not waiting to be handed to you.").format(stock_entry))
+    if row.driver_accepted_at:
+        frappe.throw(_("You already have this order."))
+    _capture_handover(mf, row, pickup_photo, scanned_qrs, lat, lng, gps_accuracy_m, pickup_photos)
+    mf.add_comment("Comment", _("Order {0} collected from {1} by {2}.").format(
+        stock_entry, row.get("held_at_store") or _("driver {0}").format(row.handover_from), frappe.session.user))
+    return {"ok": True, "manifest": mf.name, "stock_entry": stock_entry}
+
+
+@frappe.whitelist(methods=["POST"])
+def driver_handover_to_carrier(manifest, stock_entry, handover_photo, scanned_qrs, lat=None, lng=None,
+                               gps_accuracy_m=None, handover_photos=None) -> dict:
+    """The original driver hands an order to outside transport (Rapido, a courier...).
+
+    The order is then ready for the store: it is received by scanning in POS
+    when the transport arrives, which is what posts the stock.
+    """
+    _require_stage_role("complete_delivery")
+    from ch_logistics.api.driver_resolver import resolve_current_driver
+
+    mf = frappe.get_doc("CH Transfer Manifest", manifest)
+    row = next((r for r in mf.transfers if r.stock_entry == stock_entry), None)
+    if not row or not row.get("handover_carrier"):
+        frappe.throw(_("Order {0} is not set for outside transport.").format(stock_entry))
+    if row.get("handover_from") != resolve_current_driver(throw=False):
+        frappe.throw(_("Only the driver who had this order can hand it over."), frappe.PermissionError)
+    if row.driver_accepted_at:
+        frappe.throw(_("This order is already handed over."))
+    now = _capture_handover(mf, row, handover_photo, scanned_qrs, lat, lng, gps_accuracy_m, handover_photos)
+    frappe.db.set_value("CH Transfer Manifest Item", row.name, {
+        "delivery_captured_at": now, "delivery_photo": handover_photo,
+        "delivery_receiver_name": row.handover_carrier,
+    }, update_modified=False)
+    mf.reload()
+    if all(r.delivery_captured_at for r in mf.transfers):
+        mf.arrival_datetime = now
+        # The hand-over driver no longer holds this manifest; checked above.
+        mf.flags.ignore_permissions = True
+        mf._apply_delivery_complete_transition(handover_photo, flt(lat) if lat not in (None, "") else None,
+                                               flt(lng) if lng not in (None, "") else None, row.handover_carrier)
+    else:
+        mf._sync_logistics_status_to_entries("Delivered")
+    mf.add_comment("Comment", _("Order {0} handed to {1}{2} by driver {3}.").format(
+        stock_entry, row.handover_carrier,
+        f" (tracking {row.handover_tracking})" if row.get("handover_tracking") else "", row.handover_from))
+    return {"ok": True, "manifest": mf.name, "stock_entry": stock_entry}
+
+
+def _held_leg(manifest, stock_entry):
+    """The driver's own picked-up, undelivered order on ``manifest``."""
+    from ch_logistics.api.driver_resolver import assert_manifest_driver_access
+
+    mf = frappe.get_doc("CH Transfer Manifest", manifest)
+    mf.check_permission("write")
+    assert_manifest_driver_access(mf, scope_side="source")
+    row = next((r for r in mf.transfers if r.stock_entry == stock_entry), None)
+    if not row or not (row.driver_accepted_at or mf.status == "In Transit") or row.delivery_captured_at:
+        frappe.throw(_("Order {0} is not with you to leave anywhere.").format(stock_entry))
+    return mf, row
+
+
+@frappe.whitelist(methods=["POST"])
+@rate_limit(
+    limit=lambda: role_registry.get_int_setting("delivery_otp_attempts_per_minute", 10),
+    seconds=60,
+    methods=["POST"],
+)
+def request_nearby_store_otp(manifest, stock_entry, store, receiver) -> dict:
+    """Send a code to the person at a nearby store who will hold the order."""
+    _require_stage_role("complete_delivery")
+    mf, _row = _held_leg(manifest, stock_entry)
+    if not frappe.db.exists("CH Store", store):
+        frappe.throw(_("Choose the store that will hold the order."))
+    assert_otp_not_locked(mf.name)
+    plaintext = mf._generate_delivery_otp(request_source="Driver App")
+    mf.flags.ignore_validate_update_after_submit = True
+    mf.save()
+    frappe.cache().set_value(f"ch_nearby_store_otp:{mf.name}", mf.delivery_otp_log, expires_in_sec=86400)
+    recipients = _send_delivery_otp(mf, plaintext, receiver=receiver, store=store,
+                                    warehouse=frappe.db.get_value("CH Store", store, "warehouse"),
+                                    stock_entry=stock_entry) or {}
+    return {
+        "masked_emails": [mask_email(e) for e in recipients.get("emails", [])],
+        "masked_mobiles": [mask_mobile(m) for m in recipients.get("mobiles", [])],
+    }
+
+
+@frappe.whitelist(methods=["POST"])
+@rate_limit(
+    limit=lambda: role_registry.get_int_setting("delivery_otp_attempts_per_minute", 10),
+    seconds=60,
+    methods=["POST"],
+)
+def driver_drop_at_nearby_store(manifest, stock_entry, store, receiver, otp, photo, scanned_qrs,
+                                lat=None, lng=None, gps_accuracy_m=None) -> dict:
+    """Leave an order with a nearby store: it is On Hold there until dispatch
+    assigns a driver to collect it and take it to its original destination.
+    Stock is not moved; the order's status says where it is.
+    """
+    _require_stage_role("complete_delivery")
+    from ch_logistics.logistics.doctype.ch_logistics_otp_log.ch_logistics_otp_log import (
+        verify_manifest_otp,
+    )
+
+    mf, row = _held_leg(manifest, stock_entry)
+    receiver_name = frappe.db.get_value("POS Executive", receiver, "executive_name") if receiver else None
+    if not receiver_name or frappe.db.get_value("POS Executive", receiver, "store") != store:
+        frappe.throw(_("Choose who at {0} is taking the order.").format(store))
+    scans = [str(x).strip() for x in (frappe.parse_json(scanned_qrs) if scanned_qrs else []) if str(x or "").strip()]
+    mf._validate_delivery_qr_multi(stock_entry, scans)
+    if not photo:
+        frappe.throw(_("Take a photo of the order at the store."))
+    frappe.flags.ch_nearby_store_drop = True
+    try:
+        result = verify_manifest_otp(mf, otp)
+    finally:
+        frappe.flags.ch_nearby_store_drop = None
+    if not result.get("valid"):
+        # Returned, not raised, so the failed attempt stays on record.
+        return {"ok": False, "message": result.get("message"), "attempts": cint(result.get("attempts"))}
+    mf.db_set("delivery_otp", None, update_modified=False)
+    frappe.cache().delete_value(f"ch_nearby_store_otp:{mf.name}")
+
+    old_driver, old_trip = mf.driver, mf.trip
+    if len(mf.transfers) > 1:
+        from ch_logistics.api.rejection_api import _split_row_into_new_manifest
+
+        target = _split_row_into_new_manifest(mf, row)
+    else:
+        target = mf.name
+    if old_trip:
+        # On the trip's record, and where the next driver's requests are filed.
+        from ch_logistics.api.logistics_api import add_order_exception
+
+        add_order_exception(old_trip, "Hold", _("Left at {0} with {1}; waiting for a driver to be assigned.").format(
+            store, receiver_name), target, stock_entry, resolution_status="Resolved")
+    frappe.db.set_value("CH Transfer Manifest", target, {
+        "status": "On Hold", "driver": None, "driver_name": None, "driver_phone": None,
+        "trip": None, "driver_accepted_at": None,
+    })
+    leg = frappe.db.get_value("CH Transfer Manifest Item", {"parent": target, "stock_entry": stock_entry}, "name")
+    frappe.db.set_value("CH Transfer Manifest Item", leg, {
+        "driver_accepted_at": None, "handover_from": None,
+        "held_at_store": store, "held_receiver": receiver_name, "held_photo": photo,
+    }, update_modified=False)
+    frappe.get_doc("CH Transfer Manifest", target).add_comment("Comment", _(
+        "Order {0} left at {1} with {2} by driver {3} (OTP verified{4}). On hold until dispatch assigns a driver."
+    ).format(stock_entry, store, receiver_name, old_driver,
+             f", at {lat},{lng}" if lat not in (None, "") else ""))
+    moved = frappe.get_doc("CH Transfer Manifest", target)
+    moved.driver = old_driver
+    moved._sync_driver_state_after_action()
+    return {"ok": True, "manifest": target, "store": store}
 
 
 @frappe.whitelist(methods=["POST"])
@@ -891,6 +1186,7 @@ def confirm_return(
     return_photo,
     returned_serials=None,
     returned_quantities=None,
+    returned_boxes=None,
 ) -> dict:
     """Delivery person confirms all items returned to source warehouse.
 
@@ -907,6 +1203,7 @@ def confirm_return(
         return_photo=return_photo,
         returned_serials=returned_serials,
         returned_quantities=returned_quantities,
+        returned_boxes=returned_boxes,
     )
     return {
         "status": doc.status,
@@ -1140,11 +1437,77 @@ def _collect_warehouse_contacts(warehouse: str | None) -> tuple[list[str], list[
     return _uniq_keep_order(emails), _uniq_keep_order(mobiles)
 
 
-def _receiver_contacts(receiver) -> tuple:
-    """(users, emails, mobiles) for the POS Executive taking the delivery."""
-    if not receiver or not frappe.db.exists("POS Executive", receiver):
+def _same_store_group(doc, leg, only=None) -> list:
+    """Picked-up, undelivered orders going to the same warehouse as ``leg``.
+
+    This manifest's legs plus the same driver's other active manifests, so a
+    driver dropping several orders at one store reads out one code. ``only``
+    narrows it to the orders the driver ticked.
+    """
+    if not leg or not leg.to_warehouse:
+        return []
+    rows = frappe.db.sql(
+        """
+        SELECT i.parent AS manifest, i.stock_entry
+          FROM `tabCH Transfer Manifest Item` i
+          JOIN `tabCH Transfer Manifest` m ON m.name = i.parent
+         WHERE i.to_warehouse = %(wh)s
+           AND (i.driver_accepted_at IS NOT NULL OR m.status = 'In Transit')
+           AND i.delivery_captured_at IS NULL
+           AND m.docstatus = 1
+           AND m.status IN ('Assigned', 'In Transit')
+           AND (m.name = %(mf)s OR (%(driver)s != '' AND m.driver = %(driver)s))
+         ORDER BY m.name = %(mf)s DESC, m.name, i.idx
+        """,
+        {"wh": leg.to_warehouse, "mf": doc.name, "driver": doc.driver or ""},
+        as_dict=True,
+    )
+    if only is None:
+        return rows
+    wanted = set(only)
+    rows = [r for r in rows if r.stock_entry in wanted]
+    if len(rows) != len(wanted):
+        frappe.throw(_("Every ticked order must be picked up, not yet delivered, and going to "
+                       "the same store as {0}.").format(leg.stock_entry), title=_("Check Selection"))
+    return rows
+
+
+def assert_otp_not_locked(manifest: str) -> None:
+    """Cap fresh delivery codes after wrong guesses.
+
+    Each code allows a few attempts; without a cap on new codes after a Failed
+    one, the guesses are unlimited. Past the cap, dispatch steps in.
+    """
+    max_failed = role_registry.get_int_setting("delivery_otp_max_failed_per_hour", 3)
+    failed_recently = frappe.db.count("CH Logistics OTP Log", {
+        "manifest": manifest,
+        "status": "Failed",
+        "generated_at": (">", add_to_date(now_datetime(), hours=-1)),
+    })
+    if failed_recently >= max_failed:
+        frappe.throw(
+            _("Too many wrong codes on manifest {0} in the last hour. Ask dispatch "
+              "to verify the handover.").format(manifest),
+            frappe.PermissionError,
+            title=_("OTP Locked"),
+        )
+
+
+def _receiver_contacts(receiver, destination_store=None) -> tuple:
+    """(users, emails, mobiles) for the POS Executive taking the delivery.
+
+    The receiver must be an active executive of the destination store: the
+    driver picks the name, so an unchecked pick would let the driver send the
+    code to anyone (including themselves).
+    """
+    if not receiver:
         return [], [], []
-    user = frappe.db.get_value("POS Executive", receiver, "user")
+    row = frappe.db.get_value(
+        "POS Executive", receiver, ["user", "store", "is_active"], as_dict=True)
+    if not row or not row.is_active or not destination_store or row.store != destination_store:
+        frappe.throw(_("{0} does not work at the store receiving this delivery.").format(receiver),
+                     frappe.PermissionError)
+    user = row.user
     if not user:
         return [], [], []
     email, mobile = frappe.db.get_value("User", user, ["email", "mobile_no"]) or (None, None)
@@ -1152,7 +1515,7 @@ def _receiver_contacts(receiver) -> tuple:
 
 
 def _send_delivery_otp(doc, plaintext_otp=None, receiver=None,
-                       store=None, warehouse=None, stock_entry=None) -> dict:
+                       store=None, warehouse=None, stock_entry=None, group_legs=None) -> dict:
     """Send delivery OTP to the connected destination warehouse + store contacts.
 
     `stock_entry` narrows the notice to one shipment on the manifest: the
@@ -1216,7 +1579,8 @@ def _send_delivery_otp(doc, plaintext_otp=None, receiver=None,
 
     # Warehouse contacts go first — they're the canonical \"connected warehouse\" address
     # for this manifest and the user's explicit choice for delivery handoff.
-    receiver_users, receiver_emails, receiver_mobiles = _receiver_contacts(receiver)
+    receiver_users, receiver_emails, receiver_mobiles = _receiver_contacts(
+        receiver, destination_store)
     if receiver_users:
         # Named receiver only: the driver said who is signing for it, and
         # spraying the code across the whole store would let anybody else take
@@ -1262,6 +1626,9 @@ def _send_delivery_otp(doc, plaintext_otp=None, receiver=None,
         row for row in (doc.transfers or [])
         if not warehouse or row.to_warehouse == destination_warehouse
     ] or list(doc.transfers or [])
+    if group_legs:
+        # One code for every order handed over at this store, across manifests.
+        legs = list(group_legs)
     leg_challans = _challans_by_stock_entry([row.stock_entry for row in legs])
     company_name = doc.company or "Congruence Holdings"
     mail_template = _(
@@ -1442,7 +1809,7 @@ def _receiver_candidates(doc) -> list:
 
 
 @frappe.whitelist()
-def delivery_receivers(manifest, stock_entry=None) -> list:
+def delivery_receivers(manifest, stock_entry=None, store=None) -> list:
     """The people who may take delivery, at the store this leg is going to.
 
     A driver hands the box to somebody who works there, and until now their
@@ -1468,7 +1835,8 @@ def delivery_receivers(manifest, stock_entry=None) -> list:
     # A manifest raised from a transfer often names only the warehouse it is
     # going to, so the store is resolved from that — the same way the Request
     # Fulfilment Hub resolves it.
-    store = (doc.destination_store if destination == doc.destination_warehouse else None) \
+    # ``store``: a nearby store the driver is leaving the order at instead.
+    store = store or (doc.destination_store if destination == doc.destination_warehouse else None) \
         or frappe.db.get_value("CH Store", {"warehouse": destination}, "name")
     if not store or not frappe.db.exists("DocType", "POS Executive"):
         return []
@@ -1490,8 +1858,7 @@ def delivery_receivers(manifest, stock_entry=None) -> list:
                 "User", row.user, ["email", "mobile_no"]) or (None, None)
         out.append({
             "name": row.name,
-            "executive_name": row.executive_name or row.user or row.name,
-            "user": row.user,
+            "executive_name": row.executive_name or row.name,
             "has_email": bool(email),
             "has_mobile": bool(mobile),
         })
@@ -1524,7 +1891,7 @@ def mask_mobile(num):
     seconds=60,
     methods=["POST"],
 )
-def request_delivery_otp(manifest, receiver=None, stock_entry=None) -> dict:
+def request_delivery_otp(manifest, receiver=None, stock_entry=None, stock_entries=None) -> dict:
     """Driver-side trigger: 'I'm at the destination, send me the OTP'.
 
     Wired to the **Complete Delivery** button on the driver app: tapping it
@@ -1568,6 +1935,7 @@ def request_delivery_otp(manifest, receiver=None, stock_entry=None) -> dict:
                     else _("{0} sec").format(left)),
                 title=_("Please Wait"),
             )
+    assert_otp_not_locked(doc.name)
     # Delivering one shipment of several: the notice names that shipment's
     # Delivery Challan and goes to that shipment's store, not the manifest's.
     leg = None
@@ -1593,8 +1961,36 @@ def request_delivery_otp(manifest, receiver=None, stock_entry=None) -> dict:
     plaintext_otp = doc._generate_delivery_otp(request_source="Driver App")
     doc.flags.ignore_validate_update_after_submit = True
     doc.save()
-    recipients = _send_delivery_otp(doc, plaintext_otp, receiver=receiver,
-                                    stock_entry=stock_entry) or {}
+    # One code for the orders the driver ticked (same store); otherwise per order.
+    selected = [x for x in (frappe.parse_json(stock_entries) if stock_entries else []) if x]
+    group = _same_store_group(doc, leg, only=selected) if (leg and len(selected) > 1) else []
+    if len(group) > 1:
+        # Same store, several orders: the same code goes on every manifest in
+        # the group, and the store gets one notice per challan with it.
+        docs = {doc.name: doc}
+        for name in dict.fromkeys(g.manifest for g in group if g.manifest != doc.name):
+            other = frappe.get_doc("CH Transfer Manifest", name)
+            other.check_permission("write")
+            assert_manifest_driver_access(other, scope_side="destination")
+            assert_otp_not_locked(other.name)
+            other._generate_delivery_otp(request_source="Driver App", plaintext_otp=plaintext_otp)
+            other.flags.ignore_validate_update_after_submit = True
+            other.save()
+            docs[name] = other
+        group_legs = [
+            row for g in group for row in docs[g.manifest].transfers
+            if row.stock_entry == g.stock_entry
+        ]
+        from ch_logistics.logistics.doctype.ch_transfer_manifest.ch_transfer_manifest import (
+            store_for_warehouse,
+        )
+
+        recipients = _send_delivery_otp(doc, plaintext_otp, receiver=receiver,
+                                        store=store_for_warehouse(leg.to_warehouse),
+                                        warehouse=leg.to_warehouse, group_legs=group_legs) or {}
+    else:
+        recipients = _send_delivery_otp(doc, plaintext_otp, receiver=receiver,
+                                        stock_entry=stock_entry) or {}
 
     return {
         "message": _("OTP sent to the destination warehouse."),
@@ -1605,6 +2001,8 @@ def request_delivery_otp(manifest, receiver=None, stock_entry=None) -> dict:
         # Who the driver can name as having taken custody. Same people the
         # code just went to; the field still accepts anyone else.
         "receiver_options": _receiver_candidates(doc),
+        # Orders this one code covers (same store); the app offers to deliver them together.
+        "store_group": [dict(g) for g in group] if len(group) > 1 else [],
         # How long before another code may be asked for, so the app's button
         # counts down the same window this endpoint will enforce.
         "resend_after_seconds": wait_s,
@@ -1854,12 +2252,8 @@ def poll_courier_statuses(dry_run=0) -> dict:
 
             if _can_apply_courier_status(row.status, mapped_status):
                 doc = frappe.get_doc("CH Transfer Manifest", row.name)
-                if mapped_status == "Delivered":
-                    # db_set bypasses the controller's save hooks, so the
-                    # Delivered-with-draft-Stock-Entry gate must be invoked
-                    # explicitly here — a courier webhook must not be able
-                    # to create the exact wreck the controller refuses.
-                    doc._assert_no_draft_stock_entries()
+                if mapped_status == "Delivered" and not doc.get("delivery_datetime"):
+                    doc.db_set("delivery_datetime", now_datetime(), update_modified=False)
                 doc.flags.ignore_validate_update_after_submit = True
                 doc.db_set("status", mapped_status, update_modified=True)
                 doc._sync_logistics_status_to_entries(mapped_status)
@@ -1917,7 +2311,9 @@ def get_driver_assignments() -> list:
     else:
         return []
 
-    active_statuses = ["Assigned", "Pickup Started", "In Transit", "Delivered"]
+    # Recall Initiated = RTO: the driver still has the goods and must bring
+    # them back to the hub, so it stays on their list until the return.
+    active_statuses = ["Assigned", "Pickup Started", "In Transit", "Delivered", "Recall Initiated"]
     filters["status"] = ["in", active_statuses]
 
     fields = [
@@ -1958,6 +2354,7 @@ def get_driver_assignments() -> list:
         "Pickup Started": "to_pickup",
         "In Transit": "in_transit",
         "Delivered": "awaiting_receipt",
+        "Recall Initiated": "in_transit",
     }
     store_names = {
         store
@@ -1973,13 +2370,62 @@ def get_driver_assignments() -> list:
             fields=["name", "address"],
         )
     }
+    # Orders this driver is handing over: they stay on this driver's list,
+    # marked, until the new driver or the transport has taken them.
+    handover_names = set()
+    if driver:
+        handover_names = set(frappe.db.sql(
+            """
+            SELECT DISTINCT i.parent
+              FROM `tabCH Transfer Manifest Item` i
+              JOIN `tabCH Transfer Manifest` m ON m.name = i.parent
+             WHERE i.handover_from = %s AND i.driver_accepted_at IS NULL
+               AND m.docstatus = 1 AND m.status = 'Assigned'
+            """, driver, pluck=True))
+        if handover_names:
+            manifests.extend(frappe.get_all(
+                "CH Transfer Manifest", filters={"name": ["in", list(handover_names)]}, fields=fields))
+
     leg_rows = frappe.get_all(
         "CH Transfer Manifest Item",
         filters={"parent": ["in", [m["name"] for m in manifests] or ["__none__"]]},
         fields=["parent", "stock_entry", "from_warehouse", "to_warehouse",
-                 "item_count", "total_qty", "driver_accepted_at", "delivery_captured_at"],
+                 "item_count", "total_qty", "driver_accepted_at", "delivery_captured_at",
+                 "handover_from", "handover_carrier", "handover_tracking", "held_at_store"],
         order_by="parent asc, idx asc",
     )
+    handover_drivers = dict(frappe.get_all(
+        "Driver",
+        filters={"name": ["in", list({r["handover_from"] for r in leg_rows if r.get("handover_from")}) or ["__none__"]]},
+        fields=["name", "full_name"], as_list=True))
+    for row in leg_rows:
+        row["handover_from_name"] = handover_drivers.get(row.get("handover_from")) or row.get("handover_from")
+    # Orders with a Transfer / Hold request still waiting on dispatch.
+    open_requests = dict(frappe.db.sql(
+        """
+        SELECT stock_entry, exception_type FROM `tabCH Logistics Exception`
+         WHERE parenttype = 'CH Logistics Trip' AND stock_entry IN %(ses)s
+           AND exception_type IN ('Transfer', 'Hold') AND resolution_status IN ('Open', 'In Progress')
+        """,
+        {"ses": tuple(r["stock_entry"] for r in leg_rows) or ("__none__",)},
+    ))
+    # Dispatch's answer to a hold ("deliver on <date>"), shown on the order.
+    hold_notes = {}
+    for se, remarks in frappe.db.sql(
+        """
+        SELECT stock_entry, remarks FROM `tabCH Logistics Exception`
+         WHERE parenttype = 'CH Logistics Trip' AND stock_entry IN %(ses)s
+           AND exception_type = 'Hold' AND resolution_status = 'Resolved'
+           AND resolved_at >= %(since)s
+         ORDER BY resolved_at ASC
+        """,
+        {"ses": tuple(r["stock_entry"] for r in leg_rows) or ("__none__",),
+         "since": add_to_date(now_datetime(), days=-3)},
+    ):
+        hold_notes[se] = (remarks or "").rsplit(" — ", 1)[-1]
+    for row in leg_rows:
+        row["open_request"] = open_requests.get(row["stock_entry"]) or ""
+        row["hold_note"] = hold_notes.get(row["stock_entry"]) or ""
     # The Delivery Challan each shipment travels under: the number on the
     # driver's paperwork and on the box label, so the app shows it too.
     leg_challans = _challans_by_stock_entry([row["stock_entry"] for row in leg_rows])
@@ -2010,6 +2456,24 @@ def get_driver_assignments() -> list:
             m["destination_address"] = addresses.get(m["destination_store"]) or ""
         m["transfers"] = legs_by_manifest.get(m["name"], [])
         m["trip_direction"] = trip_direction.get(m.get("trip")) or "Forward"
+        if m["name"] in handover_names:
+            m["handover_view"] = 1
+            m["bucket"] = "in_transit"
+            m["transfers"] = [r for r in m["transfers"]
+                              if r.get("handover_from") == driver and not r.get("driver_accepted_at")]
+
+    # Dispatch's answer when it sent a refused order back to this driver.
+    notes = {}
+    for row in frappe.get_all(
+        "CH Manifest Rejection",
+        filters={"manifest": ["in", [m["name"] for m in manifests] or ["__none__"]],
+                 "status": "Closed", "docstatus": 1},
+        fields=["manifest", "resolution_action"],
+        order_by="resolved_on asc",
+    ):
+        notes[row.manifest] = row.resolution_action
+    for m in manifests:
+        m["dispatch_note"] = notes.get(m["name"]) or ""
 
     return manifests
 
@@ -2181,6 +2645,11 @@ def receive_courier_webhook(courier_partner: str, payload: str = None) -> dict:
     Payload must contain a tracking_number and a status field.
     """
     # --- HMAC verification ---
+    # Unknown partner answers like a bad signature, so the endpoint does not
+    # reveal which partner names exist.
+    if not courier_partner or not frappe.db.exists("Courier Partner", courier_partner):
+        frappe.response["http_status_code"] = 401
+        return {"error": "Invalid signature"}
     courier_doc = frappe.get_cached_doc("Courier Partner", courier_partner)
     api_key = _get_courier_api_key(courier_doc)
     if not api_key:

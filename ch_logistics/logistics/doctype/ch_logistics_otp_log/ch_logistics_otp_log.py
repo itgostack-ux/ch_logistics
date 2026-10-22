@@ -172,6 +172,15 @@ def verify_manifest_otp(manifest, candidate: str | None) -> dict:
             "message": _("No active delivery OTP exists. Request a new OTP."),
             "attempts": 0,
         }
+    # A code sent to a nearby store only lets the order be left there.
+    nearby = frappe.cache().get_value(f"ch_nearby_store_otp:{manifest.name}") == log_name
+    if nearby != bool(frappe.flags.ch_nearby_store_drop):
+        return {
+            "valid": False,
+            "message": _("That code is for leaving the order at a nearby store.") if nearby
+            else _("Send the code to the person at the nearby store first."),
+            "attempts": 0,
+        }
 
     row = frappe.db.get_value(
         "CH Logistics OTP Log",

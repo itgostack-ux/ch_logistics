@@ -67,7 +67,7 @@ ch_logistics.DriverMap = class DriverMap {
 			console.error("Failed to load tracking config", e);
 			this.config = {
 				default_map_zoom: 13,
-				default_map_center: { lat: 13.0827, lng: 80.2707 },
+				default_map_center: { lat: 0, lng: 0 },
 				recommended_interval_sec: 15,
 			};
 		}
@@ -85,7 +85,7 @@ ch_logistics.DriverMap = class DriverMap {
 	}
 
 	_init_map() {
-		const center = this.config.default_map_center || { lat: 13.0827, lng: 80.2707 };
+		const center = this.config.default_map_center || { lat: 0, lng: 0 };
 		this.map = new google.maps.Map(document.getElementById("ch-driver-map-canvas"), {
 			center,
 			zoom: this.config.default_map_zoom || 13,

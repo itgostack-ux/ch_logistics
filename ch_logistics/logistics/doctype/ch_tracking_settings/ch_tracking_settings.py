@@ -24,8 +24,9 @@ def get_public_config() -> dict:
 		"geofence_arrival_meters": int(s.geofence_arrival_meters or 100),
 		"default_map_zoom": int(s.default_map_zoom or 12),
 		"default_map_center": {
-			"lat": float(s.default_map_center_lat or 13.0827),
-			"lng": float(s.default_map_center_lng or 80.2707),
+			# The centre is configuration (CH Tracking Settings), not code.
+			"lat": float(s.default_map_center_lat or 0),
+			"lng": float(s.default_map_center_lng or 0),
 		},
 	}
 
@@ -36,6 +37,17 @@ def get_google_maps_api_key() -> str:
 		return frappe.utils.password.get_decrypted_password(
 			"CH Tracking Settings", "CH Tracking Settings",
 			fieldname="google_maps_api_key",
+		) or ""
+	except Exception:
+		return ""
+
+
+def get_public_maps_api_key() -> str:
+	"""Browser-restricted key for the anonymous /track page (may be empty)."""
+	try:
+		return frappe.utils.password.get_decrypted_password(
+			"CH Tracking Settings", "CH Tracking Settings",
+			fieldname="public_maps_api_key", raise_exception=False,
 		) or ""
 	except Exception:
 		return ""

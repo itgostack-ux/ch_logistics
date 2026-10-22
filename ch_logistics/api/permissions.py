@@ -4,6 +4,9 @@ from __future__ import annotations
 import frappe
 
 
+_WRITE_PTYPES = {"write", "create", "delete", "cancel", "submit", "amend"}
+
+
 def _driver_for_user(user: str | None) -> str | None:
 	if not user or user == "Guest":
 		return None
@@ -124,7 +127,8 @@ def has_driver_break_permission(doc, user: str | None = None, permission_type: s
 	user = user or frappe.session.user
 	if role_registry.is_privileged(user) or doc.get("driver") == _driver_for_user(user):
 		return True
-	if not role_registry.user_has("ops_view", user) or not doc.get("trip"):
+	capability = "ops_control" if (permission_type or "read") in _WRITE_PTYPES else "ops_view"
+	if not role_registry.user_has(capability, user) or not doc.get("trip"):
 		return False
 	trip = frappe.db.get_value(
 		"CH Logistics Trip", doc.get("trip"), ["hub_warehouse", "company"], as_dict=True
@@ -156,7 +160,12 @@ def has_driver_location_permission(doc, user: str | None = None, permission_type
 	from ch_logistics import scope_guard
 
 	user = user or frappe.session.user
-	if role_registry.is_privileged(user) or doc.get("driver") == _driver_for_user(user):
+	if role_registry.is_privileged(user):
+		return True
+	driver = _driver_for_user(user)
+	if driver and doc.get("driver") == driver:
+		if (permission_type or "read") in _WRITE_PTYPES and doc.get("trip"):
+			return frappe.db.get_value("CH Logistics Trip", doc.get("trip"), "driver") == driver
 		return True
 	if not role_registry.user_has("tracking_view", user) or not doc.get("trip"):
 		return False
@@ -192,7 +201,8 @@ def has_manifest_rejection_permission(doc, user: str | None = None, permission_t
 	user = user or frappe.session.user
 	if role_registry.is_privileged(user) or doc.get("driver") == _driver_for_user(user):
 		return True
-	if not role_registry.user_has("ops_view", user) or not doc.get("trip"):
+	capability = "ops_control" if (permission_type or "read") in _WRITE_PTYPES else "ops_view"
+	if not role_registry.user_has(capability, user) or not doc.get("trip"):
 		return False
 	trip = frappe.db.get_value(
 		"CH Logistics Trip", doc.get("trip"), ["hub_warehouse", "company"], as_dict=True
@@ -200,6 +210,73 @@ def has_manifest_rejection_permission(doc, user: str | None = None, permission_t
 	return scope_guard.is_in_scope(
 		warehouse=trip.get("hub_warehouse"), company=trip.get("company"), user=user
 	)
+
+
+def otp_log_query_condition(user: str | None = None) -> str:
+	"""OTP audit rows follow their manifest: either end in the reader's scope."""
+	from ch_logistics import roles as role_registry
+
+	user = user or frappe.session.user
+	if role_registry.is_privileged(user):
+		return ""
+	source = _scope_clause("CH Transfer Manifest", "source_warehouse", "company", user)
+	destination = _scope_clause("CH Transfer Manifest", "destination_warehouse", "company", user)
+	return (
+		"EXISTS (SELECT 1 FROM `tabCH Transfer Manifest` "
+		"WHERE `tabCH Transfer Manifest`.`name` = `tabCH Logistics OTP Log`.`manifest` "
+		f"AND ({source} OR {destination}))"
+	)
+
+
+def has_otp_log_permission(doc, user: str | None = None, permission_type: str | None = None) -> bool:
+	from ch_logistics import roles as role_registry
+	from ch_logistics import scope_guard
+
+	user = user or frappe.session.user
+	if role_registry.is_privileged(user):
+		return True
+	if not doc.get("manifest"):
+		return False
+	manifest = frappe.db.get_value(
+		"CH Transfer Manifest", doc.get("manifest"),
+		["source_store", "source_warehouse", "destination_store", "destination_warehouse", "company"],
+		as_dict=True,
+	) or {}
+	return any(
+		scope_guard.is_in_scope(store=manifest.get(f"{side}_store"),
+								warehouse=manifest.get(f"{side}_warehouse"),
+								company=manifest.get("company"), user=user)
+		for side in ("source", "destination")
+	)
+
+
+# Capabilities whose holders pick, track or override drivers and therefore
+# need the whole roster; everyone else sees only their own Driver record.
+_DRIVER_ROSTER_KEYS = ("ops_view", "ops_control", "assign_driver", "driver_override", "tracking_view")
+
+
+def _sees_driver_roster(user: str) -> bool:
+	from ch_logistics import roles as role_registry
+
+	return role_registry.is_privileged(user) or any(
+		role_registry.user_has(key, user) for key in _DRIVER_ROSTER_KEYS
+	)
+
+
+def driver_query_condition(user: str | None = None) -> str:
+	"""Driver carries live GPS and phone: drivers must not read each other's."""
+	user = user or frappe.session.user
+	if _sees_driver_roster(user):
+		return ""
+	driver = _driver_for_user(user)
+	return f"`tabDriver`.`name` = {frappe.db.escape(driver)}" if driver else "1=0"
+
+
+def has_driver_permission(doc, user: str | None = None, permission_type: str | None = None) -> bool:
+	user = user or frappe.session.user
+	if _sees_driver_roster(user):
+		return True
+	return bool(doc.get("name")) and doc.get("name") == _driver_for_user(user)
 
 
 def has_logistics_access() -> bool:

@@ -233,7 +233,35 @@ class DeliveryApp {
             const $t = $(e.currentTarget);
             this.active_manifest = $t.data("manifest");
             this.active_stock_entry = $t.data("stock-entry");
-            this.do_reject({ from_trip: true, stock_entry: this.active_stock_entry });
+            this.do_reject({ from_board: true, stock_entry: this.active_stock_entry });
+        });
+        this.$body.on("click", ".da-handover-btn", (e) => {
+            e.stopPropagation();
+            const $t = $(e.currentTarget);
+            this._open_handover_dialog($t.data("kind"), $t.data("manifest"), $t.data("stock-entry"));
+        });
+        this.$body.on("click", ".da-leg-exception-btn", (e) => {
+            e.stopPropagation();
+            const $t = $(e.currentTarget);
+            this._open_delivery_exception_dialog($t.data("manifest"), $t.data("stock-entry"), $t.data("trip"));
+        });
+        this.$body.on("change", ".da-leg-select", () => {
+            const n = this.$body.find(".da-leg-select:checked").length;
+            this.$body.find(".da-select-count").text(n);
+            this.$body.find(".da-select-bar").toggle(n > 1);
+        });
+        this.$body.on("click", ".da-deliver-selected-btn", (e) => {
+            e.stopPropagation();
+            const picked = this.$body.find(".da-leg-select:checked").map((_, el) => ({
+                manifest: $(el).data("manifest"),
+                stock_entry: $(el).data("stock-entry"),
+                to_warehouse: $(el).data("to-warehouse"),
+            })).get();
+            if (new Set(picked.map((p) => p.to_warehouse)).size > 1) {
+                frappe.msgprint(__("Tick orders for one store only — one OTP covers one delivery location."));
+                return;
+            }
+            this._open_store_group_deliver_dialog(picked[0].manifest, picked[0].stock_entry, picked);
         });
         this.$body.on("click", ".da-leg-deliver-btn", (e) => {
             e.stopPropagation();
@@ -503,7 +531,7 @@ class DeliveryApp {
         return stock_entry;
     }
 
-    _render_leg_deliver_card(m, row, trip) {
+    _render_leg_deliver_card(m, row, trip, selectable = false) {
         // One small card per Stock Entry leg on an In Transit manifest —
         // its own from->to, its own Deliver button (own OTP/QR/GPS/photo
         // capture per shipment). A row already delivered shows a badge
@@ -519,22 +547,37 @@ class DeliveryApp {
             : frappe.utils.escape_html(row.to_warehouse || "—");
         const trip_attr = frappe.utils.escape_html(trip || m.trip || "");
         let actions;
-        if (row.delivery_captured_at) {
+        if (row.open_request && !row.delivery_captured_at) {
+            // Waiting on dispatch: no Deliver / Transfer until they answer.
+            actions = `<span class="da-card-status"><i class="fa fa-clock-o"></i> ${row.open_request === "Transfer"
+                ? __("Transfer requested — waiting for dispatch to assign a driver or transport")
+                : __("On hold — waiting for dispatch")}</span>`;
+        } else if (row.delivery_captured_at) {
             const at = frappe.datetime.str_to_user(row.delivery_captured_at);
             actions = `<span class="da-card-status da-status-completed"><i class="fa fa-check-circle"></i> ${__("Delivered")} · ${at}</span>`;
         } else {
-            actions = `<button class="btn btn-primary btn-sm da-leg-deliver-btn" data-manifest="${frappe.utils.escape_html(m.name)}" data-stock-entry="${se}" data-trip="${trip_attr}"><i class="fa fa-check-circle"></i> ${__("Deliver")}</button>`;
+            actions = `<button class="btn btn-primary btn-sm da-leg-deliver-btn" data-manifest="${frappe.utils.escape_html(m.name)}" data-stock-entry="${se}" data-trip="${trip_attr}"><i class="fa fa-check-circle"></i> ${__("Deliver")}</button>
+                <button class="btn btn-warning btn-sm da-leg-exception-btn" data-manifest="${frappe.utils.escape_html(m.name)}" data-stock-entry="${se}" data-trip="${trip_attr}"><i class="fa fa-exchange"></i> ${__("Transfer")}</button>`;
         }
+        // Tick orders for the same store to deliver them on one OTP.
+        const tick = selectable && !row.delivery_captured_at && !row.open_request
+            ? `<input type="checkbox" class="da-leg-select" style="margin-right:6px;"
+                   data-manifest="${frappe.utils.escape_html(m.name)}" data-stock-entry="${se}"
+                   data-to-warehouse="${frappe.utils.escape_html(row.to_warehouse || "")}">`
+            : "";
         return `
             <div class="da-stop-card">
                 <div class="da-stop-where">
-                    <i class="fa fa-map-marker"></i> ${from_label}
+                    ${tick}<i class="fa fa-map-marker"></i> ${from_label}
                     <i class="fa fa-long-arrow-right" style="margin:0 4px;"></i>
                     ${to_label}
                 </div>
                 <div class="text-muted" style="font-size:11px;padding:0 8px 6px;">
                     <i class="fa fa-file-text-o"></i> ${this._order_id_html(row)}
                 </div>
+                ${row.hold_note && !row.open_request && !row.delivery_captured_at
+                    ? `<div class="alert alert-warning" style="font-size:12px;padding:6px 8px;margin:0 8px 6px;">
+                        <i class="fa fa-comment"></i> <b>${__("Dispatch")}:</b> ${frappe.utils.escape_html(row.hold_note)}</div>` : ""}
                 <div class="da-stop-actions">${actions}</div>
             </div>`;
     }
@@ -563,7 +606,7 @@ class DeliveryApp {
         // pickup is captured, independent of sibling Stock Entries on the
         // same manifest — so these get the same actionable Deliver card an
         // In Transit manifest's legs get, not a read-only "waiting" one.
-        const orphan_cards = orphan_legs.map(({ m, row }) => this._render_leg_deliver_card(m, row, m.trip)).join("");
+        const orphan_cards = orphan_legs.map(({ m, row }) => this._render_leg_deliver_card(m, row, m.trip, true)).join("");
         // A manifest whose shipments have all moved to the next tab renders
         // no cards, so test what was drawn, not the manifest count.
         if (!manifest_cards.trim() && !orphan_cards) {
@@ -573,7 +616,14 @@ class DeliveryApp {
             </div>`);
             return;
         }
-        $c.html(`<div class="da-manifest-list">${manifest_cards}${orphan_cards}</div>`);
+        const select_bar = bucketFilter === "in_transit"
+            ? `<div class="da-select-bar" style="display:none;margin-bottom:8px;">
+                   <button class="btn btn-primary btn-sm btn-block da-deliver-selected-btn">
+                       <i class="fa fa-check-square-o"></i> ${__("Deliver selected")} (<span class="da-select-count">0</span>)
+                   </button>
+               </div>`
+            : "";
+        $c.html(`${select_bar}<div class="da-manifest-list">${manifest_cards}${orphan_cards}</div>`);
     }
 
     render_history_column($c) {
@@ -604,6 +654,23 @@ class DeliveryApp {
                </span>`
             : "";
 
+        if (m.handover_view) {
+            return (m.transfers || []).map((row) => this._render_handover_card(m, row)).join("");
+        }
+
+        if (m.status === "Recall Initiated") {
+            // Recalled: bring it back; the warehouse books it in, then it leaves this list.
+            const esc = frappe.utils.escape_html;
+            const hub = window.ch_wh_label_html ? ch_wh_label_html(m.source_warehouse, "—") : esc(m.source_warehouse || "—");
+            return (m.transfers || []).filter((r) => !r.delivery_captured_at).map((row) => `
+                <div class="da-stop-card">
+                    <div class="da-stop-where"><i class="fa fa-reply"></i> ${hub}</div>
+                    <div class="text-muted" style="font-size:11px;padding:0 8px 6px;"><i class="fa fa-file-text-o"></i> ${this._order_id_html(row)}</div>
+                    <div class="alert alert-danger" style="font-size:12px;padding:6px 8px;margin:0 8px 6px;">
+                        <i class="fa fa-reply"></i> ${__("Return this order to the hub. The warehouse will scan it back in.")}</div>
+                </div>`).join("");
+        }
+
         if (m.status === "Assigned" && !m.driver_accepted_at) {
             // Per-Stock-Entry decision cards here too — same reasoning as
             // the in-trip pending-decision cards (_render_leg_decision_card).
@@ -631,7 +698,7 @@ class DeliveryApp {
                 to_warehouse: m.destination_warehouse,
                 delivery_captured_at: null,
             }];
-            return rows.map((row) => this._render_leg_deliver_card(m, row, m.trip)).join("");
+            return rows.map((row) => this._render_leg_deliver_card(m, row, m.trip, true)).join("");
         }
 
         let actions = "";
@@ -841,7 +908,7 @@ class DeliveryApp {
 
         // Action buttons — carrier-grade three-stage contract:
         //   Assigned   → Start Pickup | Reject Pickup | Reject Other Assigns
-        //   In Transit → Complete Delivery | Reject Delivery (mid-trip)
+        //   In Transit → Complete Delivery
         //   Delivered  → (read-only, waiting on receiver to accept)
         let action_html = "";
         if (d.status === "Assigned") {
@@ -883,9 +950,6 @@ class DeliveryApp {
                         title="${__("Tap Reached Location first")}">
                     <i class="fa fa-lock"></i> ${__("Complete Delivery")}
                 </button>
-                <button id="da-reject-btn" class="btn btn-danger btn-sm btn-block da-action-btn">
-                    <i class="fa fa-exclamation-triangle"></i> ${__("Failed Delivery (mid-trip)")}
-                </button>
                 ${break_hint}`;
             } else {
                 let arrived_at = frappe.datetime.str_to_user(d.arrival_datetime);
@@ -894,9 +958,6 @@ class DeliveryApp {
                 </div>
                 <button id="da-deliver-btn" class="btn btn-success btn-lg btn-block da-action-btn" ${on_break ? `disabled title="${__("End your break to continue")}"` : ""}>
                     <i class="fa fa-check-circle"></i> ${__("Complete Delivery")}
-                </button>
-                <button id="da-reject-btn" class="btn btn-danger btn-sm btn-block da-action-btn">
-                    <i class="fa fa-exclamation-triangle"></i> ${__("Failed Delivery (mid-trip)")}
                 </button>
                 ${break_hint}`;
             }
@@ -1340,6 +1401,7 @@ class DeliveryApp {
             "Receiver Refused",
             "Damaged in Transit",
             "Vehicle Breakdown",
+            "Store Closed",
             "Other",
         ] : [
             "Material Not Ready",
@@ -1355,6 +1417,13 @@ class DeliveryApp {
         // whole-manifest rejection lifecycle runs on that split-off copy.
         // Leaving it unset keeps today's whole-manifest reject behavior.
         const stock_entry = opts.stock_entry || this.active_stock_entry || null;
+        // Keep our own copy: a board action must not leave a manifest
+        // "active", or load_data() stops redrawing the board.
+        const manifest_name = this.active_manifest;
+        if (opts.from_board) {
+            this.active_manifest = null;
+            this.active_stock_entry = null;
+        }
         if (stock_entry) {
             title = __("{0} — {1}", [title, stock_entry]);
         }
@@ -1390,32 +1459,44 @@ class DeliveryApp {
             primary_action: (values) => {
                 d.hide();
                 const args = {
-                    manifest: this.active_manifest,
+                    manifest: manifest_name,
                     rejection_reason: values.rejection_reason,
                     rejection_photo: values.rejection_photo,
                     rejection_photo_2: values.rejection_photo_2,
                     rejection_notes: values.rejection_notes,
                 };
                 if (stock_entry) args.stock_entry = stock_entry;
-                frappe.call({
+                // Location goes with every rejection; a store-closed one is
+                // checked against the store's geofence on the server.
+                const send = (gps) => {
+                    if (gps && gps.lat != null) {
+                        args.latitude = gps.lat;
+                        args.longitude = gps.lng;
+                    }
+                    frappe.call({
                     method: API + (stock_entry ? "reject_manifest_leg" : "reject_manifest"),
                     args,
                     callback: () => {
                         frappe.show_alert({
                             message: in_transit
-                                ? __("Failed delivery logged. Dispatch notified; goods will be returned to source.")
+                                ? __("Return to warehouse (RTO): bring the goods back. Dispatch notified.")
                                 : __("Shipment rejected. Dispatcher notified."),
                             indicator: "orange",
                         });
                         this.active_stock_entry = null;
-                        if (opts.from_trip && this.active_trip) {
+                        if (opts.from_board) {
+                            this._drop_board_card(stock_entry);
+                            // Rejected from a board card: stay on the board.
+                        } else if (opts.from_trip && this.active_trip) {
                             this.show_trip_detail(this.active_trip);
                         } else {
-                            this.show_manifest_detail(this.active_manifest);
+                            this.show_manifest_detail(manifest_name);
                         }
                         this.load_data();
                     },
                 });
+                };
+                this._capture_gps_promise(true).then(send, () => send(null));
             },
         });
         d.show();
@@ -1558,7 +1639,7 @@ class DeliveryApp {
             });
             return;
         }
-        navigator.geolocation.getCurrentPosition(
+        this._get_position(
             // accuracy is passed through so the server can widen the geofence
             // by the fix's own margin of error instead of trusting it blindly.
             (pos) => callback(pos.coords.latitude, pos.coords.longitude, pos.coords.accuracy),
@@ -1569,6 +1650,26 @@ class DeliveryApp {
                     message: __("Could not capture driver location ({0}). Enable Location on the device and retry.",
                                 [(err && err.message) || __("permission denied")]),
                 });
+            }
+        );
+    }
+
+    _get_position(on_success, on_error) {
+        // A precise fix first. Devices without a GPS chip (laptops, some
+        // tablets) often time out on it, so on timeout / no position retry
+        // once with network location and a recent cached reading. A denied
+        // permission is not retried.
+        navigator.geolocation.getCurrentPosition(
+            on_success,
+            (err) => {
+                if (err && err.code === err.PERMISSION_DENIED) {
+                    on_error(err);
+                    return;
+                }
+                navigator.geolocation.getCurrentPosition(
+                    on_success, on_error,
+                    { enableHighAccuracy: false, timeout: 20000, maximumAge: 60000 }
+                );
             },
             { enableHighAccuracy: true, timeout: 8000, maximumAge: 0 }
         );
@@ -2243,6 +2344,8 @@ class DeliveryApp {
                             label: __("Scan Manifest QR"), reqd: 1,
                         },
                     ],
+                    secondary_action_label: __("Reject"),
+                    secondary_action: () => this._reject_from_accept(d, manifest, stock_entry, in_trip_view),
                     primary_action_label: __("Confirm & Accept"),
                     primary_action: (values) => {
                         const photos = this._photo_picker_urls(d);
@@ -2308,6 +2411,8 @@ class DeliveryApp {
                     options: `<div class="da-box-scan-list">${box_labels.map(box_row_html).join("")}</div>`,
                 },
             ],
+            secondary_action_label: __("Reject"),
+            secondary_action: () => this._reject_from_accept(d, manifest, stock_entry, in_trip_view),
             primary_action_label: __("Confirm & Accept"),
             primary_action: (values) => {
                 const photos = this._photo_picker_urls(d);
@@ -2403,8 +2508,9 @@ class DeliveryApp {
         }).then(() => {
             frappe.dom.unfreeze();
             frappe.show_alert({ message: __("Shipment accepted"), indicator: "green" });
+            if (!in_trip_view) this._drop_board_card(stock_entry);
+            this.load_data();
             this._trip_pickups_remaining(trip).then((remaining) => {
-                this.load_data();
                 // Only a confirmed 0 (not null — unknown trip, or the
                 // re-check itself failed) is grounds to navigate away.
                 if (remaining === 0) {
@@ -2455,7 +2561,7 @@ class DeliveryApp {
     // proves nothing and gives the OTP nowhere to go; a store with nobody on
     // its roster falls back to free text so a delivery is never blocked by
     // missing master data.
-    _receiver_fields(manifest, receivers, stock_entry) {
+    _receiver_fields(manifest, receivers, stock_entry, stock_entries = null) {
         receivers = receivers || [];
         if (!receivers.length) {
             return [{
@@ -2464,7 +2570,7 @@ class DeliveryApp {
                 description: __("No POS Executive is on file for this store."),
             }, {
                 fieldname: "send_otp", fieldtype: "Button", label: __("Send OTP"),
-                click: () => this._send_receiver_otp(manifest, null, stock_entry),
+                click: () => this._send_receiver_otp(manifest, null, stock_entry, stock_entries),
             }];
         }
         return [{
@@ -2485,7 +2591,7 @@ class DeliveryApp {
                         [match.executive_name]));
                     return;
                 }
-                this._send_receiver_otp(manifest, match.name, stock_entry);
+                this._send_receiver_otp(manifest, match.name, stock_entry, stock_entries);
             },
         }];
     }
@@ -2536,10 +2642,197 @@ class DeliveryApp {
 
     // stock_entry, when the dialog is delivering one shipment of several, so
     // the notice names that shipment's Delivery Challan and no other.
-    _send_receiver_otp(manifest, receiver, stock_entry) {
+    _drop_board_card(stock_entry) {
+        // Take the handled order off the board at once; load_data() then
+        // redraws with what the server says.
+        if (!stock_entry) return;
+        this.$body.find(`[data-stock-entry="${CSS.escape(stock_entry)}"]`).closest(".da-stop-card").remove();
+    }
+
+    _render_handover_card(m, row) {
+        // An order this driver is handing over. Another driver: they come and
+        // collect it (nothing to do here). Outside transport: this driver
+        // records the hand-over with photo, label scan and location.
+        const esc = frappe.utils.escape_html;
+        const se = esc(row.stock_entry || "");
+        const to_label = window.ch_wh_label_html ? ch_wh_label_html(row.to_warehouse, "—") : esc(row.to_warehouse || "—");
+        const carrier = row.handover_carrier;
+        const note = carrier
+            ? __("Hand this order to {0}{1}.", [esc(carrier), row.handover_tracking ? ` (${__("tracking")} ${esc(row.handover_tracking)})` : ""])
+            : __("{0} is coming to pick this order up from you.", [esc(m.driver_name || __("Another driver"))]);
+        const action = carrier
+            ? `<button class="btn btn-warning btn-sm btn-block da-handover-btn" data-kind="carrier" data-manifest="${esc(m.name)}" data-stock-entry="${se}"><i class="fa fa-handshake-o"></i> ${__("Hand over")}</button>`
+            : `<span class="da-card-status"><i class="fa fa-clock-o"></i> ${__("Waiting for pickup")}</span>`;
+        return `
+            <div class="da-stop-card">
+                <div class="da-stop-where"><i class="fa fa-map-marker"></i> ${to_label}</div>
+                <div class="text-muted" style="font-size:11px;padding:0 8px 6px;"><i class="fa fa-file-text-o"></i> ${this._order_id_html(row)}</div>
+                <div class="alert alert-info" style="font-size:12px;padding:6px 8px;margin:0 8px 6px;"><i class="fa fa-exchange"></i> ${note}</div>
+                <div class="da-stop-actions">${action}</div>
+            </div>`;
+    }
+
+    _open_handover_dialog(kind, manifest, stock_entry) {
+        // kind "collect": new driver takes it; "carrier": old driver gives it to transport.
+        frappe.dom.freeze(__("Capturing location…"));
+        this._capture_gps_promise(true).then((gps) => {
+            frappe.dom.unfreeze();
+            const d = new frappe.ui.Dialog({
+                title: kind === "collect" ? __("Pick up — {0}", [this._order_id(stock_entry)])
+                                          : __("Hand over — {0}", [this._order_id(stock_entry)]),
+                size: "small",
+                fields: [
+                    ...this._gps_display_fields(gps),
+                    ...this._photo_picker_fields(__("Photos of Hand-over")),
+                    { fieldname: "scanned_qr", fieldtype: "Data", options: "Barcode", reqd: 1,
+                      label: __("Scan box label"),
+                      description: __("Several boxes? Separate labels with commas.") },
+                ],
+                primary_action_label: kind === "collect" ? __("Confirm Pick up") : __("Confirm Hand over"),
+                primary_action: (values) => {
+                    const photos = this._photo_picker_urls(d);
+                    if (!photos.length) {
+                        frappe.show_alert({ message: __("Take at least one photo."), indicator: "red" });
+                        return;
+                    }
+                    const scans = String(values.scanned_qr || "").split(/[\s,]+/).filter(Boolean);
+                    d.hide();
+                    const photo_arg = kind === "collect"
+                        ? { pickup_photo: photos[0], pickup_photos: JSON.stringify(photos) }
+                        : { handover_photo: photos[0], handover_photos: JSON.stringify(photos) };
+                    frappe.dom.freeze(__("Saving…"));
+                    this._call_promise(API + (kind === "collect" ? "driver_accept_handover" : "driver_handover_to_carrier"), {
+                        manifest, stock_entry, scanned_qrs: JSON.stringify(scans),
+                        lat: gps.lat, lng: gps.lng, gps_accuracy_m: gps.accuracy, ...photo_arg,
+                    }).then(() => {
+                        frappe.dom.unfreeze();
+                        frappe.show_alert({ message: kind === "collect" ? __("Order picked up") : __("Order handed over"), indicator: "green" });
+                        this._drop_board_card(stock_entry);
+                        this.load_data();
+                    }).catch(() => frappe.dom.unfreeze());
+                },
+            });
+            d.show();
+            this._bind_photo_picker(d);
+        }).catch(() => frappe.dom.unfreeze());
+    }
+
+    _open_nearby_store_dialog(manifest, stock_entry) {
+        // Leave the order with a nearby store: its person confirms with an OTP.
+        frappe.dom.freeze(__("Capturing location…"));
+        this._capture_gps_promise(true).then((gps) => {
+            frappe.dom.unfreeze();
+            let receivers = [];
+            const d = new frappe.ui.Dialog({
+                title: __("Drop at nearby store — {0}", [this._order_id(stock_entry)]),
+                size: "small",
+                fields: [
+                    ...this._gps_display_fields(gps),
+                    { fieldname: "store", fieldtype: "Link", options: "CH Store", label: __("Nearby store"), reqd: 1,
+                      onchange: () => {
+                          const store = d.get_value("store");
+                          if (!store) return;
+                          this._call_promise(API + "delivery_receivers", { manifest, stock_entry, store }).then((r) => {
+                              receivers = r || [];
+                              d.set_df_property("receiver", "options", [""].concat(receivers.map((x) => x.executive_name)));
+                          });
+                      } },
+                    { fieldname: "receiver", fieldtype: "Select", label: __("Person taking it"), reqd: 1, options: [""] },
+                    { fieldname: "send_otp", fieldtype: "Button", label: __("Send OTP"), click: () => {
+                          const match = receivers.find((x) => x.executive_name === d.get_value("receiver"));
+                          if (!match) { frappe.msgprint(__("Choose the store and who is taking it first.")); return; }
+                          this._call_promise(API + "request_nearby_store_otp",
+                              { manifest, stock_entry, store: d.get_value("store"), receiver: match.name }).then((info) => {
+                              const to = [].concat(info?.masked_emails || [], info?.masked_mobiles || []);
+                              frappe.show_alert({ message: to.length ? __("OTP sent to {0}", [to.join(", ")]) : __("OTP generated — ask the person"), indicator: "green" });
+                          });
+                      } },
+                    { fieldname: "otp", fieldtype: "Data", label: __("OTP from the store"), reqd: 1 },
+                    ...this._photo_picker_fields(__("Photos at the store")),
+                    { fieldname: "scanned_qr", fieldtype: "Data", options: "Barcode", reqd: 1, label: __("Scan box label"),
+                      description: __("Several boxes? Separate labels with commas.") },
+                ],
+                primary_action_label: __("Submit"),
+                primary_action: (values) => {
+                    const photos = this._photo_picker_urls(d);
+                    if (!photos.length) { frappe.show_alert({ message: __("Take at least one photo."), indicator: "red" }); return; }
+                    const match = receivers.find((x) => x.executive_name === values.receiver);
+                    frappe.dom.freeze(__("Saving…"));
+                    this._call_promise(API + "driver_drop_at_nearby_store", {
+                        manifest, stock_entry, store: values.store, receiver: match && match.name, otp: values.otp,
+                        photo: photos[0], scanned_qrs: JSON.stringify(String(values.scanned_qr || "").split(/[\s,]+/).filter(Boolean)),
+                        lat: gps.lat, lng: gps.lng, gps_accuracy_m: gps.accuracy,
+                    }).then((r) => {
+                        frappe.dom.unfreeze();
+                        if (r && r.ok === false) { frappe.msgprint({ title: __("OTP"), indicator: "red", message: r.message }); return; }
+                        d.hide();
+                        frappe.show_alert({ message: __("Order left at {0} — on hold until dispatch assigns a driver.", [values.store]), indicator: "green" });
+                        this._drop_board_card(stock_entry);
+                        this.load_data();
+                    }).catch(() => frappe.dom.unfreeze());
+                },
+            });
+            d.show();
+            this._bind_photo_picker(d);
+        }).catch(() => frappe.dom.unfreeze());
+    }
+
+    _reject_from_accept(dialog, manifest, stock_entry, in_trip_view) {
+        dialog.hide();
+        this.active_manifest = manifest;
+        this.active_stock_entry = stock_entry;
+        this.do_reject(in_trip_view ? { from_trip: true, stock_entry } : { from_board: true, stock_entry });
+    }
+
+    _open_delivery_exception_dialog(manifest, stock_entry, trip) {
+        // Transfer (hand over to another driver), Hold (deliver later) or
+        // drop at a nearby store. Hold/Transfer wait on dispatch as trip exceptions.
+        const d = new frappe.ui.Dialog({
+            title: __("Transfer / Hold — {0}", [this._order_id(stock_entry)]),
+            size: "small",
+            fields: [
+                { fieldname: "action", fieldtype: "Select", label: __("Type"), reqd: 1,
+                  options: ["Transfer", "Hold", "Drop at nearby store"].join("\n"), default: "Transfer",
+                  description: __("Transfer: hand over to another driver · Hold: deliver later · Drop at nearby store: leave it with a store (OTP)") },
+                { fieldname: "reason", fieldtype: "Data", label: __("Reason"),
+                  depends_on: "eval:doc.action !== 'Drop at nearby store'", mandatory_depends_on: "eval:doc.action !== 'Drop at nearby store'" },
+                { fieldname: "photo", fieldtype: "Attach Image", label: __("Photo"),
+                  depends_on: "eval:doc.action !== 'Drop at nearby store'", mandatory_depends_on: "eval:doc.action !== 'Drop at nearby store'" },
+                { fieldname: "notes", fieldtype: "Small Text", label: __("Notes"),
+                  depends_on: "eval:doc.action !== 'Drop at nearby store'" },
+            ],
+            primary_action_label: __("Submit"),
+            primary_action: (values) => {
+                d.hide();
+                if (values.action === "Drop at nearby store") {
+                    this._open_nearby_store_dialog(manifest, stock_entry);
+                    return;
+                }
+                const remarks = `${this._order_id(stock_entry)} · ${stock_entry} · ${manifest}: ${values.reason}`
+                    + (values.notes ? ` — ${values.notes}` : "");
+                frappe.call({
+                    method: TRIP_API + "exception_raise",
+                    args: { trip: trip || null, exception_type: values.action,
+                            severity: values.action === "Transfer" ? "High" : "Medium",
+                            remarks, photo: values.photo, manifest, stock_entry },
+                    freeze: true,
+                    callback: () => {
+                        frappe.show_alert({ message: __("{0} request sent to dispatch.", [__(values.action)]), indicator: "orange" });
+                        this.load_data();
+                    },
+                });
+            },
+        });
+        d.show();
+    }
+
+    _send_receiver_otp(manifest, receiver, stock_entry, stock_entries = null) {
         const dialog = cur_dialog;
         frappe.dom.freeze(__("Sending OTP…"));
-        this._call_promise(API + "request_delivery_otp", { manifest, receiver, stock_entry })
+        const args = { manifest, receiver, stock_entry };
+        // Ticked orders for one store share the one code.
+        if (stock_entries && stock_entries.length > 1) args.stock_entries = JSON.stringify(stock_entries);
+        this._call_promise(API + "request_delivery_otp", args)
             .then((info) => {
                 frappe.dom.unfreeze();
                 const to = [].concat(info?.masked_emails || [], info?.masked_mobiles || []);
@@ -2555,6 +2848,75 @@ class DeliveryApp {
                 frappe.dom.unfreeze();
                 frappe.show_alert({ message: __("Could not send the OTP"), indicator: "red" });
             });
+    }
+
+    _open_store_group_deliver_dialog(manifest, stock_entry, group) {
+        // Same evidence as a single order (photos, receiver, GPS) plus every
+        // order's own label scan; one OTP for the lot.
+        frappe.dom.freeze(__("Capturing location…"));
+        Promise.all([
+            this._capture_gps_promise(true),
+            this._call_promise(API + "delivery_receivers", { manifest, stock_entry }).catch(() => []),
+        ]).then(([gps, receivers]) => {
+            frappe.dom.unfreeze();
+            const scan_fields = group.map((g, i) => ({
+                fieldname: `scan_${i}`, fieldtype: "Data", options: "Barcode", reqd: 1,
+                label: __("Scan label — {0}", [this._order_id(g.stock_entry)]),
+                description: __("Several boxes? Separate labels with commas."),
+            }));
+            const d = new frappe.ui.Dialog({
+                title: __("Deliver {0} orders — one OTP", [group.length]),
+                size: "small",
+                fields: [
+                    ...this._gps_display_fields(gps),
+                    ...this._photo_picker_fields(__("Photos of Delivery")),
+                    ...scan_fields,
+                    ...this._receiver_fields(manifest, receivers, stock_entry, group.map((g) => g.stock_entry)),
+                    {
+                        fieldname: "otp", fieldtype: "Data", label: __("Delivery OTP"), reqd: 1,
+                        description: __("Tap Send OTP: one code goes to the store for all these orders."),
+                    },
+                ],
+                primary_action_label: __("Confirm & Deliver All"),
+                primary_action: (values) => {
+                    const receiver_name = this._receiver_label(receivers, values);
+                    if (!receiver_name) {
+                        frappe.msgprint(__("Name who is taking the delivery."));
+                        return;
+                    }
+                    const photos = this._photo_picker_urls(d);
+                    if (!photos.length) {
+                        frappe.show_alert({ message: __("Take at least one photo of the delivery."), indicator: "red" });
+                        return;
+                    }
+                    const scans = group.flatMap((g, i) =>
+                        String(values[`scan_${i}`] || "").split(/[\s,]+/).filter(Boolean));
+                    d.hide();
+                    frappe.dom.freeze(__("Delivering…"));
+                    this._call_promise(API + "driver_complete_store_delivery", {
+                        manifest, stock_entry, receiver_name, otp: values.otp,
+                        stock_entries: JSON.stringify(group.map((g) => g.stock_entry)),
+                        scanned_qrs: JSON.stringify(scans),
+                        delivery_photo: photos[0], delivery_photos: JSON.stringify(photos),
+                        lat: gps.lat, lng: gps.lng, gps_accuracy_m: gps.accuracy,
+                        no_location_reason: gps.no_location_reason,
+                    }).then((r) => {
+                        frappe.dom.unfreeze();
+                        if (r && r.ok === false) {
+                            frappe.msgprint({ title: __("OTP"), indicator: "red", message: r.message });
+                            return;
+                        }
+                        frappe.show_alert({
+                            message: __("{0} orders delivered", [((r && r.delivered) || []).length]),
+                            indicator: "green",
+                        });
+                        this.load_data();
+                    }).catch(() => frappe.dom.unfreeze());
+                },
+            });
+            d.show();
+            this._bind_photo_picker(d);
+        }).catch(() => frappe.dom.unfreeze());
     }
 
     _open_leg_deliver_dialog(manifest, stock_entry, trip, in_trip_view, otp_info, receivers) {
@@ -2829,7 +3191,7 @@ class DeliveryApp {
                     : (m.status === "Delivered"
                         ? `<span class="da-awaiting-pill text-muted" style="font-size:11px;" title="${__("The destination store must Scan & Receive this shipment")}"><i class="fa fa-clock-o"></i> ${__("Awaiting receipt")}</span>`
                         : "")}
-                ${["Assigned", "Pickup Started", "In Transit"].includes(m.status)
+                ${["Assigned", "Pickup Started"].includes(m.status)
                     ? `<button class="btn btn-xs btn-danger da-stop-manifest-reject-btn" data-name="${frappe.utils.escape_html(m.name)}"><i class="fa fa-ban"></i> ${__("Reject")}</button>`
                     : ""}
             </div>${proof_line(m)}`).join("");
@@ -2968,9 +3330,14 @@ class DeliveryApp {
             ? `disabled title="${__("End your break to accept shipments")}"`
             : "";
         const trip_attr = frappe.utils.escape_html(trip || m.trip || "");
-        const actions = row.driver_accepted_at
+        const collect_from = row.held_at_store || row.handover_from_name || "";
+        const handover_btn = !row.driver_accepted_at && (row.handover_from || row.held_at_store) && !row.handover_carrier
+            ? `<button class="btn btn-success btn-sm btn-block da-handover-btn" data-kind="collect" data-manifest="${frappe.utils.escape_html(m.name)}" data-stock-entry="${se}"><i class="fa fa-handshake-o"></i> ${__("Pick up from {0}", [frappe.utils.escape_html(collect_from)])}</button>`
+            : "";
+        const actions = handover_btn || (row.driver_accepted_at || m.status === "In Transit"
             ? `<span class="da-card-status da-status-completed"><i class="fa fa-check-circle"></i> ${__("Accepted")}</span>`
-            : `<button class="btn btn-success btn-sm da-leg-accept-btn" data-manifest="${frappe.utils.escape_html(m.name)}" data-stock-entry="${se}" data-trip="${trip_attr}" ${accept_disabled}><i class="fa fa-check"></i> ${__("Accept Shipment")}</button>`;
+            : `<button class="btn btn-success btn-sm da-leg-accept-btn" data-manifest="${frappe.utils.escape_html(m.name)}" data-stock-entry="${se}" data-trip="${trip_attr}" ${accept_disabled}><i class="fa fa-check"></i> ${__("Accept Shipment")}</button>
+               <button class="btn btn-danger btn-sm da-leg-reject-btn" data-manifest="${frappe.utils.escape_html(m.name)}" data-stock-entry="${se}"><i class="fa fa-ban"></i> ${__("Reject")}</button>`);
         return `
             <div class="da-stop-card da-manifest-merged-card">
                 <div class="da-stop-where">
@@ -2981,6 +3348,12 @@ class DeliveryApp {
                 <div class="text-muted" style="font-size:11px;padding:0 8px 6px;">
                     <i class="fa fa-file-text-o"></i> ${this._order_id_html(row)}
                 </div>
+                ${handover_btn ? `<div class="alert alert-info" style="font-size:12px;padding:6px 8px;margin:0 8px 6px;">
+                    <i class="fa fa-exchange"></i> ${row.held_at_store
+                        ? __("Collect this order from store {0} (not from the hub), then deliver it to its destination.", [frappe.utils.escape_html(row.held_at_store)])
+                        : __("Collect this order from driver {0} (not from the hub).", [frappe.utils.escape_html(row.handover_from_name || "")])}</div>` : ""}
+                ${m.dispatch_note ? `<div class="alert alert-warning" style="font-size:12px;padding:6px 8px;margin:0 8px 6px;">
+                    <i class="fa fa-comment"></i> <b>${__("Dispatch")}:</b> ${frappe.utils.escape_html(m.dispatch_note)}</div>` : ""}
                 <div class="da-stop-actions">${actions}</div>
             </div>`;
     }
@@ -3932,7 +4305,7 @@ class DeliveryApp {
                 ).then(resolve, reject);
                 return;
             }
-            navigator.geolocation.getCurrentPosition(
+            this._get_position(
                 (pos) => resolve({ lat: pos.coords.latitude, lng: pos.coords.longitude, accuracy: pos.coords.accuracy }),
                 (err) => {
                     give_up(
@@ -3940,8 +4313,7 @@ class DeliveryApp {
                             [(err && err.message) || __("permission denied")]),
                         err || new Error("geolocation denied"), may_waive
                     ).then(resolve, reject);
-                },
-                { enableHighAccuracy: true, timeout: 8000, maximumAge: 0 }
+                }
             );
         });
     }

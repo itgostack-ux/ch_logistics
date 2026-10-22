@@ -108,6 +108,10 @@ def trip_set_manual_status(trip, status):
     doc = frappe.get_doc("CH Logistics Trip", trip)
     if (doc.get("transport_mode") or "Own") == "Own":
         frappe.throw(_("An Own trip moves through the driver app, not by hand."))
+    if status == "Delivered":
+        # Delivered hands stock to the store; it goes stop by stop with each
+        # store's OTP through trip_deliver_stop.
+        frappe.throw(_("Deliver a courier trip stop by stop with the store's code."))
     doc.check_permission("write")
     doc.status = status
     doc.save()
@@ -234,9 +238,11 @@ def trip_request_stop_otp(trip, sequence, receiver=None) -> dict:
     store = _stop_store(stop, entry)
 
     from ch_logistics.api.transfer_manifest_api import (
-        _send_delivery_otp, mask_email, mask_mobile,
+        _send_delivery_otp, assert_otp_not_locked, mask_email, mask_mobile,
     )
 
+    for row in entry["rows"]:
+        assert_otp_not_locked(row.name)
     plaintext = str(secrets.randbelow(900000) + 100000)
     for row in entry["rows"]:
         mf = frappe.get_doc("CH Transfer Manifest", row.name)
@@ -343,6 +349,7 @@ def trip_deliver_stop(trip, sequence, otp=None, delivered_at=None,
     if not doc.get("actual_end"):
         doc.actual_end = delivered
     doc.status = "Delivered"
+    doc.flags.lifecycle_action = True
     doc.save()
     return {"ok": True, "trip": doc.name, "sequence": cint(stop.sequence),
             "status": doc.status, "delivered_at": str(delivered), "pending": [],
@@ -1010,6 +1017,19 @@ def get_stock_entry_box_labels(stock_entry) -> list:
     scan (see driver_accept_manifest_row's multi-box validation), or just
     one/none, in which case the existing single-scan flow is unchanged.
     """
+    # Labels are the pickup-scan payload: only the driver carrying this
+    # shipment, ops, or someone who may read the Stock Entry gets them.
+    driver = _resolve_current_driver()
+    carries_it = bool(driver) and bool(frappe.db.sql(
+        """SELECT 1 FROM `tabCH Transfer Manifest Item` i
+           JOIN `tabCH Transfer Manifest` m ON m.name = i.parent
+           WHERE i.stock_entry = %s AND m.driver = %s AND m.docstatus < 2 LIMIT 1""",
+        (stock_entry, driver),
+    ))
+    if not (carries_it or role_registry.user_has("ops_view")
+            or frappe.has_permission("Stock Entry", "read", doc=stock_entry)):
+        frappe.throw(_("You are not allowed to see this shipment's box labels."),
+                     frappe.PermissionError)
     return [
         b for b in frappe.get_all(
             "CH Stock Entry Package", filters={"parent": stock_entry}, pluck="package_label"
@@ -2074,8 +2094,11 @@ def dynamic_insert_stop(trip, manifest=None, store=None, warehouse=None, stop_ty
 # Exceptions
 # ---------------------------------------------------------------------------
 @frappe.whitelist(methods=["POST"])
-def exception_raise(trip, exception_type, severity="Medium", stop_sequence=None,
-                    remarks=None, photo=None):
+def exception_raise(trip=None, exception_type=None, severity="Medium", stop_sequence=None,
+                    remarks=None, photo=None, manifest=None, stock_entry=None):
+    if not trip:
+        # An order handed over or collected from a store is no longer on a trip.
+        return _raise_order_exception(exception_type, severity, remarks, photo, manifest, stock_entry)
     doc = get_locked_trip(trip)
     doc.check_permission("write")
     from ch_logistics.api.driver_resolver import assert_trip_driver_access
@@ -2089,14 +2112,82 @@ def exception_raise(trip, exception_type, severity="Medium", stop_sequence=None,
         "remarks": remarks,
         "photo": photo,
         "resolution_status": "Open",
+        # Which order a Hold / Transfer is about, so dispatch can act on it.
+        "manifest": manifest,
+        "stock_entry": stock_entry,
     })
     # If severity High/Critical, mark the corresponding stop as Exception
     if severity in ("High", "Critical") and stop_sequence:
         for s in doc.stops:
             if s.sequence == cint(stop_sequence):
                 s.status = "Exception"
+                doc.flags.lifecycle_action = True
                 break
     doc.save()
+    return True
+
+
+def _order_exception_trip(manifest, stock_entry, driver=None):
+    """The trip that last carried an order, to file its requests on."""
+    trip = frappe.db.get_value("CH Transfer Manifest", manifest, "trip")
+    if trip:
+        return trip
+    rows = frappe.db.sql(
+        """SELECT parent FROM `tabCH Logistics Exception`
+            WHERE parenttype = 'CH Logistics Trip' AND stock_entry = %s
+            ORDER BY occurred_at DESC LIMIT 1""",
+        stock_entry,
+    )
+    if rows:
+        return rows[0][0]
+    if driver:
+        return frappe.db.get_value(
+            "CH Logistics Trip", {"driver": driver, "status": ["!=", "Cancelled"]}, "name",
+            order_by="modified desc",
+        )
+    return None
+
+
+def add_order_exception(trip, exception_type, remarks, manifest, stock_entry,
+                        resolution_status="Open", severity="Medium", photo=None):
+    """File a row on ``trip`` for an order its driver is no longer carrying.
+
+    Server-authored: the caller has already checked who may act on the order,
+    so this skips the trip's own driver guard.
+    """
+    idx = cint(frappe.db.sql(
+        "SELECT MAX(idx) FROM `tabCH Logistics Exception` WHERE parent = %s AND parenttype = 'CH Logistics Trip'",
+        trip,
+    )[0][0]) + 1
+    now = now_datetime()
+    frappe.get_doc({
+        "doctype": "CH Logistics Exception",
+        "parent": trip, "parenttype": "CH Logistics Trip", "parentfield": "exceptions", "idx": idx,
+        "occurred_at": now, "exception_type": exception_type, "severity": severity,
+        "remarks": (remarks or "")[:1000], "photo": photo, "resolution_status": resolution_status,
+        "resolved_at": now if resolution_status == "Resolved" else None,
+        "manifest": manifest, "stock_entry": stock_entry,
+    }).db_insert()
+
+
+def _raise_order_exception(exception_type, severity, remarks, photo, manifest, stock_entry):
+    from ch_logistics.api.driver_resolver import assert_manifest_driver_access, resolve_current_driver
+
+    if exception_type not in ("Hold", "Transfer"):
+        frappe.throw(_("This shipment is not on a trip."))
+    if not (manifest and stock_entry):
+        frappe.throw(_("Name the order this request is about."))
+    mf = frappe.get_doc("CH Transfer Manifest", manifest)
+    mf.check_permission("read")
+    assert_manifest_driver_access(mf)
+    row = next((r for r in mf.transfers if r.stock_entry == stock_entry), None)
+    if not row or not (row.driver_accepted_at or mf.status == "In Transit") or row.delivery_captured_at:
+        frappe.throw(_("Order {0} is not with you.").format(stock_entry))
+    trip = _order_exception_trip(manifest, stock_entry, resolve_current_driver(throw=False))
+    if not trip:
+        frappe.throw(_("Dispatch cannot be reached from this order. Call your manager."))
+    add_order_exception(trip, exception_type, remarks, manifest, stock_entry,
+                        severity=severity or "Medium", photo=photo)
     return True
 
 
@@ -2125,6 +2216,7 @@ def stop_arrive(trip, sequence, gps_lat=None, gps_lng=None):
             break
     if not matched:
         frappe.throw(_("Stop sequence {0} not found on trip {1}").format(sequence, trip))
+    doc.flags.lifecycle_action = True
     doc.save()
     return True
 
@@ -2166,6 +2258,7 @@ def stop_complete(trip, sequence, scan_compliance_pct=None, override_exceptions=
             break
     if not matched:
         frappe.throw(_("Stop sequence {0} not found on trip {1}").format(sequence, trip))
+    doc.flags.lifecycle_action = True
     doc.save()
     return True
 
@@ -3048,7 +3141,7 @@ def ops_unassigned_manifests(direction=None, hub=None, limit=100):
 
 
 @frappe.whitelist()
-def ops_recall_inbox(limit=100):
+def ops_recall_inbox(limit=100, kind=None, company=None):
     """In-flight transfer recalls awaiting physical return + stock reversal.
 
     Mirrors the "Returns Cockpit" pattern from SAP TM / Oracle TM /
@@ -3066,7 +3159,7 @@ def ops_recall_inbox(limit=100):
         "total_stock_entries", "total_items", "total_qty",
         "recall_reason", "recall_notes",
         "recall_initiated_by", "recall_initiated_at",
-        "creation",
+        "rejection_reason", "creation",
     ]
     if has_trip:
         fields.append("trip")
@@ -3079,11 +3172,21 @@ def ops_recall_inbox(limit=100):
         prefix="ops_recall",
     )
     select_fields = ", ".join(f"`{field}`" for field in fields)
+    # RTO = the driver turned it back in transit (a rejection is recorded);
+    # recall = dispatch pulled it back.
+    kind_clause = {
+        "rto": "AND IFNULL(rejection_reason, '') != ''",
+        "recall": "AND IFNULL(rejection_reason, '') = ''",
+    }.get(kind or "", "")
+    if company:
+        # Same company filter the other Operations tabs follow.
+        kind_clause += " AND company = %(company)s"
+        scope_params["company"] = company
     rows = frappe.db.sql(
         f"""
         SELECT {select_fields}
         FROM `tabCH Transfer Manifest`
-        WHERE status = 'Recall Initiated' AND {scope_clause}
+        WHERE status = 'Recall Initiated' AND {scope_clause} {kind_clause}
         ORDER BY recall_initiated_at DESC, modified DESC
         LIMIT %(limit)s
         """,
@@ -3591,8 +3694,12 @@ def ops_packing_queue(limit=100):
 
 
 @frappe.whitelist()
-def ops_exception_inbox(resolution_status="Open", limit=100):
-    """Open exceptions across all trips, newest first."""
+def ops_exception_inbox(resolution_status="Open", limit=100, exception_type=None, company=None):
+    """Open exceptions across all trips, newest first.
+
+    ``exception_type`` narrows it to one kind, e.g. the Hold / Transfer
+    requests drivers raise from the Delivery App.
+    """
     _require_ops()
     rs = resolution_status or "Open"
     scope_clause, scope_params = scope_guard.build_scope_sql(
@@ -3605,11 +3712,14 @@ def ops_exception_inbox(resolution_status="Open", limit=100):
         SELECT e.name AS row_name, e.parent AS trip, e.idx, e.occurred_at,
                e.exception_type, e.severity, e.stop_sequence,
                e.remarks, e.photo, e.resolution_status, e.escalated_to,
-               t.driver, t.driver_name, t.hub_warehouse, t.status AS trip_status
+               e.manifest, e.stock_entry,
+               t.driver, t.driver_name, t.vehicle, t.hub_warehouse, t.status AS trip_status
         FROM `tabCH Logistics Exception` e
         INNER JOIN `tabCH Logistics Trip` t ON t.name = e.parent
         WHERE e.parenttype = 'CH Logistics Trip'
           AND IFNULL(e.resolution_status, 'Open') = %(rs)s
+          AND (%(etype)s = '' OR e.exception_type = %(etype)s)
+          AND (%(company)s = '' OR t.company = %(company)s)
           AND {scope_clause}
         ORDER BY FIELD(e.severity, 'Critical', 'High', 'Medium', 'Low'),
                  e.occurred_at DESC
@@ -3617,6 +3727,8 @@ def ops_exception_inbox(resolution_status="Open", limit=100):
         """,
         {
             "rs": rs,
+            "etype": exception_type or "",
+            "company": company or "",
             "limit": min(max(cint(limit) or 100, 1), 500),
             **scope_params,
         },
@@ -3667,6 +3779,146 @@ def ops_drivers_available():
         ):
             visible.append(row)
     return visible
+
+
+@frappe.whitelist(methods=["POST"])
+def ops_handover(trip, row_name, mode, driver=None, carrier=None, tracking=None):
+    """Answer a driver's Transfer request: another driver, or outside transport.
+
+    The order moves to a manifest of its own (split when the manifest carries
+    other orders) that waits for the hand-over. Driver: the new driver sees it
+    in Pickup Pending and collects it from the old one. Transport (Rapido,
+    Porter, a courier): the old driver records the hand-over. Until then the
+    old driver keeps seeing it, marked as being handed over.
+    """
+    role_registry.require("ops_control", _("reassign shipments"))
+    if mode not in ("Driver", "Transport"):
+        frappe.throw(_("Choose another driver or outside transport."))
+    trip_doc = get_locked_trip(trip)
+    scope_guard.assert_trip_scope(trip_doc.as_dict())
+    exc = next((e for e in trip_doc.exceptions if e.name == row_name), None)
+    if not exc or exc.exception_type != "Transfer" or exc.resolution_status not in ("Open", "In Progress"):
+        frappe.throw(_("This transfer request is no longer open."))
+    if not (exc.get("manifest") and exc.get("stock_entry")):
+        frappe.throw(_("This request does not name its order. Reassign it from the trip instead."))
+
+    mf = frappe.get_doc("CH Transfer Manifest", exc.manifest)
+    scope_guard.assert_manifest_scope(mf.as_dict(), side="either")
+    row = next((r for r in mf.transfers if r.stock_entry == exc.stock_entry), None)
+    if not row or not (row.driver_accepted_at or mf.status == "In Transit") or row.delivery_captured_at:
+        frappe.throw(_("Order {0} is not with the driver any more.").format(exc.stock_entry))
+    old_driver = mf.driver
+    if mode == "Driver":
+        if not driver or not frappe.db.exists("Driver", driver):
+            frappe.throw(_("Choose the driver who takes it over."))
+        if driver == old_driver:
+            frappe.throw(_("That is the driver handing it over."))
+    elif not (carrier or "").strip():
+        frappe.throw(_("Name the transport (e.g. Rapido, Porter, ST Courier)."))
+
+    if len(mf.transfers) > 1:
+        from ch_logistics.api.rejection_api import _split_row_into_new_manifest
+
+        target_name = _split_row_into_new_manifest(mf, row)
+    else:
+        target_name = mf.name
+    driver_name, driver_phone = (
+        frappe.db.get_value("Driver", driver, ["full_name", "cell_number"]) if mode == "Driver" else (None, None)
+    )
+    frappe.db.set_value("CH Transfer Manifest", target_name, {
+        "driver": driver if mode == "Driver" else None,
+        "driver_name": driver_name,
+        "driver_phone": driver_phone,
+        "trip": None,
+        "status": "Assigned",
+        "driver_accepted_at": None,
+    })
+    leg = frappe.db.get_value("CH Transfer Manifest Item", {"parent": target_name, "stock_entry": exc.stock_entry}, "name")
+    frappe.db.set_value("CH Transfer Manifest Item", leg, {
+        "driver_accepted_at": None,
+        "handover_from": old_driver,
+        "handover_carrier": (carrier or "").strip() if mode == "Transport" else None,
+        "handover_tracking": (tracking or "").strip() if mode == "Transport" else None,
+    }, update_modified=False)
+    to_whom = driver_name or driver if mode == "Driver" else (carrier or "").strip()
+    frappe.get_doc("CH Transfer Manifest", target_name).add_comment(
+        "Comment", _("Handed over from driver {0} to {1} by {2}.").format(old_driver, to_whom, frappe.session.user))
+
+    moved = frappe.get_doc("CH Transfer Manifest", target_name)
+    moved.driver = old_driver
+    moved._sync_driver_state_after_action()
+    exc.resolution_status = "Resolved"
+    exc.resolved_at = now_datetime()
+    exc.remarks = f"{exc.remarks or ''} — handed to {to_whom}"[:1000]
+    trip_doc.save()
+    return {"ok": True, "manifest": target_name, "handed_to": to_whom}
+
+
+@frappe.whitelist()
+def ops_store_holds(limit=200):
+    """Orders a driver left with a nearby store, waiting for a driver to be assigned."""
+    _require_ops()
+    scope_clause, scope_params = scope_guard.build_scope_sql(
+        location_fields=("m.source_warehouse", "m.destination_warehouse"),
+        company_field="m.company",
+        prefix="ops_store_hold",
+    )
+    return frappe.db.sql(
+        f"""
+        SELECT m.name AS manifest, m.company, m.destination_warehouse, m.destination_store,
+               i.stock_entry, i.held_at_store, i.held_receiver, i.held_photo, m.modified
+          FROM `tabCH Transfer Manifest` m
+          JOIN `tabCH Transfer Manifest Item` i ON i.parent = m.name
+         WHERE m.docstatus = 1 AND m.status = 'On Hold'
+           AND IFNULL(i.held_at_store, '') != '' AND {scope_clause}
+         ORDER BY m.modified DESC
+         LIMIT %(limit)s
+        """,
+        {"limit": min(max(cint(limit) or 200, 1), 500), **scope_params},
+        as_dict=True,
+    )
+
+
+@frappe.whitelist(methods=["POST"])
+def ops_assign_from_store(manifest, driver):
+    """Approve a store hold: the driver collects it there and delivers it on."""
+    role_registry.require("ops_control", _("assign held shipments"))
+    mf = frappe.get_doc("CH Transfer Manifest", manifest)
+    scope_guard.assert_manifest_scope(mf.as_dict(), side="either")
+    if mf.status != "On Hold":
+        frappe.throw(_("Manifest {0} is not on hold at a store.").format(manifest))
+    if not driver or not frappe.db.exists("Driver", driver):
+        frappe.throw(_("Choose the driver who collects it."))
+    name, phone = frappe.db.get_value("Driver", driver, ["full_name", "cell_number"])
+    frappe.db.set_value("CH Transfer Manifest", manifest, {
+        "driver": driver, "driver_name": name, "driver_phone": phone,
+        "status": "Assigned", "driver_accepted_at": None,
+    })
+    mf.add_comment("Comment", _("Approved by {0}: {1} collects it from the store and delivers it.").format(
+        frappe.session.user, name or driver))
+    return {"ok": True, "manifest": manifest, "driver": name or driver}
+
+
+@frappe.whitelist(methods=["POST"])
+def ops_hold_decision(trip, row_name, decision, deliver_on=None):
+    """Answer a driver's Hold: deliver on a later day."""
+    role_registry.require("ops_control", _("decide on held shipments"))
+    if decision != "next_day":
+        frappe.throw(_("Choose the day to deliver."))
+    trip_doc = get_locked_trip(trip)
+    scope_guard.assert_trip_scope(trip_doc.as_dict())
+    exc = next((e for e in trip_doc.exceptions if e.name == row_name), None)
+    if not exc or exc.exception_type != "Hold" or exc.resolution_status not in ("Open", "In Progress"):
+        frappe.throw(_("This hold is no longer open."))
+
+    when = getdate(deliver_on) if deliver_on else frappe.utils.add_days(getdate(), 1)
+    outcome = _("deliver on {0}").format(frappe.utils.formatdate(when))
+
+    exc.resolution_status = "Resolved"
+    exc.resolved_at = now_datetime()
+    exc.remarks = f"{exc.remarks or ''} — {outcome}"[:1000]
+    trip_doc.save()
+    return {"ok": True, "outcome": outcome}
 
 
 @frappe.whitelist(methods=["POST"])
@@ -4439,6 +4691,7 @@ def start_stop_pickup(trip, sequence, scanned_qr, pickup_photo,
         stop.pickup_scanned_by = frappe.session.user
         stop.status = "Arrived"
         trip_doc.flags.ignore_mandatory = True
+        trip_doc.flags.lifecycle_action = True
         trip_doc.flags.ignore_validate_update_after_submit = True
         trip_doc.save()
 
@@ -4581,6 +4834,7 @@ def complete_stop_delivery(trip, sequence, scanned_qr, delivery_photo,
         if not stop.get("ata"):
             stop.ata = now_datetime()
         trip_doc.flags.ignore_mandatory = True
+        trip_doc.flags.lifecycle_action = True
         trip_doc.flags.ignore_validate_update_after_submit = True
         trip_doc.save()
 
@@ -4627,6 +4881,7 @@ def request_stop_otp(trip, sequence, lat=None, lng=None):
     from ch_logistics.api.transfer_manifest_api import (
         _require_stage_role,
         _send_delivery_otp,
+        assert_otp_not_locked,
     )
 
     _require_stage_role("complete_delivery")
@@ -4677,6 +4932,8 @@ def request_stop_otp(trip, sequence, lat=None, lng=None):
     # source and audit trail are identical to the per-manifest flow), then
     # broadcast that same OTP across every other manifest at the stop.
     first = frappe.get_doc("CH Transfer Manifest", rows[0].name)
+    for r in rows:
+        assert_otp_not_locked(r.name)
     first.check_permission("write")
     assert_manifest_driver_access(first, scope_side="destination")
     # Step 1: arrival ping for the first manifest (so its delivery_otp can
@@ -4701,9 +4958,10 @@ def request_stop_otp(trip, sequence, lat=None, lng=None):
         doc.flags.ignore_validate_update_after_submit = True
         doc.save()
 
-    # Send via the first manifest's destination — same store for all of
-    # them by the bundle invariant.
-    recipients = _send_delivery_otp(first, plaintext_otp) or {}
+    # Send to the people at THIS stop: the first manifest's header can name
+    # another store when it also carries legs elsewhere.
+    recipients = _send_delivery_otp(first, plaintext_otp, store=stop.get("store") or None,
+                                    warehouse=stop.warehouse or None) or {}
     from ch_logistics.logistics.doctype.ch_logistics_otp_log.ch_logistics_otp_log import (
         record_otp_dispatch,
     )

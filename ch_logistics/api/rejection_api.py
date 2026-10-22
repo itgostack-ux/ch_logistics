@@ -48,8 +48,10 @@ def create_and_submit_rejection(
 	driver = _current_driver() or manifest_doc.driver
 	if not driver:
 		frappe.throw(_("The manifest has no assigned driver."), frappe.PermissionError)
-	if manifest_doc.status not in ("Assigned", "Pickup Started", "In Transit"):
-		frappe.throw(_("Only an active pickup or in-transit delivery can be rejected."))
+	if manifest_doc.status == "In Transit":
+		frappe.throw(_("This order is already picked up. Use Transfer, Hold or Drop at nearby store."))
+	if manifest_doc.status not in ("Assigned", "Pickup Started"):
+		frappe.throw(_("Only an active pickup can be rejected."))
 	if frappe.db.exists(
 		"CH Manifest Rejection",
 		{"manifest": manifest, "docstatus": ["<", 2], "status": ["not in", ["Closed", "Reassigned"]]},
@@ -59,12 +61,18 @@ def create_and_submit_rejection(
 
 	doc = frappe.new_doc("CH Manifest Rejection")
 	doc.manifest = manifest
+	# Set before insert: the create-permission check runs before before_insert
+	# fills it, and the driver rule needs it to recognise the caller.
+	doc.driver = driver
 	doc.rejection_reason = rejection_reason
 	doc.proof_image_1 = proof_image_1
 	doc.proof_image_2 = proof_image_2
 	doc.remarks = str(remarks or "").strip()[:1000]
 	doc.latitude = flt(latitude) if latitude is not None else None
 	doc.longitude = flt(longitude) if longitude is not None else None
+	# Who may reject was checked above (reject_manifest capability, manifest
+	# write, assigned driver); the audit record itself is server-authored.
+	doc.flags.ignore_permissions = True
 	doc.insert()
 	doc.submit()
 	return doc, trip
@@ -150,9 +158,17 @@ def _split_row_into_new_manifest(manifest_doc, row):
 	new_doc.trip = manifest_doc.trip
 	new_doc.append("transfers", {"stock_entry": stock_entry})
 	new_doc.flags.ignore_mandatory = True
+	# Server-authored copy of a live assignment: the lifecycle-field guard is
+	# for user edits, and a driver's split would otherwise be refused as forged.
+	new_doc.flags.ignore_validate_update_after_submit = True
 	new_doc.insert(ignore_permissions=True)
-	new_doc.status = "Assigned"
-	new_doc.driver_accepted_at = driver_accepted_at or frappe.utils.now_datetime()
+	# Same stage as the original, so an in-transit leg is rejected as in transit (RTO).
+	new_doc.status = manifest_doc.status if manifest_doc.status in ("Assigned", "In Transit") else "Assigned"
+	if manifest_doc.status == "In Transit":
+		new_doc.pickup_datetime = manifest_doc.pickup_datetime or frappe.utils.now_datetime()
+	# Only an order the driver really picked up counts as accepted; a pickup
+	# refusal stays unaccepted so a send-back shows Accept / Reject again.
+	new_doc.driver_accepted_at = driver_accepted_at
 	new_doc.flags.ignore_mandatory = True
 	new_doc.submit()
 
@@ -160,7 +176,22 @@ def _split_row_into_new_manifest(manifest_doc, row):
 		"Comment",
 		_("Stock Entry {0} split into manifest {1} for individual rejection.").format(stock_entry, new_doc.name),
 	)
+	_maybe_complete_manifest_delivery(manifest_doc.name)
 	return new_doc.name
+
+
+def _maybe_complete_manifest_delivery(manifest_name: str) -> None:
+	"""After the last undelivered leg is split off, everything left on the
+	manifest was already delivered: roll it up to Delivered the way the last
+	leg's delivery would have, so its stores can receive.
+	"""
+	doc = frappe.get_doc("CH Transfer Manifest", manifest_name)
+	if doc.status != "In Transit" or not doc.transfers or not all(r.delivery_captured_at for r in doc.transfers):
+		return
+	last = max(doc.transfers, key=lambda r: r.delivery_captured_at)
+	doc.arrival_datetime = doc.arrival_datetime or last.delivery_captured_at
+	doc._apply_delivery_complete_transition(last.get("delivery_photo"), last.get("delivery_lat"),
+											last.get("delivery_lng"), last.get("delivery_receiver_name"))
 
 
 def _maybe_complete_manifest_pickup(manifest_name: str) -> None:
@@ -239,8 +270,10 @@ def driver_reject_manifest_row(manifest: str, stock_entry: str, rejection_reason
 	from ch_logistics.api.driver_resolver import assert_manifest_driver_access
 
 	assert_manifest_driver_access(manifest_doc, scope_side="source")
-	if manifest_doc.status not in ("Assigned", "Pickup Started", "In Transit"):
-		frappe.throw(_("Only an active pickup or in-transit delivery can be rejected."))
+	if manifest_doc.status == "In Transit":
+		frappe.throw(_("This order is already picked up. Use Transfer, Hold or Drop at nearby store."))
+	if manifest_doc.status not in ("Assigned", "Pickup Started"):
+		frappe.throw(_("Only an active pickup can be rejected."))
 
 	row = next((r for r in manifest_doc.transfers if r.stock_entry == stock_entry), None)
 	if not row:
@@ -364,7 +397,9 @@ def rejection_inbox(company: str | None = None, limit: int = 200) -> list[dict]:
 	role_registry.require("ops_view")
 	rows = frappe.get_all(
 		"CH Manifest Rejection",
-		filters={"docstatus": 1, "status": ("not in", [REVIEW_APPROVED, REVIEW_OVERRULED])},
+		# Acknowledged = an in-transit rejection that became an RTO; it is
+		# answered by the warehouse return (RTO tab), not here.
+		filters={"docstatus": 1, "status": ("not in", [REVIEW_APPROVED, REVIEW_OVERRULED, "Acknowledged"])},
 		fields=["name", "manifest", "trip", "driver", "rejection_reason", "remarks",
 				"proof_image_1", "proof_image_2", "rejected_on", "rejected_by", "status"],
 		order_by="rejected_on desc",
@@ -435,6 +470,16 @@ def _put_the_goods_back(manifest_doc, target_status: str, note: str) -> list[str
 			continue
 		doc = frappe.get_doc("Stock Entry", row.stock_entry)
 		if (doc.custom_status or "") != "Rejected":
+			# Pickup-time rejection: stock never left transit, only the
+			# status goes back to where the manifest is heading.
+			if (doc.custom_status or "") in ("Assigned", "Ready For Pickup") and doc.custom_status != target_status:
+				doc.custom_status = target_status
+				doc.custom_logistics_status = "Pending Pickup"
+				_authorize_custom_state_transition(doc, force=True)
+				doc.flags.ignore_validate_update_after_submit = True
+				doc.save(ignore_permissions=True)
+				doc.add_comment("Comment", note)
+				moved.append(doc.name)
 			continue
 		for item in doc.items:
 			item.custom_pending_qty = item.custom_quantity
@@ -480,6 +525,11 @@ def _review(rejection: str, notes: str | None, approve: bool) -> dict:
 		(doc.manifest,),
 	)
 	manifest = frappe.get_doc("CH Transfer Manifest", doc.manifest)
+	# Same reach as rejection_inbox: either end of the manifest in scope.
+	from ch_logistics import scope_guard
+
+	manifest.check_permission("read")
+	scope_guard.assert_manifest_scope(manifest.as_dict(), side="either")
 	if manifest.status != "Rejected":
 		frappe.throw(
 			_("Manifest {0} is {1}, not Rejected — nothing to send back.").format(
@@ -492,6 +542,8 @@ def _review(rejection: str, notes: str | None, approve: bool) -> dict:
 		moved = _put_the_goods_back(manifest, "Ready For Pickup", note)
 		payload = {
 			"status": "Packed",
+			"rejection_reason": None,
+			"rejected_during": None,
 			"trip": None,
 			"driver": None,
 			"driver_name": None,
@@ -505,7 +557,9 @@ def _review(rejection: str, notes: str | None, approve: bool) -> dict:
 		note = _("Rejection overruled by {0}: back to {1}. {2}").format(
 			who, manifest.driver_name or manifest.driver or _("the driver"), notes)
 		moved = _put_the_goods_back(manifest, "Assigned", note)
-		frappe.db.set_value("CH Transfer Manifest", manifest.name, {"status": "Assigned"})
+		frappe.db.set_value("CH Transfer Manifest", manifest.name, {
+			"status": "Assigned", "rejection_reason": None, "rejected_during": None,
+		})
 		review_status, action = REVIEW_OVERRULED, _("Ignored — returned to the driver")
 
 	manifest.reload()

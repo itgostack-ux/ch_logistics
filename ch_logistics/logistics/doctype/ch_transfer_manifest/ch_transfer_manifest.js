@@ -875,6 +875,13 @@ async function show_return_confirm_dialog(frm, api) {
                 description: __("Enter the quantity physically counted. The server requires an exact match."),
             }] : []),
             ...countFields,
+            ...((requirements.boxes || []).length ? [{
+                fieldname: "returned_boxes",
+                fieldtype: "Small Text",
+                label: __("Scan Every Box ({0})", [requirements.boxes.length]),
+                description: __("One box label per line: {0}", [requirements.boxes.join(", ")]),
+                reqd: 1,
+            }] : []),
             {
                 fieldname: "return_photo",
                 fieldtype: "Attach Image",
@@ -921,6 +928,7 @@ async function show_return_confirm_dialog(frm, api) {
                             return_photo: values.return_photo,
                             returned_serials: [...scanned],
                             returned_quantities: returnedQuantities,
+                            returned_boxes: values.returned_boxes || "",
                         },
                         freeze: true,
                         freeze_message: __("Reversing stock entries..."),

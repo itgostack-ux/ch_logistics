@@ -180,10 +180,30 @@ class CHLogisticsTrip(Document):
         protected = (
             "company", "trip_date", "direction", "route", "hub_warehouse",
             "vehicle", "planned_start", "planned_end",
+            # Switching to a courier mode unlocks manual Delivered without OTP.
+            "transport_mode", "courier_partner", "tracking_number", "carrier_name",
         )
         if any(self.has_value_changed(fieldname) for fieldname in protected) \
                 or self._stop_plan_changed(previous):
             frappe.throw(_("Trip planning fields can only be changed by dispatch."), frappe.PermissionError)
+        # Status and stop progress move only through the driver-app actions
+        # (mark_* / stop endpoints set lifecycle_action), never a direct save.
+        if self.flags.get("lifecycle_action") or rejected_assignment:
+            return
+        if self.has_value_changed("status") or self._stop_progress_changed(previous):
+            frappe.throw(
+                _("Trip status can only be changed through the driver app actions."),
+                frappe.PermissionError,
+            )
+
+    def _stop_progress_changed(self, previous) -> bool:
+        fields = ("status", "ata", "gps_lat", "gps_lng")
+        before = {row.name: row for row in previous.stops or () if row.name}
+        for stop in self.stops or ():
+            old = before.get(stop.name)
+            if old and any(stop.get(f) != old.get(f) for f in fields):
+                return True
+        return False
 
     # Which stops the trip visits, and in what order — the part of the stops
     # table that is planning. Everything else on a stop (status, ETA, actual
@@ -585,6 +605,19 @@ class CHLogisticsTrip(Document):
         if not previous or previous.status == self.status:
             return
         if (self.get("transport_mode") or "Own") != "Own":
+            from ch_logistics import roles as role_registry
+
+            privileged = role_registry.is_privileged()
+            if (
+                self.has_value_changed("transport_mode")
+                and previous.status not in ("Draft", "Assigned")
+                and not privileged
+            ):
+                frappe.throw(_("Transport mode cannot change once the trip is moving."),
+                             frappe.PermissionError)
+            if self.status == "Delivered" and not (self.flags.get("lifecycle_action") or privileged):
+                frappe.throw(_("Deliver a courier trip stop by stop with the store's code."),
+                             frappe.PermissionError)
             allowed = self._MANUAL_MODE_TRANSITIONS.get(previous.status, set())
             if self.status not in allowed:
                 frappe.throw(
@@ -742,6 +775,7 @@ class CHLogisticsTrip(Document):
                 frappe.throw(_("Trip must be Assigned before starting"))
             self.status = "Started"
             self.actual_start = now_datetime()
+            self.flags.lifecycle_action = True
         finally:
             frappe.db.sql("SELECT RELEASE_LOCK(%s)", (_lk,))
 
@@ -761,6 +795,7 @@ class CHLogisticsTrip(Document):
                 ).format(self.name, ", ".join(pending)))
             self.status = "Completed"
             self.actual_end = now_datetime()
+            self.flags.lifecycle_action = True
         finally:
             frappe.db.sql("SELECT RELEASE_LOCK(%s)", (_lk,))
 
@@ -793,6 +828,7 @@ class CHLogisticsTrip(Document):
                     ).format(self.name, ", ".join(blocking))
                 )
             self.flags.cancel_after_recall = True
+            self.flags.lifecycle_action = True
             self.status = "Cancelled"
             self.cancelled_by = frappe.session.user
             self.cancelled_on = now_datetime()
@@ -817,6 +853,7 @@ class CHLogisticsTrip(Document):
                     "separately, after the trip is closed."
                 ).format(self.name, ", ".join(unsettled)))
             self.status = "Closed"
+            self.flags.lifecycle_action = True
         finally:
             frappe.db.sql("SELECT RELEASE_LOCK(%s)", (_lk,))
 

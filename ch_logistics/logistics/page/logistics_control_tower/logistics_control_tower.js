@@ -2079,6 +2079,18 @@ class LogisticsCommandCenter {
 						<i class="fa fa-id-card"></i> ${__("Drivers")}
 						<span class="lcc-tab-badge" id="lcc-cnt-drv">0</span>
 					</button>
+					<button class="lcc-tab" data-tab="rejections">
+						<i class="fa fa-ban"></i> ${__("Rejected")}
+						<span class="lcc-tab-badge lcc-tab-badge-warn" id="lcc-cnt-rej">0</span>
+					</button>
+					<button class="lcc-tab" data-tab="hold">
+						<i class="fa fa-pause-circle"></i> ${__("Hold")}
+						<span class="lcc-tab-badge lcc-tab-badge-warn" id="lcc-cnt-hold">0</span>
+					</button>
+					<button class="lcc-tab" data-tab="transfer">
+						<i class="fa fa-exchange"></i> ${__("Transfer")}
+						<span class="lcc-tab-badge lcc-tab-badge-warn" id="lcc-cnt-xfer">0</span>
+					</button>
 				</div>
 				<div class="lcc-ops-bottom" id="lcc-ops-bottom"></div>
 			</div>
@@ -2187,6 +2199,91 @@ class LogisticsCommandCenter {
 		$r.on("click", ".lcc-mf-print-receipt", (e) => { e.preventDefault(); this._ops_print_manifest($(e.currentTarget).data("name"), "ePOD Transfer Manifest"); });
 		$r.on("click", ".lcc-mf-print-ewb",     (e) => { e.preventDefault(); this._ops_print_ewaybills($(e.currentTarget).data("name")); });
 
+		// Store holds — approve and choose who collects it from the store.
+		$r.on("click", ".lcc-store-hold-assign", (e) => {
+			e.preventDefault();
+			const manifest = $(e.currentTarget).data("manifest");
+			const d = new frappe.ui.Dialog({
+				title: __("Assign driver for {0}", [manifest]),
+				fields: [{ fieldname: "driver", fieldtype: "Link", options: "Driver", label: __("Driver"), reqd: 1,
+				           description: __("They collect it from the store and deliver it to the original destination.") }],
+				primary_action_label: __("Approve & Assign"),
+				primary_action: (v) => {
+					d.hide();
+					frappe.call({ method: _LCC + "ops_assign_from_store", args: { manifest, driver: v.driver }, freeze: true })
+						.then((r) => {
+							frappe.show_alert({ message: __("Assigned to {0}", [r.message && r.message.driver]), indicator: "green" });
+							this._ops_load();
+						});
+				},
+			});
+			d.show();
+		});
+
+		// Hold requests — deliver on a later day.
+		$r.on("click", ".lcc-hold-decide", (e) => {
+			e.preventDefault();
+			const $b = $(e.currentTarget);
+			const decision = $b.data("decision");
+			const send = (args) => frappe.call({
+				method: _LCC + "ops_hold_decision",
+				args: { trip: $b.data("trip"), row_name: $b.data("row"), decision, ...args },
+				freeze: true,
+			}).then((r) => {
+				frappe.show_alert({ message: (r.message && r.message.outcome) || __("Done"), indicator: "green" });
+				this._ops_load();
+			});
+			const d = new frappe.ui.Dialog({
+				title: __("Deliver on"),
+				fields: [{ fieldname: "deliver_on", fieldtype: "Date", label: __("Delivery date"), reqd: 1,
+				           default: frappe.datetime.add_days(frappe.datetime.get_today(), 1) }],
+				primary_action_label: __("Confirm"),
+				primary_action: (v) => { d.hide(); send({ deliver_on: v.deliver_on }); },
+			});
+			d.show();
+		});
+
+		// Transfer requests — hand the order to another driver or outside transport.
+		$r.on("click", ".lcc-req-handover", (e) => {
+			e.preventDefault();
+			const $b = $(e.currentTarget);
+			const mode = $b.data("mode");
+			const fields = mode === "Driver"
+				? [{ fieldname: "driver", fieldtype: "Link", options: "Driver", label: __("New Driver"), reqd: 1,
+				     description: __("They collect the order from the current driver.") }]
+				: [{ fieldname: "carrier", fieldtype: "Autocomplete", label: __("Transport"), reqd: 1,
+				     options: ["Rapido", "Porter", "ST Courier"] },
+				   { fieldname: "tracking", fieldtype: "Data", label: __("Tracking / Booking No.") }];
+			const d = new frappe.ui.Dialog({
+				title: mode === "Driver" ? __("Assign another driver") : __("Hand to outside transport"),
+				fields,
+				primary_action_label: __("Assign"),
+				primary_action: (v) => {
+					d.hide();
+					frappe.call({
+						method: _LCC + "ops_handover",
+						args: { trip: $b.data("trip"), row_name: $b.data("row"), mode, ...v },
+						freeze: true,
+					}).then((r) => {
+						frappe.show_alert({ message: __("Handed to {0}", [r.message && r.message.handed_to]), indicator: "green" });
+						this._ops_load();
+					});
+				},
+			});
+			d.show();
+		});
+
+		// Hold / Transfer requests — dispatch closes them once handled.
+		$r.on("click", ".lcc-req-resolve", (e) => {
+			e.preventDefault();
+			const $b = $(e.currentTarget);
+			frappe.call({
+				method: _LCC + "exception_resolve",
+				args: { trip: $b.data("trip"), row_name: $b.data("row") },
+				freeze: true,
+			}).then(() => this._ops_load());
+		});
+
 		// Recalls inbox — confirm physical return + reverse stock.
 		$r.on("click", ".lcc-rec-confirm",      (e) => { e.preventDefault(); this._ops_confirm_recall_return($(e.currentTarget).data("name")); });
 
@@ -2206,19 +2303,28 @@ class LogisticsCommandCenter {
 		// The exception inbox was dropped from this console, and with it the
 		// query behind it: a trip's own exceptions still show on its side
 		// panel, read from the board payload it already carries.
-		const [b, u, d, rc, lc, pp] = await Promise.all([
+		const [b, u, d, rc, lc, pp, hold, xfer, rej, sh] = await Promise.all([
 			frappe.call({ method: _LCC + "ops_board",              args: args_board }),
 			frappe.call({ method: _LCC + "ops_unassigned_manifests", args: { limit: 0 } }),
 			frappe.call({ method: _LCC + "ops_drivers_available" }),
 			frappe.call({ method: _LCC + "ops_recall_inbox",        args: { limit: 100 } }),
 			frappe.call({ method: _LCC + "ops_lifecycle_counts",    args: args_board }),
 			frappe.call({ method: _LCC + "ops_pickup_pending",      args: co ? { company: co } : {} }),
+			frappe.call({ method: _LCC + "ops_exception_inbox",     args: { exception_type: "Hold" } }),
+			frappe.call({ method: _LCC + "ops_exception_inbox",     args: { exception_type: "Transfer" } }),
+			// Action inboxes list every company in the user's scope: they are to-dos, not a report.
+			frappe.call({ method: _REJ + "rejection_inbox",          args: {} }),
+			frappe.call({ method: _LCC + "ops_store_holds" }),
 		]);
 
 		this.board      = b.message || { buckets: {}, totals: {} };
 		this.unassigned = u.message || [];
 		this.drivers    = d.message || [];
 		this.recalls    = rc.message || [];
+		this.holds      = hold.message || [];
+		this.transfers  = xfer.message || [];
+		this.rejections = rej.message || [];
+		this.store_holds = sh.message || [];
 		this.pickup_pending = pp.message || [];
 		this.lifecycle  = lc.message || { stages: [] };
 		this.selected_manifests.clear();
@@ -2398,12 +2504,22 @@ class LogisticsCommandCenter {
 		$("#lcc-cnt-rec").text(rec_cnt).toggleClass("has-items", rec_cnt > 0);
 		$("#lcc-cnt-pend").text(pend_cnt).toggleClass("has-items", pend_cnt > 0);
 		$("#lcc-cnt-drv").text(this.drivers.length);
+		for (const [id, list] of [["rej", this.rejections], ["hold", (this.holds || []).concat(this.store_holds || [])], ["xfer", this.transfers]]) {
+			const n = (list || []).length;
+			$(`#lcc-cnt-${id}`).text(n).toggleClass("has-items", n > 0);
+		}
 
 		const $b = $("#lcc-ops-bottom").empty();
 		if (this.bottom_tab === "manifests")  return this._ops_render_manifests($b);
 		if (this.bottom_tab === "recalls")    return this._ops_render_recalls($b);
 		if (this.bottom_tab === "pickup_pending") return this._ops_render_pickup_pending($b);
 		if (this.bottom_tab === "drivers")    return this._ops_render_drivers($b);
+		if (this.bottom_tab === "rejections") return this._ops_render_rejections($b);
+		if (this.bottom_tab === "hold") {
+			this._ops_render_requests($b, this.holds, "Hold");
+			return this._ops_render_store_holds($b);
+		}
+		if (this.bottom_tab === "transfer")   return this._ops_render_requests($b, this.transfers, "Transfer");
 	}
 
 	// ── Paging ────────────────────────────────────────────────────
@@ -3091,9 +3207,9 @@ class LogisticsCommandCenter {
 
 	// ── Rejected: a driver said no, and somebody has to answer ──────────
 	//
-	// The goods are already back at the source warehouse by the time a row
-	// lands here (the rejection reverses the transit movement), so both
-	// answers move stock again — see rejection_api._put_the_goods_back.
+	// Pickup-time rejections: the goods never left the hub, so neither
+	// answer moves stock — Approve returns the order to the dispatch pool,
+	// Send back returns it to the same driver (rejection_api._review).
 	_ops_render_rejections($b) {
 		const rows = this.rejections || [];
 		if (!rows.length) {
@@ -3127,9 +3243,9 @@ class LogisticsCommandCenter {
 		$b.html(`
 			<div class="lcc-ops-bar">
 				<span class="lcc-muted">${__(
-					"A driver refused these shipments and the goods went back to the source warehouse. "
+					"A driver refused these shipments before pickup; the goods are still at the source. "
 					+ "Approve sends the shipment back to Unassigned Manifests as Packed for a different trip; "
-					+ "Ignore puts it back on the same driver's list. Either way the stock moves into transit again.")}</span>
+					+ "Ignore puts it back on the same driver's list. No stock moves either way.")}</span>
 			</div>
 			<div class="lcc-table-wrap"><table class="lcc-table">
 				<thead><tr>
@@ -3185,12 +3301,13 @@ class LogisticsCommandCenter {
 		d.show();
 	}
 
-	_ops_render_recalls($b) {
-		if (!(this.recalls || []).length) {
-			$b.html(`<div class="lcc-empty"><i class="fa fa-check-circle"></i> ${__("No open recalls. Recalled manifests appear here until physical return is confirmed at the source warehouse.")}</div>`);
+	_ops_render_recalls($b, list = null, empty_msg = null) {
+		const recalls = list || this.recalls || [];
+		if (!recalls.length) {
+			$b.html(`<div class="lcc-empty"><i class="fa fa-check-circle"></i> ${empty_msg || __("No open recalls. Recalled manifests appear here until physical return is confirmed at the source warehouse.")}</div>`);
 			return;
 		}
-		const rows = this.recalls.map((r) => {
+		const rows = recalls.map((r) => {
 			const age = (r.recall_age_hours == null) ? "—" : `${r.recall_age_hours}h`;
 			let age_cls = "lcc-sev-low";
 			if (r.recall_age_hours != null) {
@@ -3241,6 +3358,75 @@ class LogisticsCommandCenter {
 					<th style="width:160px">${__("Action")}</th>
 				</tr></thead>
 				<tbody>${rows}</tbody>
+			</table></div>`);
+	}
+
+	_ops_render_requests($b, list, type) {
+		// Hold / Transfer requests drivers raised from the Delivery App.
+		if (!(list || []).length) {
+			$b.html(`<div class="lcc-empty"><i class="fa fa-check-circle"></i> ${__("No open {0} requests.", [__(type)])}</div>`);
+			return;
+		}
+		const esc = frappe.utils.escape_html;
+		const action = type === "Hold" ? __("Release") : __("Done");
+		const rows = list.map((r) => `<tr>
+			<td><a href="#" class="lcc-trip-link" data-name="${esc(r.trip)}">${esc(r.trip)}</a>
+				<div class="lcc-muted">${esc(r.trip_status || "")}</div></td>
+			<td>${esc(r.driver_name || r.driver || "—")}${r.vehicle ? `<div class="lcc-muted"><i class="fa fa-truck"></i> ${esc(r.vehicle)}</div>` : ""}</td>
+			<td class="lcc-exc-remarks">${esc(r.remarks || "—")}</td>
+			<td>${r.photo ? `<a href="${esc(r.photo)}" target="_blank"><i class="fa fa-camera"></i></a>` : "—"}</td>
+			<td>${r.occurred_at ? frappe.datetime.str_to_user(r.occurred_at) : ""}</td>
+			<td>${type === "Hold"
+				? `<button class="btn btn-xs btn-success lcc-hold-decide" data-decision="next_day" data-trip="${esc(r.trip)}" data-row="${esc(r.row_name)}">
+					<i class="fa fa-calendar"></i> ${__("Deliver Next Day")}</button>
+`
+				: type === "Transfer" && r.manifest && r.stock_entry
+				? `<button class="btn btn-xs btn-primary lcc-req-handover" data-mode="Driver" data-trip="${esc(r.trip)}" data-row="${esc(r.row_name)}">
+					<i class="fa fa-user"></i> ${__("Assign Driver")}</button>
+				   <button class="btn btn-xs btn-default lcc-req-handover" data-mode="Transport" data-trip="${esc(r.trip)}" data-row="${esc(r.row_name)}">
+					<i class="fa fa-truck"></i> ${__("Other Transport")}</button>`
+				: `<button class="btn btn-xs btn-success lcc-req-resolve" data-trip="${esc(r.trip)}" data-row="${esc(r.row_name)}">
+					<i class="fa fa-check"></i> ${action}</button>`}</td>
+		</tr>`).join("");
+		$b.html(`
+			<div class="lcc-ops-bar"><span class="lcc-muted lcc-ops-bar-hint"><i class="fa fa-info-circle"></i>
+				${type === "Hold"
+					? __("Driver asked to hold these deliveries. Deliver Next Day: the driver keeps the goods and delivers on the chosen day.")
+					: __("Driver asked to hand these shipments over. Assign another driver (they collect it from this driver) or outside transport (this driver hands it over with photo and scan).")}
+			</span></div>
+			<div class="lcc-table-wrap"><table class="lcc-table">
+				<thead><tr>
+					<th>${__("Trip")}</th><th>${__("Driver / Vehicle")}</th><th>${__("Order · Reason")}</th>
+					<th>${__("Photo")}</th><th>${__("Raised")}</th><th style="width:220px">${__("Action")}</th>
+				</tr></thead>
+				<tbody>${rows}</tbody>
+			</table></div>`);
+	}
+
+	_ops_render_store_holds($b) {
+		// Orders a driver left with a nearby store (OTP-confirmed), on hold
+		// until a driver is assigned to collect them and deliver on.
+		const rows = this.store_holds || [];
+		if (!rows.length) return;
+		const esc = frappe.utils.escape_html;
+		const wh = (w) => (window.ch_wh_label_html ? ch_wh_label_html(w, "—") : esc(w || "—"));
+		$b.append(`
+			<div class="lcc-ops-bar" style="margin-top:14px"><span class="lcc-muted lcc-ops-bar-hint"><i class="fa fa-building"></i>
+				${__("Held at stores: a driver left these with a nearby store. Approve and assign a driver to collect them there and deliver to the original destination.")}
+			</span></div>
+			<div class="lcc-table-wrap"><table class="lcc-table">
+				<thead><tr><th>${__("Manifest")}</th><th>${__("Order")}</th><th>${__("Held at")}</th><th>${__("Received by")}</th>
+					<th>${__("Photo")}</th><th>${__("Deliver to")}</th><th style="width:200px">${__("Action")}</th></tr></thead>
+				<tbody>${rows.map((r) => `<tr>
+					<td><a href="/app/ch-transfer-manifest/${encodeURIComponent(r.manifest)}" target="_blank">${esc(r.manifest)}</a></td>
+					<td>${esc(r.stock_entry)}</td>
+					<td>${esc(r.held_at_store)}</td>
+					<td>${esc(r.held_receiver || "—")}</td>
+					<td>${r.held_photo ? `<a href="${esc(r.held_photo)}" target="_blank"><i class="fa fa-camera"></i></a>` : "—"}</td>
+					<td>${wh(r.destination_warehouse)}</td>
+					<td><button class="btn btn-xs btn-primary lcc-store-hold-assign" data-manifest="${esc(r.manifest)}">
+						<i class="fa fa-user"></i> ${__("Approve & Assign Driver")}</button></td>
+				</tr>`).join("")}</tbody>
 			</table></div>`);
 	}
 
@@ -3427,6 +3613,13 @@ class LogisticsCommandCenter {
 					description: __("Enter the physically counted quantity; an exact match is required."),
 				}] : []),
 				...countFields,
+				...((requirements.boxes || []).length ? [{
+					fieldname: "returned_boxes",
+					fieldtype: "Small Text",
+					label: __("Scan Every Box ({0})", [requirements.boxes.length]),
+					description: __("One box label per line: {0}", [requirements.boxes.join(", ")]),
+					reqd: 1,
+				}] : []),
 				{
 					fieldname: "return_photo",
 					fieldtype: "Attach Image",
@@ -3472,6 +3665,7 @@ class LogisticsCommandCenter {
 								return_photo: values.return_photo,
 								returned_serials: [...scanned],
 								returned_quantities: returnedQuantities,
+								returned_boxes: values.returned_boxes || "",
 							},
 							freeze: true,
 							freeze_message: __("Reversing stock entries..."),

@@ -97,11 +97,18 @@ class CHManifestRejection(Document):
 			rejection_reason=self.rejection_reason,
 			rejection_photo=self.proof_image_1,
 			rejection_notes=self.remarks,
+			latitude=self.get("latitude"),
+			longitude=self.get("longitude"),
 		)
 		# The manifest controller performs the scoped dispatcher notification.
 		# This flag means that path was invoked, not that a swallowed duplicate
 		# notification happened here.
 		self.db_set("dispatcher_notified", 1, update_modified=False)
+		if frappe.db.get_value("CH Transfer Manifest", self.manifest, "status") == "Recall Initiated":
+			# In-transit rejection became an RTO; the warehouse return closes it.
+			self.db_set({"status": "Acknowledged",
+						 "resolution_action": _("RTO — goods returning to the warehouse")},
+						update_modified=False)
 
 	def _notify_dispatcher(self) -> None:
 		"""Best-effort FCM + system notification to the dispatcher."""

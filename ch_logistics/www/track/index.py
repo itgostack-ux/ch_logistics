@@ -28,9 +28,11 @@ def get_context(context):
 
     context.found = True
     context.t = data
+    # Anonymous page: only the browser-restricted public key, never the
+    # server key used for geocoding. No public key -> status without a map.
     from ch_logistics.logistics.doctype.ch_tracking_settings.ch_tracking_settings import (
-        get_google_maps_api_key,
+        get_public_maps_api_key,
     )
 
-    context.maps_key = get_google_maps_api_key()
+    context.maps_key = get_public_maps_api_key()
     return context

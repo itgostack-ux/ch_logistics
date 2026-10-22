@@ -37,7 +37,13 @@
   "distance_km",
   "trip_time",
   "col_break_2",
-  "transfer_status"
+  "transfer_status",
+  "handover_from",
+  "handover_carrier",
+  "handover_tracking",
+  "held_at_store",
+  "held_receiver",
+  "held_photo"
  ],
  "fields": [
   {
@@ -247,11 +253,49 @@
    "fieldtype": "Datetime",
    "in_list_view": 1,
    "label": "Trip Time"
+  },
+  {
+   "fieldname": "handover_from",
+   "fieldtype": "Link",
+   "label": "Handed Over From Driver",
+   "options": "Driver",
+   "read_only": 1
+  },
+  {
+   "fieldname": "handover_carrier",
+   "fieldtype": "Data",
+   "label": "Handed To Transport",
+   "read_only": 1
+  },
+  {
+   "fieldname": "handover_tracking",
+   "fieldtype": "Data",
+   "label": "Transport Tracking No.",
+   "read_only": 1
+  },
+  {
+   "fieldname": "held_at_store",
+   "fieldtype": "Link",
+   "label": "Held At Store",
+   "options": "CH Store",
+   "read_only": 1
+  },
+  {
+   "fieldname": "held_receiver",
+   "fieldtype": "Data",
+   "label": "Held By (Receiver)",
+   "read_only": 1
+  },
+  {
+   "fieldname": "held_photo",
+   "fieldtype": "Attach Image",
+   "label": "Hold Photo",
+   "read_only": 1
   }
  ],
  "istable": 1,
  "links": [],
- "modified": "2026-08-21 17:00:00.000000",
+ "modified": "2026-10-22 15:01:05.194059",
  "modified_by": "Administrator",
  "module": "Logistics",
  "name": "CH Transfer Manifest Item",

@@ -52,13 +52,6 @@ doc_events = {
 	"CH Store": {
 		"on_update": "ch_logistics.api.optimizer.sync_one_store_geo",
 	},
-	# The audit team verifies a store's damaged bin; the goods still have to
-	# travel. ch_erp15 owns the audit and is the base layer, so it cannot reach
-	# into logistics -- logistics listens instead, which is the direction the
-	# estate's dependencies actually run.
-	"CH Stock Audit Session": {
-		"on_update": "ch_logistics.damaged_stock_release.on_audit_session_update",
-	},
 }
 
 permission_query_conditions = {
@@ -67,6 +60,8 @@ permission_query_conditions = {
 	"CH Driver Break Log": "ch_logistics.api.permissions.driver_break_query_condition",
 	"CH Driver Location": "ch_logistics.api.permissions.driver_location_query_condition",
 	"CH Manifest Rejection": "ch_logistics.api.permissions.manifest_rejection_query_condition",
+	"Driver": "ch_logistics.api.permissions.driver_query_condition",
+	"CH Logistics OTP Log": "ch_logistics.api.permissions.otp_log_query_condition",
 }
 
 has_permission = {
@@ -75,6 +70,8 @@ has_permission = {
 	"CH Driver Break Log": "ch_logistics.api.permissions.has_driver_break_permission",
 	"CH Driver Location": "ch_logistics.api.permissions.has_driver_location_permission",
 	"CH Manifest Rejection": "ch_logistics.api.permissions.has_manifest_rejection_permission",
+	"Driver": "ch_logistics.api.permissions.has_driver_permission",
+	"CH Logistics OTP Log": "ch_logistics.api.permissions.has_otp_log_permission",
 }
 
 # --------------------------------------------------------------------------
