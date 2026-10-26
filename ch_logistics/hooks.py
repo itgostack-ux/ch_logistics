@@ -52,6 +52,10 @@ doc_events = {
 	"CH Store": {
 		"on_update": "ch_logistics.api.optimizer.sync_one_store_geo",
 	},
+	# A store's Scan & Receive closes the courier trip that brought it.
+	"Stock Entry": {
+		"on_submit": "ch_logistics.api.logistics_api.close_courier_trip_on_receive",
+	},
 }
 
 permission_query_conditions = {

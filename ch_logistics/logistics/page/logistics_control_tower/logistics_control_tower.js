@@ -1805,6 +1805,8 @@ class LogisticsCommandCenter {
 		const $b = $("#lcc-pack-body");
 		if (!(this.pack_queue || []).length) {
 			$b.html(`<div class="lcc-empty"><i class="fa fa-check-circle"></i> ${__("No packed delivery challans waiting to be grouped into a manifest.")}</div>`);
+			// Nothing is ticked any more: drop the count left from before.
+			this._pack_update_create_btn();
 			return;
 		}
 		const needle = String(this.pack_search || "").trim().toLowerCase();
@@ -1814,6 +1816,7 @@ class LogisticsCommandCenter {
 			$b.html(`<div class="lcc-empty"><i class="fa fa-search"></i> ${needle
 				? __("No packed order matches “{0}”.", [frappe.utils.escape_html(needle)])
 				: __("No packed order matches the filters.")}</div>`);
+			this._pack_update_create_btn();
 			return;
 		}
 		this._cs_bind_sort();
@@ -2251,8 +2254,9 @@ class LogisticsCommandCenter {
 			const fields = mode === "Driver"
 				? [{ fieldname: "driver", fieldtype: "Link", options: "Driver", label: __("New Driver"), reqd: 1,
 				     description: __("They collect the order from the current driver.") }]
-				: [{ fieldname: "carrier", fieldtype: "Autocomplete", label: __("Transport"), reqd: 1,
-				     options: ["Rapido", "Porter", "ST Courier"] },
+				// Same Courier Partner master as a courier trip, so both pick from one list.
+				: [{ fieldname: "carrier", fieldtype: "Link", options: "Courier Partner", label: __("Courier Partner"), reqd: 1,
+				     get_query: () => ({ filters: { is_active: 1 } }) },
 				   { fieldname: "tracking", fieldtype: "Data", label: __("Tracking / Booking No.") }];
 			const d = new frappe.ui.Dialog({
 				title: mode === "Driver" ? __("Assign another driver") : __("Hand to outside transport"),
@@ -2303,7 +2307,7 @@ class LogisticsCommandCenter {
 		// The exception inbox was dropped from this console, and with it the
 		// query behind it: a trip's own exceptions still show on its side
 		// panel, read from the board payload it already carries.
-		const [b, u, d, rc, lc, pp, hold, xfer, rej, sh] = await Promise.all([
+		const [b, u, d, rc, lc, pp, hold, xfer, rej, sh, xdone] = await Promise.all([
 			frappe.call({ method: _LCC + "ops_board",              args: args_board }),
 			frappe.call({ method: _LCC + "ops_unassigned_manifests", args: { limit: 0 } }),
 			frappe.call({ method: _LCC + "ops_drivers_available" }),
@@ -2315,6 +2319,9 @@ class LogisticsCommandCenter {
 			// Action inboxes list every company in the user's scope: they are to-dos, not a report.
 			frappe.call({ method: _REJ + "rejection_inbox",          args: {} }),
 			frappe.call({ method: _LCC + "ops_store_holds" }),
+			// Transfers already answered, to follow each order to the store.
+			frappe.call({ method: _LCC + "ops_exception_inbox",
+			              args: { exception_type: "Transfer", resolution_status: "Resolved", limit: 50 } }),
 		]);
 
 		this.board      = b.message || { buckets: {}, totals: {} };
@@ -2325,6 +2332,8 @@ class LogisticsCommandCenter {
 		this.transfers  = xfer.message || [];
 		this.rejections = rej.message || [];
 		this.store_holds = sh.message || [];
+		this.transfers_done = (xdone.message || []).filter((r) => r.stock_entry)
+			.sort((a, b) => String(b.resolved_at || "").localeCompare(String(a.resolved_at || "")));
 		this.pickup_pending = pp.message || [];
 		this.lifecycle  = lc.message || { stages: [] };
 		this.selected_manifests.clear();
@@ -2476,9 +2485,20 @@ class LogisticsCommandCenter {
 		});
 	}
 
+	// A courier / other-transport trip has no driver of ours: show who carries
+	// it and the number to track it by where the driver and vehicle would be.
+	_trip_carrier(t) {
+		if (!t.transport_mode || t.transport_mode === "Own") return null;
+		return {
+			who: t.courier_partner || t.carrier_name || __(t.transport_mode),
+			ref: t.tracking_number || "",
+		};
+	}
+
 	_trip_card(t) {
 		const dir = t.direction === "Reverse" ? "↩" : t.direction === "Mixed" ? "↔" : "→";
 		const start = t.planned_start ? frappe.datetime.str_to_user(t.planned_start) : "—";
+		const carrier = this._trip_carrier(t);
 		const exc_badge = (t.open_exceptions || 0) > 0
 			? `<span class="lcc-card-exc ${t.critical_exceptions ? "is-crit" : ""}"><i class="fa fa-exclamation-triangle"></i> ${t.open_exceptions}</span>` : "";
 		return `<div class="lcc-trip-card" data-name="${frappe.utils.escape_html(t.name)}">
@@ -2487,8 +2507,11 @@ class LogisticsCommandCenter {
 				${exc_badge}
 			</div>
 			<div class="lcc-card-meta">
-				<div><i class="fa fa-user"></i> ${frappe.utils.escape_html(t.driver_name || __("Unassigned"))}</div>
-				<div><i class="fa fa-truck"></i> ${frappe.utils.escape_html(t.vehicle_number || "—")}</div>
+				${carrier
+					? `<div><i class="fa fa-truck"></i> ${frappe.utils.escape_html(carrier.who)}</div>
+					   <div><i class="fa fa-barcode"></i> ${frappe.utils.escape_html(carrier.ref || "—")}</div>`
+					: `<div><i class="fa fa-user"></i> ${frappe.utils.escape_html(t.driver_name || __("Unassigned"))}</div>
+					   <div><i class="fa fa-truck"></i> ${frappe.utils.escape_html(t.vehicle_number || "—")}</div>`}
 				<div><i class="fa fa-clock-o"></i> ${start}</div>
 				<div><i class="fa fa-cube"></i> ${t.total_shipments || 0} ${__("shipments")}</div>
 			</div>
@@ -2519,7 +2542,10 @@ class LogisticsCommandCenter {
 			this._ops_render_requests($b, this.holds, "Hold");
 			return this._ops_render_store_holds($b);
 		}
-		if (this.bottom_tab === "transfer")   return this._ops_render_requests($b, this.transfers, "Transfer");
+		if (this.bottom_tab === "transfer") {
+			this._ops_render_requests($b, this.transfers, "Transfer");
+			return this._ops_render_handovers($b);
+		}
 	}
 
 	// ── Paging ────────────────────────────────────────────────────
@@ -3208,7 +3234,7 @@ class LogisticsCommandCenter {
 	// ── Rejected: a driver said no, and somebody has to answer ──────────
 	//
 	// Pickup-time rejections: the goods never left the hub, so neither
-	// answer moves stock — Approve returns the order to the dispatch pool,
+	// answer moves stock — Approve returns the order to Packed Orders,
 	// Send back returns it to the same driver (rejection_api._review).
 	_ops_render_rejections($b) {
 		const rows = this.rejections || [];
@@ -3244,7 +3270,7 @@ class LogisticsCommandCenter {
 			<div class="lcc-ops-bar">
 				<span class="lcc-muted">${__(
 					"A driver refused these shipments before pickup; the goods are still at the source. "
-					+ "Approve sends the shipment back to Unassigned Manifests as Packed for a different trip; "
+					+ "Approve sends the order back to Packed Orders, to go out on a new manifest; "
 					+ "Ignore puts it back on the same driver's list. No stock moves either way.")}</span>
 			</div>
 			<div class="lcc-table-wrap"><table class="lcc-table">
@@ -3357,6 +3383,44 @@ class LogisticsCommandCenter {
 					<th>${__("Recall Age")}</th>
 					<th style="width:160px">${__("Action")}</th>
 				</tr></thead>
+				<tbody>${rows}</tbody>
+			</table></div>`);
+	}
+
+	// What became of each transfer dispatch answered: who has the order now.
+	_ops_render_handovers($b) {
+		const list = this.transfers_done || [];
+		if (!list.length) return;
+		const esc = frappe.utils.escape_html;
+		const where = (r) => {
+			const to = r.handover_carrier || (String(r.remarks || "").split(" — handed to ").pop() || __("new driver"));
+			if (["Transferred", "Partially Transferred"].includes(r.order_status))
+				return ["green", __("Received by the store")];
+			if (!r.handed_over_at)
+				return ["orange", r.handover_carrier ? __("Driver to hand it to {0}", [to]) : __("{0} to collect it", [to])];
+			if (["Ready For Receive", "Receive At Transit"].includes(r.order_status))
+				return ["blue", r.handover_carrier ? __("With {0}, store to receive", [to]) : __("Delivered, store to receive")];
+			return ["blue", __("With {0}", [to])];
+		};
+		const rows = list.map((r) => {
+			const [color, text] = where(r);
+			const to = r.handover_carrier
+				? `${esc(r.handover_carrier)}${r.handover_tracking ? ` · ${esc(r.handover_tracking)}` : ""}`
+				: esc(String(r.remarks || "").split(" — handed to ").pop() || "—");
+			return `<tr>
+				<td><a href="/app/stock-entry/${encodeURIComponent(r.stock_entry)}" target="_blank">${esc(r.stock_entry)}</a></td>
+				<td>${esc(r.driver_name || r.driver || "—")}</td>
+				<td>${to}</td>
+				<td>${r.handed_over_at ? frappe.datetime.str_to_user(r.handed_over_at) : "—"}</td>
+				<td><span class="indicator-pill ${color}"><span>${esc(text)}</span></span></td>
+			</tr>`;
+		}).join("");
+		$b.append(`
+			<div class="lcc-ops-bar" style="margin-top:14px"><span class="lcc-muted lcc-ops-bar-hint"><i class="fa fa-history"></i>
+				${__("Handed over: the last {0} transfers and where each order is now.", [list.length])}</span></div>
+			<div class="lcc-table-wrap"><table class="lcc-table">
+				<thead><tr><th>${__("Order")}</th><th>${__("From driver")}</th><th>${__("Handed to")}</th>
+					<th>${__("Handed over at")}</th><th>${__("Now")}</th></tr></thead>
 				<tbody>${rows}</tbody>
 			</table></div>`);
 	}
@@ -3617,8 +3681,9 @@ class LogisticsCommandCenter {
 					fieldname: "returned_boxes",
 					fieldtype: "Small Text",
 					label: __("Scan Every Box ({0})", [requirements.boxes.length]),
-					description: __("One box label per line: {0}", [requirements.boxes.join(", ")]),
+					description: __("One box label per line: {0}. A shipment whose boxes are all scanned counts its IMEIs as returned.", [requirements.boxes.join(", ")]),
 					reqd: 1,
+					onchange: () => countBoxes(),
 				}] : []),
 				{
 					fieldname: "return_photo",
@@ -3630,6 +3695,7 @@ class LogisticsCommandCenter {
 			],
 			primary_action_label: __("Confirm Return & Reverse Stock"),
 			primary_action: (values) => {
+				countBoxes();
 				const missing = [...expected].filter((value) => !scanned.has(value));
 				if (missing.length) {
 					frappe.msgprint({
@@ -3695,6 +3761,17 @@ class LogisticsCommandCenter {
 				</div>
 			`);
 		};
+		// All of a shipment's boxes back = its IMEIs back, as at the store's receive.
+		function countBoxes() {
+			const have = new Set(String(d.get_value("returned_boxes") || "").split(/[\n,]+/)
+				.map((s) => s.trim().toLowerCase()).filter(Boolean));
+			for (const g of requirements.box_groups || []) {
+				if ((g.boxes || []).length && g.boxes.every((b) => have.has(b.toLowerCase()))) {
+					(g.serials || []).forEach((s) => { if (expected.has(s)) scanned.add(s); });
+				}
+			}
+			renderProgress();
+		}
 		renderProgress();
 		if (expected.size) {
 			const $input = d.fields_dict.scan_imei.$input;
@@ -3704,6 +3781,17 @@ class LogisticsCommandCenter {
 				const value = String($input.val() || "").trim();
 				$input.val("");
 				if (!value) return;
+				// A box label scanned here goes to the box list, where it belongs.
+				const box = (requirements.boxes || []).find((b) => b.toLowerCase() === value.toLowerCase());
+				if (box) {
+					const have = String(d.get_value("returned_boxes") || "").split(/[\n,]+/).map((s) => s.trim()).filter(Boolean);
+					if (!have.some((b) => b.toLowerCase() === box.toLowerCase())) {
+						d.set_value("returned_boxes", have.concat(box).join("\n"));
+					}
+					frappe.show_alert({ message: __("Box {0} added to the box list", [box]), indicator: "green" }, 4);
+					countBoxes();
+					return;
+				}
 				if (!expected.has(value)) {
 					frappe.show_alert({
 						message: __("Scanned IMEI is wrong. Please scan the correct item."),
@@ -3844,8 +3932,11 @@ class LogisticsCommandCenter {
 				<button class="btn btn-sm btn-default lcc-side-close">✕</button>
 			</div>
 			<div class="lcc-side-info">
-				<div><b>${__("Driver")}:</b> ${frappe.utils.escape_html(t.driver_name || __("Unassigned"))}${t.driver_phone ? ` · ${t.driver_phone}` : ""}</div>
-				<div><b>${__("Vehicle")}:</b> ${frappe.utils.escape_html(t.vehicle_number || "—")}</div>
+				${this._trip_carrier(t)
+					? `<div><b>${__("Courier")}:</b> ${frappe.utils.escape_html(this._trip_carrier(t).who)}</div>
+					   <div><b>${__("Tracking ID")}:</b> ${frappe.utils.escape_html(this._trip_carrier(t).ref || "—")}</div>`
+					: `<div><b>${__("Driver")}:</b> ${frappe.utils.escape_html(t.driver_name || __("Unassigned"))}${t.driver_phone ? ` · ${t.driver_phone}` : ""}</div>
+					   <div><b>${__("Vehicle")}:</b> ${frappe.utils.escape_html(t.vehicle_number || "—")}</div>`}
 				<div><b>${__("Hub")}:</b> ${window.ch_wh_label_html ? ch_wh_label_html(t.hub_warehouse, "—") : frappe.utils.escape_html(t.hub_warehouse || "—")}</div>
 				<div><b>${__("Shipments")}:</b> ${t.total_shipments || 0}</div>
 				<div><b>${__("Created")}:</b> ${frappe.utils.escape_html(t.created_by || "—")}${t.created_on ? ` · ${frappe.datetime.str_to_user(t.created_on)}` : ""}</div>
@@ -3878,8 +3969,6 @@ class LogisticsCommandCenter {
 		const next = {
 			"Draft": ["Assigned"],
 			"Assigned": ["Picked Up"],
-			"Picked Up": ["Delivery Pending", "Delivered"],
-			"Delivery Pending": ["Delivered"],
 		}[t.status] || [];
 		const carrier = t.courier_partner || t.carrier_name || __("not named");
 		return `
@@ -3892,8 +3981,8 @@ class LogisticsCommandCenter {
 						${s === "Delivered" ? `<i class="fa fa-check"></i> ` : ""}${__("Mark {0}", [__(s)])}
 					</button>`).join("")}
 				${next.length ? "" : `<span class="lcc-muted">${
-					t.status === "Delivered"
-						? __("Waiting for the store to scan it in")
+					["Picked Up", "Delivery Pending", "Delivered"].includes(t.status)
+						? __("With the courier. The store receives it with Scan & Receive, and the trip closes itself.")
 						: __("Nothing left to record")}</span>`}
 			</div>`;
 	}
@@ -3978,6 +4067,11 @@ class LogisticsCommandCenter {
 				})),
 				default: people.length === 1 ? people[0].name : "",
 				reqd: 1,
+				// A code sent for someone else is no use to the new pick.
+				onchange: () => {
+					const f = dialog.fields_dict.otp_sent_html;
+					if (f) f.$wrapper.html("");
+				},
 			});
 		} else {
 			// Nobody on the store's roster: the name is typed, as the driver
@@ -3991,7 +4085,13 @@ class LogisticsCommandCenter {
 		fields.push({
 			fieldname: "send_otp", fieldtype: "Button",
 			label: __("Send OTP to {0}", [who]),
-			click: () => this._ops_send_stop_otp(trip, stop, dialog),
+			click: () => {
+				if (people.length && !dialog.get_value("receiver")) {
+					frappe.msgprint(__("Choose who is receiving at {0} first.", [who]));
+					return;
+				}
+				this._ops_send_stop_otp(trip, stop, dialog);
+			},
 		});
 		fields.push({ fieldname: "otp_sent_html", fieldtype: "HTML" });
 		fields.push({
@@ -4062,7 +4162,13 @@ class LogisticsCommandCenter {
 			},
 		});
 		dialog.show();
-		this._ops_send_stop_otp(trip, stop, dialog);
+		if (people.length) {
+			// The code goes to the person signing for it: wait until they are picked.
+			dialog.fields_dict.otp_sent_html.$wrapper.html(`<div class="lcc-muted" style="margin-bottom:10px">${
+				__("Choose who is receiving, then tap Send OTP.")}</div>`);
+		} else {
+			this._ops_send_stop_otp(trip, stop, dialog);
+		}
 	}
 
 	_ops_send_stop_otp(trip, stop, dialog) {
@@ -4256,7 +4362,9 @@ class LogisticsCommandCenter {
 		Object.values(this.board.buckets || {}).flat()
 			.filter((t) => ["Draft","Assigned","Started"].includes(t.status))
 			.forEach((t) => opts.push(
-				`${t.name} — ${t.route || "—"} — ${t.driver_name || __("Unassigned")}`
+				`${t.name} — ${t.route || "—"} — ${this._trip_carrier(t)
+					? [this._trip_carrier(t).who, this._trip_carrier(t).ref].filter(Boolean).join(" ")
+					: (t.driver_name || __("Unassigned"))}`
 			));
 
 		if (!opts.length) {

@@ -333,6 +333,9 @@ def assign_driver(manifest, driver, courier_partner=None, vehicle_number=None,
     plaintext_otp = getattr(doc.flags, "delivery_otp_plaintext", None)
     if plaintext_otp:
         _send_delivery_otp(doc, plaintext_otp)
+    from ch_logistics.api.driver_push import notify_manifests_assigned
+
+    notify_manifests_assigned(driver, [doc.name], trip=doc.get("trip"))
     return {"status": doc.status, "vehicle": doc.get("custom_vehicle")}
 
 
@@ -740,8 +743,11 @@ def driver_complete_delivery_row(manifest, stock_entry, delivery_photo, receiver
                 mf.arrival_lng = lng_f
             mf._apply_delivery_complete_transition(delivery_photo, lat_f, lng_f, receiver_name)
         else:
-            # The manifest is still moving, but this shipment's store may now
-            # have everything it was owed — close that stop on the trip.
+            # The manifest is still moving, but this shipment is at its store:
+            # it can be scanned in now, not when the last leg lands.
+            mf._sync_logistics_status_to_entries("Delivered", only={stock_entry})
+            # This shipment's store may now have everything it was owed —
+            # close that stop on the trip.
             mf._cascade_stop_status_to_trip()
     except DeliveryOTPError as exc:
         # Returning a normal response is deliberate: Frappe rolls the whole
@@ -772,6 +778,14 @@ def _scans_for_leg(mf, stock_entry, scans) -> list:
     A single-box order is checked against the first scan only, so each order
     in a store delivery has to be handed its own label first.
     """
+    labels = {l.lower() for l in mf._box_labels(stock_entry)}
+    if labels:
+        # Boxed order: its own labels only; the other orders' are not strays.
+        own = [s for s in scans if s.lower() in labels]
+        if not own:
+            frappe.throw(_("No scanned label matches order {0}.").format(stock_entry), title=_("Scan Required"))
+        mf._validate_delivery_qr_multi(stock_entry, own)
+        return own
     for i, first in enumerate(scans):
         ordered = [first] + scans[:i] + scans[i + 1:]
         log_len = len(frappe.local.message_log or [])
@@ -898,6 +912,9 @@ def driver_accept_handover(manifest, stock_entry, pickup_photo, scanned_qrs, lat
     row = next((r for r in mf.transfers if r.stock_entry == stock_entry), None)
     if not row or not (row.get("handover_from") or row.get("held_at_store")) or row.get("handover_carrier"):
         frappe.throw(_("Order {0} is not waiting to be handed to you.").format(stock_entry))
+    if mf.status == "On Hold" or not mf.driver:
+        # Left at a store: dispatch approves it and names who collects it first.
+        frappe.throw(_("Order {0} is waiting for dispatch to assign a driver.").format(stock_entry))
     if row.driver_accepted_at:
         frappe.throw(_("You already have this order."))
     _capture_handover(mf, row, pickup_photo, scanned_qrs, lat, lng, gps_accuracy_m, pickup_photos)
@@ -926,6 +943,8 @@ def driver_handover_to_carrier(manifest, stock_entry, handover_photo, scanned_qr
     if row.driver_accepted_at:
         frappe.throw(_("This order is already handed over."))
     now = _capture_handover(mf, row, handover_photo, scanned_qrs, lat, lng, gps_accuracy_m, handover_photos)
+    # The courier takes it to the store: the driver's part ends here, and the
+    # store receives it by scanning in POS when the courier arrives.
     frappe.db.set_value("CH Transfer Manifest Item", row.name, {
         "delivery_captured_at": now, "delivery_photo": handover_photo,
         "delivery_receiver_name": row.handover_carrier,
@@ -938,7 +957,7 @@ def driver_handover_to_carrier(manifest, stock_entry, handover_photo, scanned_qr
         mf._apply_delivery_complete_transition(handover_photo, flt(lat) if lat not in (None, "") else None,
                                                flt(lng) if lng not in (None, "") else None, row.handover_carrier)
     else:
-        mf._sync_logistics_status_to_entries("Delivered")
+        mf._sync_logistics_status_to_entries("Delivered", only={stock_entry})
     mf.add_comment("Comment", _("Order {0} handed to {1}{2} by driver {3}.").format(
         stock_entry, row.handover_carrier,
         f" (tracking {row.handover_tracking})" if row.get("handover_tracking") else "", row.handover_from))
@@ -981,6 +1000,7 @@ def request_nearby_store_otp(manifest, stock_entry, store, receiver) -> dict:
     return {
         "masked_emails": [mask_email(e) for e in recipients.get("emails", [])],
         "masked_mobiles": [mask_mobile(m) for m in recipients.get("mobiles", [])],
+        "expires_in_seconds": _otp_expires_in(mf),
     }
 
 
@@ -1049,6 +1069,9 @@ def driver_drop_at_nearby_store(manifest, stock_entry, store, receiver, otp, pho
     moved = frappe.get_doc("CH Transfer Manifest", target)
     moved.driver = old_driver
     moved._sync_driver_state_after_action()
+    from ch_logistics.api.logistics_api import settle_trip_after_handover
+
+    settle_trip_after_handover(old_trip)
     return {"ok": True, "manifest": target, "store": store}
 
 
@@ -1514,6 +1537,20 @@ def _receiver_contacts(receiver, destination_store=None) -> tuple:
     return ([user], [email] if email else [], [mobile] if mobile else [])
 
 
+def _otp_expires_in(doc) -> int:
+    """Seconds left on the manifest's current code."""
+    expires = doc.get("delivery_otp_expires_at")
+    return max(int((get_datetime(expires) - now_datetime()).total_seconds()), 0) if expires else 0
+
+
+def _otp_validity_text(doc) -> str:
+    expires = doc.get("delivery_otp_expires_at")
+    if not expires:
+        return ""
+    return _("Valid for {0} minutes, until {1}.").format(
+        max(round(_otp_expires_in(doc) / 60), 1), frappe.utils.format_time(get_datetime(expires), "HH:mm"))
+
+
 def _send_delivery_otp(doc, plaintext_otp=None, receiver=None,
                        store=None, warehouse=None, stock_entry=None, group_legs=None) -> dict:
     """Send delivery OTP to the connected destination warehouse + store contacts.
@@ -1613,6 +1650,7 @@ def _send_delivery_otp(doc, plaintext_otp=None, receiver=None,
         return recipients
 
     subject = _("Delivery OTP for Manifest {0}").format(doc.name)
+    validity = _otp_validity_text(doc)
     manifest_url = frappe.utils.get_url_to_form("CH Transfer Manifest", doc.name)
 
     # The mail names the Delivery Challan, not the manifest: the challan is
@@ -1645,6 +1683,7 @@ def _send_delivery_otp(doc, plaintext_otp=None, receiver=None,
         "</table>"
         "<p style='font-size:20px;font-weight:bold;letter-spacing:4px'>"
         "OTP: {otp}</p>"
+        "<p style='color:#b91c1c;font-weight:600'>{validity}</p>"
         "{shared_note}"
         "<p>Share this OTP with the driver only after physically verifying all items.</p>"
         "<p style='margin-top:16px'><a href='{manifest_url}' style='background:#0b57d0;color:#ffffff;text-decoration:none;padding:10px 14px;border-radius:6px;display:inline-block;font-weight:600'>Open Manifest</a></p>"
@@ -1680,6 +1719,7 @@ def _send_delivery_otp(doc, plaintext_otp=None, receiver=None,
                 qty=qty or 0,
                 otp=plaintext_otp,
                 shared_note=shared_note,
+                validity=validity,
                 manifest_url=manifest_url,
             ),
         )
@@ -1693,8 +1733,8 @@ def _send_delivery_otp(doc, plaintext_otp=None, receiver=None,
                 event="notification",
                 message={
                     "subject": subject,
-                    "message": _("OTP {0} for manifest {1}. Share only after item verification.").format(
-                        plaintext_otp, doc.name
+                    "message": _("OTP {0} for manifest {1}. {2} Share only after item verification.").format(
+                        plaintext_otp, doc.name, validity
                     ),
                     "type": "info",
                     "from_user": frappe.session.user,
@@ -1710,8 +1750,8 @@ def _send_delivery_otp(doc, plaintext_otp=None, receiver=None,
         try:
             from frappe.core.doctype.sms_settings.sms_settings import send_sms
             sms_message = _(
-                "CH Logistics: Delivery OTP {0} for Manifest {1}. Share only after item verification."
-            ).format(plaintext_otp, doc.name)
+                "CH Logistics: Delivery OTP {0} for Manifest {1}. {2} Share only after item verification."
+            ).format(plaintext_otp, doc.name, validity)
             send_sms(sms_recipients, sms_message)
             sms_sent = True
         except Exception:
@@ -2006,6 +2046,7 @@ def request_delivery_otp(manifest, receiver=None, stock_entry=None, stock_entrie
         # How long before another code may be asked for, so the app's button
         # counts down the same window this endpoint will enforce.
         "resend_after_seconds": wait_s,
+        "expires_in_seconds": _otp_expires_in(doc),
     }
 
 

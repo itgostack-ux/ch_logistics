@@ -12,6 +12,7 @@ Every channel is best-effort and isolated — a failing transport never breaks
 the operational flow that triggered the notification.
 """
 import frappe
+from frappe import _
 from frappe.utils import now_datetime
 
 from ch_logistics.logistics.doctype.ch_driver_device.ch_driver_device import (
@@ -43,11 +44,14 @@ def notify_driver(driver, title, body, data=None, reference=None):
     if user:
         try:
             _notify_inapp(user, title, body, reference)
+            # Only once the change it announces is saved: a request that
+            # fails afterwards must not leave the driver with a phantom alert.
             frappe.publish_realtime(
                 event="driver_push",
                 message={"title": title, "body": body, "data": data or {},
                          "ts": str(now_datetime())},
                 user=user,
+                after_commit=True,
             )
             result["channels"].append("inapp")
         except Exception:
@@ -56,16 +60,45 @@ def notify_driver(driver, title, body, data=None, reference=None):
 
     # 2) FCM to the native app (only when explicitly configured) -----------
     if provider == "FCM":
-        try:
-            sent = _send_fcm(driver, title, body, data)
-            if sent:
-                result["channels"].append("fcm")
-        except Exception:
-            frappe.log_error(title="notify_driver fcm failed",
-                             message=frappe.get_traceback())
+        def _push():
+            try:
+                _send_fcm(driver, title, body, data)
+            except Exception:
+                frappe.log_error(title="notify_driver fcm failed",
+                                 message=frappe.get_traceback())
+
+        frappe.db.after_commit.add(_push)
+        result["channels"].append("fcm")
 
     result["ok"] = bool(result["channels"])
     return result
+
+
+def notify_manifests_assigned(driver, manifests, trip=None, title=None, body=None, kind="manifest_assigned"):
+    """Tell a driver about shipments that are now theirs to act on.
+
+    Best-effort like ``notify_driver``: an assignment never fails because a
+    notification could not be sent.
+    """
+    manifests = [m for m in (manifests or []) if m]
+    if not driver or not manifests:
+        return None
+    try:
+        if not body:
+            count = frappe.db.count("CH Transfer Manifest Item", {"parent": ["in", manifests]}) or len(manifests)
+            body = (_("{0} shipment(s) assigned to you on trip {1}. Open the Delivery App to accept.").format(count, trip)
+                    if trip else
+                    _("{0} shipment(s) assigned to you. Open the Delivery App to accept.").format(count))
+        return notify_driver(
+            driver,
+            title or _("New Shipment Assigned"),
+            body,
+            data={"type": kind, "manifests": manifests, "trip": trip or ""},
+            reference=("CH Logistics Trip", trip) if trip else ("CH Transfer Manifest", manifests[0]),
+        )
+    except Exception:
+        frappe.log_error(title="notify_manifests_assigned failed", message=frappe.get_traceback())
+        return None
 
 
 def _notify_inapp(user, title, body, reference):

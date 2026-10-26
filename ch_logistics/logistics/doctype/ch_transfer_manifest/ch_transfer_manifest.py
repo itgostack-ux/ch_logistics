@@ -1203,11 +1203,6 @@ class CHTransferManifest(Document):
             stock_entries &= {stock_entry}
         if scanned in stock_entries:
             return True
-        # Legacy box label form: strip a trailing "-B<digits>" and compare
-        # what's left.
-        base = re.sub(r"-B\d+$", "", scanned)
-        if base in stock_entries:
-            return True
         # Current box labels are "{delivery_challan}-B<digits>", which the
         # strip above can't map back to a Stock Entry — match them against
         # the labels actually stored on this manifest's own boxes instead.
@@ -1222,7 +1217,7 @@ class CHTransferManifest(Document):
         # shows for the shipment and the number on the paperwork, so it is
         # what a driver without a box label in hand reads off or scans.
         # Checked without regard to case, as a typed code would be.
-        wanted = {scanned.lower(), base.lower()}
+        wanted = {scanned.lower()}
         for name in stock_entries:
             if name.lower() in wanted:
                 return True
@@ -1238,6 +1233,31 @@ class CHTransferManifest(Document):
             if wanted & {c.lower() for c in challans}:
                 return True
         return False
+
+    def _box_labels(self, stock_entry=None):
+        """Box labels printed for one shipment, or for every shipment here."""
+        stock_entries = [stock_entry] if stock_entry else [r.stock_entry for r in (self.transfers or []) if r.stock_entry]
+        if not stock_entries:
+            return []
+        return [l.strip() for l in frappe.get_all(
+            "CH Stock Entry Package", filters={"parent": ["in", stock_entries]}, pluck="package_label") if l and l.strip()]
+
+    def _require_box_label(self, scanned, stock_entry):
+        """When the shipment was packed into labelled boxes, only that exact
+        label proves the box is in hand: not the challan, the transfer number
+        or the manifest QR, and not a box number that was never printed.
+        Returns False for an unboxed shipment, which keeps the older codes."""
+        labels = self._box_labels(stock_entry)
+        if not labels:
+            return False
+        if scanned.lower() in {l.lower() for l in labels}:
+            return True
+        if stock_entry and self._scanned_matches_own_shipment(scanned, stock_entry):
+            frappe.throw(_("{0} is the shipment's number, not a box. Scan the box label on the carton.").format(scanned),
+                         title=_("Scan the Box"))
+        self._refuse_other_shipments_code(scanned, stock_entry)
+        frappe.throw(_("Scan the box label on the carton. {0} is not a box of this shipment.").format(scanned),
+                     title=_("Wrong QR"))
 
     def _refuse_other_shipments_code(self, scanned, stock_entry):
         """A code that belongs to this manifest but to another of its
@@ -1272,6 +1292,8 @@ class CHTransferManifest(Document):
         if not scanned:
             frappe.throw(_("QR scan is mandatory. Scan the manifest/order QR to start pickup."),
                          title=_("Scan Required"))
+        if self._require_box_label(scanned, stock_entry):
+            return
         if self._scanned_matches_own_shipment(scanned, stock_entry):
             return
         self._refuse_other_shipments_code(scanned, stock_entry)
@@ -1307,6 +1329,10 @@ class CHTransferManifest(Document):
                 ),
                 title=_("Scan Required"),
             )
+        stray = [c for c in scanned_list if c not in box_labels]
+        if stray:
+            frappe.throw(_("{0} is not a box of {1}. Scan only this shipment's box labels.").format(
+                ", ".join(stray), stock_entry), title=_("Wrong QR"))
         missing = [b for b in box_labels if b not in scanned_list]
         if missing:
             frappe.throw(
@@ -1348,6 +1374,10 @@ class CHTransferManifest(Document):
                 ),
                 title=_("Scan Required"),
             )
+        stray = [c for c in scanned_list if c not in box_labels]
+        if stray:
+            frappe.throw(_("{0} is not a box of {1}. Scan only this shipment's box labels.").format(
+                ", ".join(stray), stock_entry), title=_("Wrong QR"))
         missing = [b for b in box_labels if b not in scanned_list]
         if missing:
             frappe.throw(
@@ -1370,6 +1400,8 @@ class CHTransferManifest(Document):
         if not scanned:
             frappe.throw(_("QR scan is mandatory. Scan the manifest/order QR to complete delivery."),
                          title=_("Scan Required"))
+        if self._require_box_label(scanned, stock_entry):
+            return
         if self._scanned_matches_own_shipment(scanned, stock_entry):
             return
         self._refuse_other_shipments_code(scanned, stock_entry)
@@ -2549,8 +2581,9 @@ class CHTransferManifest(Document):
         )
         return plaintext
 
-    def _sync_logistics_status_to_entries(self, logistics_status):
-        """Push logistics status change to all child Stock Entries.
+    def _sync_logistics_status_to_entries(self, logistics_status, only=None):
+        """Push logistics status change to all child Stock Entries, or to the
+        ones in ``only`` (one shipment delivered off a manifest still moving).
 
         Two parallel fields on Stock Entry drive the receiving-side UX:
 
@@ -2595,7 +2628,12 @@ class CHTransferManifest(Document):
         meta = frappe.get_meta("Stock Entry")
         now = now_datetime()
 
-        for row in self.transfers:
+        rows = [r for r in self.transfers if not only or r.stock_entry in only]
+        for row in rows:
+            # A shipment its store has already scanned in never moves back.
+            if meta.has_field("custom_status") and frappe.db.get_value("Stock Entry", row.stock_entry, "custom_status") in (
+                    "Receive At Transit", "Partially Transferred", "Transferred"):
+                continue
             update = {}
             if meta.has_field("custom_logistics_status"):
                 update["custom_logistics_status"] = logistics_status
@@ -2640,7 +2678,7 @@ class CHTransferManifest(Document):
 
         # set_value skipped Stock Entry doc_events, so refresh the Material
         # Request list roll-up (Latest Status / dispatched qty) explicitly.
-        _refresh_mr_list_summary(row.stock_entry for row in self.transfers)
+        _refresh_mr_list_summary(row.stock_entry for row in rows)
 
     def _sync_custom_status_only(self, target_status):
         """Push a manifest-status-driven value onto linked Stock Entries'
@@ -3062,12 +3100,24 @@ class CHTransferManifest(Document):
                 pluck="package_label",
             ) if b
         ] if self.transfers else []
+        # Each shipment's boxes and the serials that went out in them, so the
+        # return can be counted by box: all of a shipment's boxes back means
+        # its serials are back.
+        box_groups = []
+        for row in self.transfers:
+            if not row.stock_entry:
+                continue
+            labels = frappe.get_all("CH Stock Entry Package", filters={"parent": row.stock_entry}, pluck="package_label")
+            group_serials = [s for item in inventory if item.get("stock_entry") == row.stock_entry for s in item.get("serials", [])]
+            if labels and group_serials:
+                box_groups.append({"stock_entry": row.stock_entry, "boxes": [b for b in labels if b], "serials": group_serials})
         return {
             "items": inventory,
             "serials": serials,
             "serial_count": len(serials),
             "total_qty": sum(flt(item.get("qty")) for item in inventory),
             "boxes": boxes,
+            "box_groups": box_groups,
         }
 
     @staticmethod
@@ -3217,14 +3267,13 @@ class CHTransferManifest(Document):
             self.return_confirmed_by = frappe.session.user
             self.return_confirmed_at = now_datetime()
 
-            # RTO (driver rejected in transit): goods are booked back into the
-            # source warehouse, then re-queued for a new manifest below.
-            is_rto = bool(self.get("rejection_reason"))
+            # The goods are booked back into the source warehouse, then
+            # re-queued for a new manifest below (Packed Orders).
             reversed_ses = self._reverse_stock_entries(
                 reason=self.recall_reason or _("Manifest recall"),
                 reference=f"manifest {self.name} confirmed return",
                 allow_original_cancellation=False,
-                target_status="Rejected" if is_rto else "Draft",
+                target_status="Rejected",
             )
             self.reversed_stock_entries = ", ".join(reversed_ses) if reversed_ses else "—"
 
@@ -3254,8 +3303,7 @@ class CHTransferManifest(Document):
                 ),
             )
 
-            if is_rto:
-                self._requeue_rto_orders()
+            self._requeue_rto_orders()
 
             self._maybe_finalize_recalled_trip()
             self._maybe_auto_close_parent_trip()

@@ -61,6 +61,43 @@ class DeliveryApp {
         this.active_trip = null;
         this._trip_detail = null;
         this.render();
+        this._listen_for_pushes();
+    }
+
+    // Dispatch's notify_driver (new shipment, transfer, store pickup, hold
+    // answer) also fires a realtime "driver_push". Show it at once: a phone
+    // notification once the driver allows them, an alert with sound, and a
+    // reload so the order is already on the list.
+    _listen_for_pushes() {
+        try {
+            if ("Notification" in window && Notification.permission === "default") {
+                // Browsers only ask from a tap.
+                document.addEventListener("click", () => Notification.requestPermission().catch(() => {}), { once: true });
+            }
+        } catch (e) { /* no notification support */ }
+        frappe.realtime.off("driver_push");
+        frappe.realtime.on("driver_push", (msg) => {
+            const title = (msg && msg.title) || __("Delivery App");
+            const body = (msg && msg.body) || "";
+            const esc = frappe.utils.escape_html;
+            frappe.show_alert({ message: `<b>${esc(title)}</b><br>${esc(body)}`, indicator: "blue" }, 10);
+            try { frappe.utils.play_sound("alert"); } catch (e) { /* sound blocked */ }
+            if (navigator.vibrate) navigator.vibrate([200, 100, 200]);
+            this._show_os_notification(title, body, (msg && msg.data && msg.data.type) || "ch-driver");
+            this.load_data();
+        });
+    }
+
+    async _show_os_notification(title, body, tag) {
+        try {
+            if (!("Notification" in window) || Notification.permission !== "granted") return;
+            const opts = { body, tag, renotify: true, icon: "/assets/frappe/images/frappe-favicon.svg" };
+            // Phones only show notifications through a service worker.
+            const reg = navigator.serviceWorker && await navigator.serviceWorker.getRegistration();
+            if (reg) return reg.showNotification(title, opts);
+            const n = new Notification(title, opts);
+            n.onclick = () => { window.focus(); n.close(); };
+        } catch (e) { /* the alert above already showed it */ }
     }
 
     refresh() {
@@ -1267,7 +1304,7 @@ class DeliveryApp {
                         ${__("OTP regenerated, but no warehouse contact is configured. Ask the store directly.")}
                     </div>`;
                 }
-                this._open_delivery_dialog(recipients_html, info.receiver_options || []);
+                this._open_delivery_dialog(recipients_html, info.receiver_options || [], info.expires_in_seconds);
             },
             error: () => {
                 frappe.dom.unfreeze();
@@ -1283,7 +1320,7 @@ class DeliveryApp {
         });
     }
 
-    _open_delivery_dialog(recipients_html, receiver_options) {
+    _open_delivery_dialog(recipients_html, receiver_options, expires_in = 0) {
         const seals = ((this._detail || {}).packed_seals || []).filter(Boolean);
         let d = new frappe.ui.Dialog({
             title: __("Complete Delivery"),
@@ -1375,11 +1412,13 @@ class DeliveryApp {
                                 [info.email_count || 0, info.sms_count || 0]),
                             indicator: "blue",
                         });
+                        this._start_otp_expiry(d, info.expires_in_seconds);
                     },
                 });
             },
         });
         d.show();
+        this._start_otp_expiry(d, expires_in);
     }
 
     do_reject(opts = {}) {
@@ -2341,7 +2380,8 @@ class DeliveryApp {
                         ...this._photo_picker_fields(__("Photos of Goods")),
                         {
                             fieldname: "scanned_qr", fieldtype: "Data", options: "Barcode",
-                            label: __("Scan Manifest QR"), reqd: 1,
+                            label: __("Scan Box Label QR"), reqd: 1,
+                            description: __("Scan the QR on the box (e.g. {0}-B01). The challan or manifest QR also works.", [frappe.utils.escape_html(this._order_id(stock_entry))]),
                         },
                     ],
                     secondary_action_label: __("Reject"),
@@ -2640,6 +2680,35 @@ class DeliveryApp {
         };
     }
 
+    // How long the code just sent stays good. The server refuses it after
+    // that; the countdown on the OTP field lets the driver see it coming.
+    _start_otp_expiry(dialog, seconds, fieldname = "otp") {
+        const field = dialog && dialog.fields_dict && dialog.fields_dict[fieldname];
+        if (!field) return;
+        if (dialog.__ch_otp_expiry) clearInterval(dialog.__ch_otp_expiry);
+        const ends = Date.now() + Math.max(parseInt(seconds, 10) || 0, 0) * 1000;
+        if (ends <= Date.now()) return;
+        const paint = () => {
+            const left = Math.max(Math.round((ends - Date.now()) / 1000), 0);
+            if (!left) {
+                clearInterval(dialog.__ch_otp_expiry);
+                dialog.__ch_otp_expiry = null;
+                field.set_description(`<span class="text-danger"><b>${__("OTP expired. Tap Send OTP for a new code.")}</b></span>`);
+                return;
+            }
+            const mm = Math.floor(left / 60), ss = String(left % 60).padStart(2, "0");
+            field.set_description(`<span class="${left <= 60 ? "text-danger" : "text-muted"}">${__("OTP valid for {0}", [`<b>${mm}:${ss}</b>`])}</span>`);
+        };
+        paint();
+        dialog.__ch_otp_expiry = setInterval(paint, 1000);
+        const was = dialog.onhide;
+        dialog.onhide = () => {
+            if (dialog.__ch_otp_expiry) clearInterval(dialog.__ch_otp_expiry);
+            dialog.__ch_otp_expiry = null;
+            if (typeof was === "function") was();
+        };
+    }
+
     // stock_entry, when the dialog is delivering one shipment of several, so
     // the notice names that shipment's Delivery Challan and no other.
     _drop_board_card(stock_entry) {
@@ -2745,6 +2814,7 @@ class DeliveryApp {
                               { manifest, stock_entry, store: d.get_value("store"), receiver: match.name }).then((info) => {
                               const to = [].concat(info?.masked_emails || [], info?.masked_mobiles || []);
                               frappe.show_alert({ message: to.length ? __("OTP sent to {0}", [to.join(", ")]) : __("OTP generated — ask the person"), indicator: "green" });
+                              this._start_otp_expiry(d, info && info.expires_in_seconds);
                           });
                       } },
                     { fieldname: "otp", fieldtype: "Data", label: __("OTP from the store"), reqd: 1 },
@@ -2843,6 +2913,7 @@ class DeliveryApp {
                 });
                 this._start_otp_cooldown(
                     dialog, (info && info.resend_after_seconds) || 120);
+                this._start_otp_expiry(dialog, info && info.expires_in_seconds);
             })
             .catch(() => {
                 frappe.dom.unfreeze();
@@ -2961,7 +3032,8 @@ class DeliveryApp {
                         ...this._photo_picker_fields(__("Photos of Delivery")),
                         {
                             fieldname: "scanned_qr", fieldtype: "Data", options: "Barcode",
-                            label: __("Scan Manifest QR"), reqd: 1,
+                            label: __("Scan Box Label QR"), reqd: 1,
+                            description: __("Scan the QR on the box (e.g. {0}-B01). The challan or manifest QR also works.", [frappe.utils.escape_html(this._order_id(stock_entry))]),
                         },
                         ...this._receiver_fields(manifest, receivers, stock_entry),
                         {

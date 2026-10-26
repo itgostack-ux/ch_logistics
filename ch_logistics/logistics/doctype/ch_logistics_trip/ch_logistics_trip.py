@@ -541,7 +541,7 @@ class CHLogisticsTrip(Document):
         previous = self.get_doc_before_save()
         if not previous or previous.status == self.status:
             return
-        if self.status == "Delivered" and (self.get("transport_mode") or "Own") != "Own":
+        if self.status in ("Picked Up", "Delivered") and (self.get("transport_mode") or "Own") != "Own":
             self._settle_manifests_on_manual_delivery()
 
     def _settle_manifests_on_manual_delivery(self):
@@ -588,8 +588,8 @@ class CHLogisticsTrip(Document):
         if handed:
             self.add_comment(
                 "Info",
-                _("Marked delivered by {0} — waiting for the store to scan it in: {1}").format(
-                    frappe.session.user, ", ".join(handed)))
+                _("{0} by {1}: the store receives these with Scan & Receive: {2}").format(
+                    _(self.status), frappe.session.user, ", ".join(handed)))
         if failed:
             self.add_comment(
                 "Info", _("Could not hand over: {0}").format("; ".join(failed)))

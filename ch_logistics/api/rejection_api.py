@@ -538,10 +538,16 @@ def _review(rejection: str, notes: str | None, approve: bool) -> dict:
 
 	who = frappe.session.user
 	if approve:
-		note = _("Rejection accepted by {0}: back to the dispatch pool. {1}").format(who, notes)
-		moved = _put_the_goods_back(manifest, "Ready For Pickup", note)
+		# The orders go back to Packed Orders and leave on a new manifest; this
+		# one is closed so it does not wait in the dispatch pool as well.
+		note = _("Rejection accepted by {0}: back to Packed Orders for a new manifest. {1}").format(who, notes)
+		old_trip = manifest.trip
+		moved = _put_the_goods_back(manifest, "Packed", note)
+		for row in manifest.transfers:
+			if row.stock_entry:
+				frappe.db.set_value("Stock Entry", row.stock_entry, "custom_transfer_manifest", None, update_modified=False)
 		payload = {
-			"status": "Packed",
+			"status": "Cancelled",
 			"rejection_reason": None,
 			"rejected_during": None,
 			"trip": None,
@@ -552,7 +558,11 @@ def _review(rejection: str, notes: str | None, approve: bool) -> dict:
 		if manifest.meta.has_field("stop_sequence"):
 			payload["stop_sequence"] = 0
 		frappe.db.set_value("CH Transfer Manifest", manifest.name, payload)
-		review_status, action = REVIEW_APPROVED, _("Approved — returned to Packed")
+		review_status, action = REVIEW_APPROVED, _("Approved — back in Packed Orders")
+		# The driver's trip may now carry nothing: free the driver.
+		from ch_logistics.api.logistics_api import settle_trip_after_handover
+
+		settle_trip_after_handover(old_trip)
 	else:
 		note = _("Rejection overruled by {0}: back to {1}. {2}").format(
 			who, manifest.driver_name or manifest.driver or _("the driver"), notes)
@@ -576,6 +586,12 @@ def _review(rejection: str, notes: str | None, approve: bool) -> dict:
 		"resolved_on": frappe.utils.now_datetime(),
 	}, update_modified=False)
 	doc.add_comment("Comment", note)
+	if not approve:
+		from ch_logistics.api.driver_push import notify_manifests_assigned
+
+		notify_manifests_assigned(manifest.driver, [manifest.name], trip=manifest.get("trip"),
+								  title=_("Shipment Sent Back to You"), kind="rejection_overruled",
+								  body=_("Dispatch sent manifest {0} back to you. {1}").format(manifest.name, notes or ""))
 	return {
 		"ok": True,
 		"rejection": doc.name,
