@@ -8,6 +8,9 @@
 const API = "ch_logistics.api.transfer_manifest_api.";
 const TRIP_API = "ch_logistics.api.logistics_api.";
 const DRIVER_API = "ch_logistics.api.driver_api.";
+// Buttons the driver sees. Set to true to show them again; the server side is unchanged.
+const DRIVER_CAN_REJECT = false;     // Reject at pickup, Reject Trip
+const DRIVER_CAN_TRANSFER = false;   // Transfer / Hold / Drop at nearby store
 
 frappe.pages["delivery-app"].on_page_load = function (wrapper) {
     frappe.ui.make_app_page({
@@ -594,7 +597,8 @@ class DeliveryApp {
             actions = `<span class="da-card-status da-status-completed"><i class="fa fa-check-circle"></i> ${__("Delivered")} · ${at}</span>`;
         } else {
             actions = `<button class="btn btn-primary btn-sm da-leg-deliver-btn" data-manifest="${frappe.utils.escape_html(m.name)}" data-stock-entry="${se}" data-trip="${trip_attr}"><i class="fa fa-check-circle"></i> ${__("Deliver")}</button>
-                <button class="btn btn-warning btn-sm da-leg-exception-btn" data-manifest="${frappe.utils.escape_html(m.name)}" data-stock-entry="${se}" data-trip="${trip_attr}"><i class="fa fa-exchange"></i> ${__("Transfer")}</button>`;
+${DRIVER_CAN_TRANSFER ? `
+                <button class="btn btn-warning btn-sm da-leg-exception-btn" data-manifest="${frappe.utils.escape_html(m.name)}" data-stock-entry="${se}" data-trip="${trip_attr}"><i class="fa fa-exchange"></i> ${__("Transfer")}</button>` : ""}`;
         }
         // Tick orders for the same store to deliver them on one OTP.
         const tick = selectable && !row.delivery_captured_at && !row.open_request
@@ -957,11 +961,11 @@ class DeliveryApp {
             ).length;
             action_html = `<button id="da-pickup-btn" class="btn btn-primary btn-lg btn-block da-action-btn">
                 <i class="fa fa-camera"></i> ${__("Start Pickup")}
-            </button>
+            </button>${DRIVER_CAN_REJECT ? `
             <button id="da-reject-btn" class="btn btn-danger btn-sm btn-block da-action-btn">
                 <i class="fa fa-ban"></i> ${__("Reject Pickup")}
-            </button>`;
-            if (sibling_count > 0) {
+            </button>` : ""}`;
+            if (DRIVER_CAN_REJECT && sibling_count > 0) {
                 action_html += `<button id="da-bulk-reject-btn" class="btn btn-warning btn-sm btn-block da-action-btn">
                     <i class="fa fa-list-ul"></i> ${__("Accept this & reject {0} other", [sibling_count])}
                 </button>`;
@@ -1978,7 +1982,9 @@ class DeliveryApp {
             // route back to dispatch in one lightweight step, which
             // per-manifest reject (the audited 2-photo damage-report flow)
             // isn't meant for and doesn't replace.
-            action_html += `<button id="da-trip-reject-btn" class="btn btn-danger btn-sm btn-block da-action-btn"><i class="fa fa-ban"></i> ${__("Reject Trip")}</button>`;
+            if (DRIVER_CAN_REJECT) {
+                action_html += `<button id="da-trip-reject-btn" class="btn btn-danger btn-sm btn-block da-action-btn"><i class="fa fa-ban"></i> ${__("Reject Trip")}</button>`;
+            }
             if (on_break) {
                 action_html += `<div class="text-muted" style="font-size:11px;margin-top:4px;">${__("You're on Break — end it to accept shipments on this trip.")}</div>`;
             }
@@ -2384,8 +2390,10 @@ class DeliveryApp {
                             description: __("Scan the QR on the box (e.g. {0}-B01). The challan or manifest QR also works.", [frappe.utils.escape_html(this._order_id(stock_entry))]),
                         },
                     ],
-                    secondary_action_label: __("Reject"),
-                    secondary_action: () => this._reject_from_accept(d, manifest, stock_entry, in_trip_view),
+                    ...(DRIVER_CAN_REJECT ? {
+                        secondary_action_label: __("Reject"),
+                        secondary_action: () => this._reject_from_accept(d, manifest, stock_entry, in_trip_view),
+                    } : {}),
                     primary_action_label: __("Confirm & Accept"),
                     primary_action: (values) => {
                         const photos = this._photo_picker_urls(d);
@@ -2451,8 +2459,10 @@ class DeliveryApp {
                     options: `<div class="da-box-scan-list">${box_labels.map(box_row_html).join("")}</div>`,
                 },
             ],
-            secondary_action_label: __("Reject"),
-            secondary_action: () => this._reject_from_accept(d, manifest, stock_entry, in_trip_view),
+            ...(DRIVER_CAN_REJECT ? {
+                secondary_action_label: __("Reject"),
+                secondary_action: () => this._reject_from_accept(d, manifest, stock_entry, in_trip_view),
+            } : {}),
             primary_action_label: __("Confirm & Accept"),
             primary_action: (values) => {
                 const photos = this._photo_picker_urls(d);
@@ -3263,7 +3273,7 @@ class DeliveryApp {
                     : (m.status === "Delivered"
                         ? `<span class="da-awaiting-pill text-muted" style="font-size:11px;" title="${__("The destination store must Scan & Receive this shipment")}"><i class="fa fa-clock-o"></i> ${__("Awaiting receipt")}</span>`
                         : "")}
-                ${["Assigned", "Pickup Started"].includes(m.status)
+                ${DRIVER_CAN_REJECT && ["Assigned", "Pickup Started"].includes(m.status)
                     ? `<button class="btn btn-xs btn-danger da-stop-manifest-reject-btn" data-name="${frappe.utils.escape_html(m.name)}"><i class="fa fa-ban"></i> ${__("Reject")}</button>`
                     : ""}
             </div>${proof_line(m)}`).join("");
@@ -3408,8 +3418,8 @@ class DeliveryApp {
             : "";
         const actions = handover_btn || (row.driver_accepted_at || m.status === "In Transit"
             ? `<span class="da-card-status da-status-completed"><i class="fa fa-check-circle"></i> ${__("Accepted")}</span>`
-            : `<button class="btn btn-success btn-sm da-leg-accept-btn" data-manifest="${frappe.utils.escape_html(m.name)}" data-stock-entry="${se}" data-trip="${trip_attr}" ${accept_disabled}><i class="fa fa-check"></i> ${__("Accept Shipment")}</button>
-               <button class="btn btn-danger btn-sm da-leg-reject-btn" data-manifest="${frappe.utils.escape_html(m.name)}" data-stock-entry="${se}"><i class="fa fa-ban"></i> ${__("Reject")}</button>`);
+            : `<button class="btn btn-success btn-sm da-leg-accept-btn" data-manifest="${frappe.utils.escape_html(m.name)}" data-stock-entry="${se}" data-trip="${trip_attr}" ${accept_disabled}><i class="fa fa-check"></i> ${__("Accept Shipment")}</button>${DRIVER_CAN_REJECT ? `
+               <button class="btn btn-danger btn-sm da-leg-reject-btn" data-manifest="${frappe.utils.escape_html(m.name)}" data-stock-entry="${se}"><i class="fa fa-ban"></i> ${__("Reject")}</button>` : ""}`);
         return `
             <div class="da-stop-card da-manifest-merged-card">
                 <div class="da-stop-where">
