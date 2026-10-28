@@ -2273,10 +2273,10 @@ ${DRIVER_CAN_TRANSFER ? `
         // — the location actually captured, mirroring the Reached Location
         // dialog's lat/lng display.
         frappe.dom.freeze(__("Capturing GPS…"));
-        this._capture_gps_promise()
-            .then(({ lat, lng }) => {
+        this._capture_gps_promise(true)
+            .then(({ lat, lng, no_location_reason }) => {
                 frappe.dom.unfreeze();
-                this._open_trip_start_dialog(first_pickup, source_manifests, { lat, lng }, overrideEmptyStops);
+                this._open_trip_start_dialog(first_pickup, source_manifests, { lat, lng, no_location_reason }, overrideEmptyStops);
             })
             .catch(() => frappe.dom.unfreeze());
     }
@@ -3681,9 +3681,9 @@ ${DRIVER_CAN_TRANSFER ? `
         let captured_gps = gps || null;
         // GPS is already captured (and shown to the driver) before this
         // dialog opens — don't ask the device for a second fix.
-        return (gps ? Promise.resolve(gps) : this._capture_gps_promise())
-            .then(({ lat, lng, accuracy }) => {
-                captured_gps = { lat, lng, accuracy };
+        return (gps ? Promise.resolve(gps) : this._capture_gps_promise(true))
+            .then(({ lat, lng, accuracy, no_location_reason }) => {
+                captured_gps = { lat, lng, accuracy, no_location_reason };
                 // Step 1: flip Assigned → Started so subsequent stop_arrive /
                 // stop_complete calls are allowed by the server.
                 return this._call_promise(TRIP_API + "driver_accept_trip", {
@@ -3702,6 +3702,7 @@ ${DRIVER_CAN_TRANSFER ? `
                         scanned_qr: values[qr_key],
                         lat: captured_gps.lat, lng: captured_gps.lng,
                         gps_accuracy_m: captured_gps.accuracy,
+                        no_location_reason: captured_gps.no_location_reason,
                         notes: values.notes,
                     });
                 });
@@ -4403,7 +4404,7 @@ ${DRIVER_CAN_TRANSFER ? `
     _record_stop_arrival(seq, gps) {
         // Optional gps: reuse a fix already captured (and shown to the
         // driver) rather than prompting the device for a second reading.
-        return (gps ? Promise.resolve(gps) : this._capture_gps_promise()).then(({ lat, lng }) => {
+        return (gps ? Promise.resolve(gps) : this._capture_gps_promise(true)).then(({ lat, lng }) => {
             return this._call_promise(TRIP_API + "stop_arrive", {
                 trip: this.active_trip,
                 sequence: seq,
@@ -4498,7 +4499,7 @@ ${DRIVER_CAN_TRANSFER ? `
         // driver (same pattern as the bundle paths) instead of only being
         // silently captured — again — inside _record_stop_arrival on submit.
         frappe.dom.freeze(__("Capturing arrival…"));
-        this._capture_gps_promise()
+        this._capture_gps_promise(true)
             .then((gps) => {
                 frappe.dom.unfreeze();
                 this._open_stop_pickup_dialog(seq, candidates, stop, gps);
@@ -4895,7 +4896,7 @@ ${DRIVER_CAN_TRANSFER ? `
         // so it can be shown to the driver as a visible confirmation, same
         // as the fields do — rather than capturing silently on submit.
         frappe.dom.freeze(__("Capturing arrival…"));
-        this._capture_gps_promise()
+        this._capture_gps_promise(true)
             .then((gps) => {
                 frappe.dom.unfreeze();
                 this._open_stop_pickup_bundle_dialog(seq, candidates, stop, gps);
@@ -4963,14 +4964,14 @@ ${DRIVER_CAN_TRANSFER ? `
         frappe.dom.freeze(__("Recording arrival & cascading pickup…"));
         // Reuse the GPS fix already captured (and shown to the driver)
         // before the dialog opened rather than taking a fresh reading here.
-        return (gps ? Promise.resolve(gps) : this._capture_gps_promise())
-            .then(({ lat, lng }) => {
+        return (gps ? Promise.resolve(gps) : this._capture_gps_promise(true))
+            .then(({ lat, lng, no_location_reason }) => {
                 return this._call_promise(TRIP_API + "start_stop_pickup", {
                     trip: this.active_trip,
                     sequence: seq,
                     scanned_qr: values.scanned_qr,
                     pickup_photo: values.pickup_photo,
-                    lat, lng,
+                    lat, lng, no_location_reason,
                     notes: values.notes,
                 });
             })
@@ -5048,9 +5049,9 @@ ${DRIVER_CAN_TRANSFER ? `
 
         frappe.dom.freeze(__("Capturing arrival & sending one OTP for this stop…"));
         let gps_cache = null;
-        this._capture_gps_promise()
-            .then(({ lat, lng }) => {
-                gps_cache = { lat, lng };
+        this._capture_gps_promise(true)
+            .then(({ lat, lng, no_location_reason }) => {
+                gps_cache = { lat, lng, no_location_reason };
                 return this._call_promise(TRIP_API + "request_stop_otp", {
                     trip: this.active_trip,
                     sequence: seq,
@@ -5168,6 +5169,7 @@ ${DRIVER_CAN_TRANSFER ? `
             receiver_name: values.receiver_name,
             otp: values.otp,
             lat, lng,
+            no_location_reason: gps && gps.no_location_reason,
             notes: values.notes,
         })
             .then((res) => {

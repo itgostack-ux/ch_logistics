@@ -4741,7 +4741,7 @@ def _stop_scan_matches(scanned, expected_token, manifest_names) -> bool:
 
 @frappe.whitelist(methods=["POST"])
 def start_stop_pickup(trip, sequence, scanned_qr, pickup_photo,
-                      lat=None, lng=None, notes=None):
+                      lat=None, lng=None, notes=None, no_location_reason=None):
     """Driver scans the consolidated pickup label for a whole stop.
 
     Validates the scanned token against CH Logistics Trip Stop.pickup_token
@@ -4816,6 +4816,7 @@ def start_stop_pickup(trip, sequence, scanned_qr, pickup_photo,
             lng=lng,
             notes=manifest_note,
             scanned_qr=doc.qr_payload,
+            no_location_reason=no_location_reason,
         )
         started.append(doc.name)
 
@@ -4848,7 +4849,7 @@ def start_stop_pickup(trip, sequence, scanned_qr, pickup_photo,
 )
 def complete_stop_delivery(trip, sequence, scanned_qr, delivery_photo,
                            receiver_name, otp=None, lat=None, lng=None,
-                           notes=None):
+                           notes=None, no_location_reason=None):
     """Driver scans the consolidated drop label for a whole stop.
 
     Validates the scanned token against CH Logistics Trip Stop.delivery_token
@@ -4956,6 +4957,7 @@ def complete_stop_delivery(trip, sequence, scanned_qr, delivery_photo,
             # still receives each manifest's independent secure payload.
             scanned_qr=doc.qr_payload,
             otp_preverified=bool(otp_digests),
+            no_location_reason=no_location_reason,
         )
         delivered.append(doc.name)
 
